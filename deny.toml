@@ -1,0 +1,27 @@
+# cargo deny check: advisories, bans, licenses, sources.
+# The binary runs as root on every validator, so the graph stays small and every rule denies.
+
+[graph]
+# no target filter: every platform's dependencies are checked
+all-features = true
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.93
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,31 @@
+[package]
+name = "tn-p2p-allow-sync"
+version = "0.1.0"
+edition = "2024"
+# keep in step with rust-toolchain.toml
+rust-version = "1.94.1"
+license = "MIT OR Apache-2.0"
+description = "Keeps the nftables P2P allowlist of a Telcoin Network node in step with the committee."
+# released as a signed tarball, never through crates.io
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+
+# unwinding stays on, so a panic exits 101 and reads as a bug rather than a signal
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

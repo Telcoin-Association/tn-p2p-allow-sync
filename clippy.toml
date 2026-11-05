@@ -1,0 +1,12 @@
+# Each method below is allowed in exactly one module, the one named in its reason.
+# That module's call site carries `#[allow(clippy::disallowed_methods)]` with a comment
+# saying why, so every exception is visible where it is made; nowhere else may call them.
+disallowed-methods = [
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "resolves names through DNS; only `rpc` connects, to a literal 127.0.0.1 SocketAddr" },
+    { path = "std::net::TcpStream::connect", reason = "takes ToSocketAddrs and may resolve names; only `rpc` connects, with connect_timeout to a SocketAddr" },
+    { path = "std::process::Command::new", reason = "only `nft` runs a program: /usr/sbin/nft from a fixed path with a cleared environment" },
+    { path = "std::env::var", reason = "the environment is untrusted input; only `log` reads it, and only JOURNAL_STREAM" },
+    { path = "std::env::var_os", reason = "the environment is untrusted input; only `log` reads it, and only JOURNAL_STREAM" },
+    { path = "std::env::vars", reason = "the environment is untrusted input; only `log` reads it, and only JOURNAL_STREAM" },
+    { path = "std::env::vars_os", reason = "the environment is untrusted input; only `log` reads it, and only JOURNAL_STREAM" },
+]
