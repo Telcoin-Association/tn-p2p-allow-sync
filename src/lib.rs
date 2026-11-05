@@ -7,6 +7,7 @@
 //! Everything else lives in this library, so tests call it directly.
 
 pub mod addr;
+pub mod check;
 pub mod cli;
 pub mod config;
 pub mod fsutil;

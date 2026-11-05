@@ -6,13 +6,14 @@
 #   state/argv.log      one line per call, the arguments joined by spaces
 #   state/loaded.N.nft  what the Nth -f, -f - or -c -f - call was given, N counting from 1
 #   state/table         the live table, one object per line, parsed from the last loaded program:
-#                       `counter NAME`, `set NAME TYPE [interval]`, `chain NAME TYPE HOOK PRIO POLICY`,
-#                       `rule TEXT` and `elem SET VALUE`; absent while no table is loaded, and a
-#                       test deletes an `elem` line to delete that element by hand
+#                       `counter NAME [PACKETS BYTES]`, `set NAME TYPE [interval]`,
+#                       `chain NAME TYPE HOOK PRIO POLICY`, `rule TEXT` and `elem SET VALUE`; absent
+#                       while no table is loaded; a test deletes an `elem` line to delete that element
+#                       by hand, and appends two numbers to a `counter` line to give it traffic
 #   state/fail-next     knob: the next -f exits 1 with an nft-like message, then the knob is gone
 #   state/eperm         knob: every call prints nft's "Operation not permitted" and exits 1
 #
-# The two -j list calls print the JSON shape nft 1.0.9 prints, with both counters at 0.
+# The two -j list calls print the JSON shape nft 1.0.9 prints, each counter at 0 unless its line says otherwise.
 # `-c -f -` checks nothing and changes nothing; `delete table` removes state/table.
 # Any other call exits 64.
 set -u
@@ -130,7 +131,11 @@ listing() {
         n = split(text, words, " ")
         return expr ", {\"" words[n] "\": null}"
     }
-    $1 == "counter" { counters[++ncounters] = $2 }
+    $1 == "counter" {
+        counters[++ncounters] = $2
+        packets[$2] = ($3 == "" ? 0 : $3)
+        bytes[$2] = ($4 == "" ? 0 : $4)
+    }
     $1 == "set" { sets[++nsets] = $2; types[$2] = $3; interval[$2] = ($4 == "interval") }
     $1 == "chain" { chains[++nchains] = $0 }
     $1 == "rule" { rule = $0; sub(/^rule /, "", rule); rules[++nrules] = rule }
@@ -139,7 +144,7 @@ listing() {
         handle = 1
         printf "{\"nftables\": [%s, {\"table\": {\"family\": \"inet\", \"name\": \"tn_p2p_allow\", \"handle\": %d}}", meta, handle
         for (i = 1; i <= ncounters; i++)
-            printf ", {\"counter\": {\"family\": \"inet\", \"name\": \"%s\", \"table\": \"tn_p2p_allow\", \"handle\": %d, \"packets\": 0, \"bytes\": 0}}", counters[i], ++handle
+            printf ", {\"counter\": {\"family\": \"inet\", \"name\": \"%s\", \"table\": \"tn_p2p_allow\", \"handle\": %d, \"packets\": %s, \"bytes\": %s}}", counters[i], ++handle, packets[counters[i]], bytes[counters[i]]
         for (i = 1; i <= nsets; i++) {
             name = sets[i]
             printf ", {\"set\": {\"family\": \"inet\", \"name\": \"%s\", \"table\": \"tn_p2p_allow\", \"type\": \"%s\", \"handle\": %d", name, types[name], ++handle

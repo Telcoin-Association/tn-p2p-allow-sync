@@ -5,11 +5,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config;
 use crate::fsutil::{FsError, Lock, StateDir};
 use crate::log::{self, Log, Priority};
 use crate::nft::{self, Nft};
 use crate::sync::{self, RenderOptions, SyncOptions};
+use crate::{check, config, status};
 
 /// Usage text, printed to stderr on a usage error.
 pub const USAGE: &str = "\
@@ -261,9 +261,8 @@ fn seconds(arg: OsString) -> Option<u64> {
 
 /// Runs the command line `args`, program name first as [`std::env::args_os`] yields it, and returns how the run ended.
 ///
-/// Output goes to stdout and diagnostics to stderr; the log lines of `sync` and `render` carry journald priority prefixes when stderr is the journal.
+/// Output goes to stdout and diagnostics to stderr; the log lines of `sync`, `render`, `check` and `status` carry journald priority prefixes when stderr is the journal.
 /// A usage error prints [`USAGE`] to stderr and exits 2.
-/// `--version`, `capture-floor`, `sync` and `render` are complete; `check` and `status` parse but exit 2 with "not implemented" for now.
 pub fn run<I>(args: I) -> Exit
 where
     I: IntoIterator<Item = OsString>,
@@ -319,8 +318,20 @@ where
             };
             sync::render(&options, out, &mut log)
         }
-        Command::Check => not_implemented("check", err),
-        Command::Status { .. } => not_implemented("status", err),
+        Command::Check => {
+            let mut log = Log::new(err, journal);
+            let Some(nft) = nft_runner(invocation.nft.as_deref(), &mut log) else {
+                return Exit::Error;
+            };
+            check::check(&invocation.state_dir, &nft, out, &mut log)
+        }
+        Command::Status { json } => {
+            let mut log = Log::new(err, journal);
+            let Some(nft) = nft_runner(invocation.nft.as_deref(), &mut log) else {
+                return Exit::Error;
+            };
+            status::show(&invocation.state_dir, &nft, *json, out, &mut log)
+        }
     }
 }
 
@@ -389,13 +400,6 @@ fn failure<E: Write>(token: &str, detail: &dyn std::fmt::Display, exit: Exit, er
     // nothing is left to report a failed write to
     let _ = writeln!(err, "capture-floor: {token}: {detail}").and_then(|()| err.flush());
     exit
-}
-
-fn not_implemented<E: Write>(command: &str, err: &mut E) -> Exit {
-    // nothing is left to report a failed write to
-    let _ = writeln!(err, "tn-p2p-allow-sync: {command} is not implemented yet")
-        .and_then(|()| err.flush());
-    Exit::Error
 }
 
 fn write_version<O: Write>(out: &mut O) -> Exit {
@@ -721,24 +725,8 @@ mod tests {
     }
 
     #[test]
-    fn commands_not_built_yet_exit_2_without_usage() {
-        for (args, command) in [
-            (&["tn-p2p-allow-sync", "check"][..], "check"),
-            (&["tn-p2p-allow-sync", "status", "--json"], "status"),
-        ] {
-            let (exit, out, err) = run_args(args);
-            assert_eq!(exit, Exit::Error, "{args:?}");
-            assert_eq!(out, "", "{args:?}");
-            assert_eq!(
-                err,
-                format!("tn-p2p-allow-sync: {command} is not implemented yet\n")
-            );
-        }
-    }
-
-    #[test]
-    fn sync_and_render_refuse_a_missing_state_dir_and_touch_nothing() {
-        for command in ["sync", "render"] {
+    fn every_state_dir_command_refuses_a_missing_state_dir_and_touches_nothing() {
+        for command in ["sync", "render", "check", "status"] {
             let args = [
                 "tn-p2p-allow-sync",
                 "--state-dir",
@@ -758,7 +746,7 @@ mod tests {
 
     #[test]
     fn the_nft_path_must_be_absolute_and_a_non_default_one_is_warned_about() {
-        for command in ["sync", "render"] {
+        for command in ["sync", "render", "check", "status"] {
             let (exit, out, err) = run_args(&["tn-p2p-allow-sync", "--nft", "nft", command]);
             assert_eq!((exit, out.as_str()), (Exit::Error, ""), "{command}");
             assert_eq!(
