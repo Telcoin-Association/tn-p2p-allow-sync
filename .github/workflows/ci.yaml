@@ -1,0 +1,120 @@
+# The gates of every pull request and every push to main: fmt, clippy, test, deny, audit.
+#
+# Each job runs one command, the same one a maintainer runs locally before pushing, so a
+# red job reproduces with the command its last step names (.github/ACTIONS.md lists them).
+# rust-toolchain.toml selects the toolchain for every cargo call, here and locally.
+#
+# Every action is pinned to a full commit SHA, with the release it stands for in a trailing
+# comment on the same line. A tag can be repointed upstream, and the gate would then run new
+# code with no change in this repository. The pin table and how a pin moves are in
+# .github/ACTIONS.md, under "Action pins".
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# nothing here writes; each job asks for read access to the repository and no more
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # warnings fail the build in CI, not through #![deny(warnings)] in the source
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Test
+        run: cargo test --locked
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # the version comes from the pinned commit's manifest with its sha256; `fallback: none`
+      # fails the step instead of fetching an unchecked build when the manifest lacks it
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - name: cargo deny
+        run: cargo deny check
+
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # same pin and the same fallback rule as cargo-deny above
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
+      - name: cargo audit
+        run: cargo audit
