@@ -6,4 +6,5 @@
 //! The binary only forwards its arguments to [`cli::run`].
 //! Everything else lives in this library, so tests call it directly.
 
+pub mod addr;
 pub mod cli;
