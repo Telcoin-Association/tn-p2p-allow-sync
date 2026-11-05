@@ -37,6 +37,8 @@ T_DONE=0
 T_OUT=
 T_ERR=
 T_RC=
+RR=
+RSOCK=
 
 bail() {
     printf 'Bail out! %s\n' "$*"
@@ -52,7 +54,7 @@ if [ "$STUB" = 1 ] && [ "${GITHUB_ACTIONS:-}" = true ]; then
     bail "RELEASE_BUILD_STUB=1 is refused in CI, which runs the real build"
 fi
 
-for tool in git gpg gpgconf docker tar gzip awk sed; do
+for tool in git gpg gpgconf gpg-connect-agent make docker tar gzip awk sed; do
     command -v "$tool" >/dev/null 2>&1 || bail "missing required tool: $tool"
 done
 docker info >/dev/null 2>&1 || bail "docker does not answer"
@@ -62,6 +64,8 @@ t_exit() {
     local rc=$?
     if [ "$T_DONE" != 1 ]; then printf 'Bail out! %s stopped early (exit %s)\n' "$T_NAME" "$rc"; fi
     if [ -n "${GNUPGHOME:-}" ]; then gpgconf --homedir "$GNUPGHOME" --kill all >/dev/null 2>&1 || true; fi
+    if [ -n "${RSOCK:-}" ]; then rm -f "$RSOCK"; fi
+    if [ -n "${RR:-}" ]; then gpgconf --homedir "$RR" --remove-socketdir >/dev/null 2>&1 || true; fi
     if [ "$T_KEEP" = 0 ] && [ -n "$T_DIR" ]; then rm -rf "$T_DIR"; fi
 }
 
@@ -298,6 +302,10 @@ check "the tarball holds $d/ with the program and the three license files" test 
 packed=$(tar -xzOf "$rd/$tarball" "$d/tn-p2p-allow-sync" | sha256sum | awk '{ print $1 }') || packed=
 check "the tarball's program is the one both builds gave" test "$packed" = "$b1"
 
+# an unsigned copy of the release for the signature over ssh below
+rd2=$FX/release-dir-remote
+cp -a "$rd" "$rd2"
+
 step "$clone" rel RELEASE_DIR="$rd" RELEASE_YES=1 RELEASE_SUMS_SHA256="$sums" RELEASE_GPG_KEY="$fpr" \
     ./release/release.sh sign "$tag"
 expect_rc 0 "sign adds alice's signature over SHA256SUMS"
@@ -308,6 +316,31 @@ step "$clone" rel RELEASE_DIR="$rd" TN_P2P_ALLOW_REBUILD=1 CARGO_BUILD_JOBS="${C
 expect_rc 0 "verify accepts the signed release and its rebuild from the tag"
 expect_out "verified $tag commit=$r1 signatures=1/1" "verify counts alice's signature"
 expect_err "rebuilt $tag from $r1: the same tn-p2p-allow-sync, sha256 $b1" "the rebuild from the tag gives the released program"
+
+# the same signature over a GnuPG home of its own whose agent socket is a forward of the
+# fixture agent's extra socket, which is what make release-sign-remote finds once ssh -R has
+# brought the laptop's: the restricted socket allows the signature and nothing more
+RR=$FX/gr
+step "$clone" ./etc/release-remote.sh setup "$RR"
+expect_rc 0 "release-remote.sh setup creates the home and imports the maintainer keys"
+expect_err "maintainer keys imported: 1 from " "setup imports alice's key alone"
+expect_err 'ssh -R ' "setup prints the ssh -R command"
+RSOCK=$("$clone/etc/release-remote.sh" socket "$RR")
+step "$clone" env RELEASE_GPG_KEY="$fpr" ./etc/release-remote.sh check "$RR"
+expect_rc 2 "check refuses while no agent is forwarded"
+expect_err "no agent socket at $RSOCK" "check names the socket it expects"
+ln -s "$(gpgconf --homedir "$GNUPGHOME" --list-dirs agent-extra-socket)" "$RSOCK"
+step "$clone" env RELEASE_GPG_KEY="$fpr" ./etc/release-remote.sh check "$RR"
+expect_rc 0 "check finds alice's key behind the forwarded socket"
+expect_err "holds $fpr" "check names the key it found"
+step "$clone" rel RELEASE_DIR="$rd2" RELEASE_YES=1 RELEASE_SUMS_SHA256="$sums" RELEASE_GPG_KEY="$fpr" \
+    make --no-print-directory release-sign-remote "TAG=$tag" "RELEASE_REMOTE_GNUPGHOME=$RR"
+expect_rc 0 "make release-sign-remote signs over the forwarded agent"
+expect_out "signed $tag as @alice: 1/1 signatures" "the signature over ssh counts as alice's"
+check "the home for signing over ssh holds no private key" test -z "$(ls -A "$RR/private-keys-v1.d" 2>/dev/null)"
+step "$clone" rel RELEASE_DIR="$rd2" TN_P2P_ALLOW_REBUILD=0 ./release/release.sh verify "$tag"
+expect_rc 0 "verify accepts the release signed over ssh"
+expect_out "verified $tag commit=$r1 signatures=1/1" "verify counts the signature made over ssh"
 
 # a rebuild that differs fails verify; release.conf is changed in the clone only, which verify,
 # unlike build and publish, does not compare with main

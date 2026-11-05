@@ -59,22 +59,46 @@ Each target runs one step from the repository root as `./release/release.sh <ste
 | `make release-sign TAG=vX.Y.Z` | `sign` | laptop | re-checks the draft's files, compares the `SHA256SUMS` hash with the one `build` printed, and appends your signature to `SHA256SUMS.asc`; it rebuilds the binary only with `TN_P2P_ALLOW_REBUILD=1`, since an amd64 build under emulation on a Mac is slow |
 | `make release-verify TAG=vX.Y.Z` | `verify` | build server, CI, operators | re-checks the tag, the assets, the signatures and the `--version` lines, and rebuilds the binary from the tag, since the target sets `TN_P2P_ALLOW_REBUILD=1` unless you pass `TN_P2P_ALLOW_REBUILD=0` |
 | `make release-publish TAG=vX.Y.Z` | `publish` | build server | verifies, then publishes the draft after you confirm |
+| `make release-setup-remote` | | build server | creates the GnuPG home for signing over ssh, imports the keys of `release/keys` into it and prints the `ssh -R` command that forwards the laptop's gpg-agent into it |
+| `make release-tag-remote TAG=vX.Y.Z` | `tag` | build server, over ssh | `tag` on this machine over the forwarded agent, the YubiKey staying in the laptop; checks first that the agent answers and holds the signing key |
+| `make release-sign-remote TAG=vX.Y.Z` | `sign` | build server, over ssh | `sign` on this machine over the forwarded agent, with the same check |
 
 The Makefile also has `make ci`, the five gates of the README, and `make nft-real`, the real-kernel test.
 
 ## Cutting a release
 
 1. `make release-prep TAG=vX.Y.Z` on the build server, then open the PR `release: vX.Y.Z` it prints and merge it alone.
-2. `make release-tag TAG=vX.Y.Z` on the laptop, one touch of the YubiKey.
+2. `make release-tag TAG=vX.Y.Z` on the laptop, one touch of the YubiKey; or `make release-tag-remote TAG=vX.Y.Z` on the build server over ssh ([Signing over ssh](#signing-over-ssh)).
 3. The tag push runs `.github/workflows/release.yaml`: `validate-tag` runs `check-tag` and `notes`, and `draft-release` runs `draft`, the only job with `contents: write`.
 4. `make release-build TAG=vX.Y.Z` on the build server; note the `SHA256SUMS sha256:` line it prints last.
-5. `make release-sign TAG=vX.Y.Z` on the laptop of each signer, with that hash at the prompt or in `RELEASE_SUMS_SHA256`, one touch each.
+5. `make release-sign TAG=vX.Y.Z` on the laptop of each signer, with that hash at the prompt or in `RELEASE_SUMS_SHA256`, one touch each; or `make release-sign-remote TAG=vX.Y.Z` on the build server over ssh.
 6. `make release-verify TAG=vX.Y.Z`, then `make release-publish TAG=vX.Y.Z`, on the build server.
 7. The workflow's `verify-release` job runs `verify` on the published release, with `TN_P2P_ALLOW_REBUILD=1` and a read-only token, as a detective check.
 
-`tag` and `sign` need the maintainer's YubiKey, so a maintainer runs them by hand.
+`tag` and `sign` need the maintainer's YubiKey, so a maintainer runs them by hand, on the laptop or on the build server over ssh.
 A final version must be higher than every other final, and a release candidate's higher than every final.
 After publishing, the deployment scripts pick the release up only when a `chore` commit of `tn-node-deployment` moves `TN_P2P_ALLOW_VERSION` and `TN_P2P_ALLOW_TARBALL_SHA256` in `lib/common.sh` to the new tag and the tarball hash ([installing.md](installing.md)).
+
+## Signing over ssh
+
+`tag` and `sign` can run on the build server with the YubiKey still in the laptop: the laptop forwards its gpg-agent over ssh, and gpg on the server signs through it.
+The private key never leaves the YubiKey.
+Each signature is one request over the forwarded socket, with the PIN and the touch on the laptop.
+The laptop forwards the agent's extra socket, which gpg-agent serves in restricted mode: signatures and decryption, no key export and no control of the agent.
+On the server the forwarded socket belongs to a GnuPG home of its own, `~/.gnupg-tn-release` (`RELEASE_REMOTE_GNUPGHOME`), which holds the maintainers' public keys from `release/keys` and `no-autostart`.
+The server's own gpg-agent is never involved, and nothing starts an agent in that home: its socket is the forwarded one or none.
+
+1. On the server, `make release-setup-remote`: once, again after a reboot, and whenever `release/keys` changes.
+   It creates the home, imports the keys and prints the `ssh -R` command with the socket path gpg uses for that home.
+2. The server needs to know the signing key: `git config user.signingkey <fingerprint>` in this checkout, or `RELEASE_GPG_KEY=<fingerprint>` on each command.
+3. On the laptop, with the YubiKey plugged in, run `gpg --card-status`, then the printed command: `ssh -R <socket>:"$(gpgconf --list-dirs agent-extra-socket)" <user>@<server>`.
+4. In that session, `make release-tag-remote TAG=vX.Y.Z` or `make release-sign-remote TAG=vX.Y.Z`.
+   Each checks that an agent answers on the forwarded socket and holds the signing key, then runs the plain target with `GNUPGHOME` set to that home.
+
+`build`, `verify` and `publish` are unchanged and run on the server as before; `publish` needs a `gh` login there with write access to the repository.
+If ssh reports `remote port forwarding failed`, a socket file from an earlier session is still on the server: run `make release-setup-remote` again, which removes a socket nothing answers on, and reconnect; `StreamLocalBindUnlink yes` in the server's `sshd_config` makes ssh replace it by itself.
+`gpg --card-status` on the server cannot see the card over the restricted socket, so a missing or locked YubiKey shows only when the signature is requested.
+`etc/tests/release_dry_run.sh` rehearses the path with the fixture agent's extra socket standing in for the forwarded one.
 
 ## Reproducibility
 
