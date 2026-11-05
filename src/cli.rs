@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use crate::config;
 use crate::fsutil::{FsError, Lock, StateDir};
+use crate::log::{self, Log, Priority};
+use crate::nft::{self, Nft};
+use crate::sync::{self, RenderOptions, SyncOptions};
 
 /// Usage text, printed to stderr on a usage error.
 pub const USAGE: &str = "\
@@ -258,17 +261,22 @@ fn seconds(arg: OsString) -> Option<u64> {
 
 /// Runs the command line `args`, program name first as [`std::env::args_os`] yields it, and returns how the run ended.
 ///
-/// Output goes to stdout and diagnostics to stderr.
+/// Output goes to stdout and diagnostics to stderr; the log lines of `sync` and `render` carry journald priority prefixes when stderr is the journal.
 /// A usage error prints [`USAGE`] to stderr and exits 2.
-/// `--version` and `capture-floor` are complete; `sync`, `check`, `status` and `render` parse but exit 2 with "not implemented" for now.
+/// `--version`, `capture-floor`, `sync` and `render` are complete; `check` and `status` parse but exit 2 with "not implemented" for now.
 pub fn run<I>(args: I) -> Exit
 where
     I: IntoIterator<Item = OsString>,
 {
-    run_with(args, &mut io::stdout(), &mut io::stderr())
+    run_with(
+        args,
+        &mut io::stdout(),
+        &mut io::stderr(),
+        log::stderr_is_journal(),
+    )
 }
 
-fn run_with<I, O, E>(args: I, out: &mut O, err: &mut E) -> Exit
+fn run_with<I, O, E>(args: I, out: &mut O, err: &mut E, journal: bool) -> Exit
 where
     I: IntoIterator<Item = OsString>,
     O: Write,
@@ -282,11 +290,63 @@ where
         Command::CaptureFloor(files) => {
             capture_floor(&invocation.state_dir, files, CAPTURE_FLOOR_WAIT, err)
         }
-        Command::Sync { .. } => not_implemented("sync", err),
+        Command::Sync {
+            require_authoritative,
+            wait,
+        } => {
+            let mut log = Log::new(err, journal);
+            let Some(nft) = nft_runner(invocation.nft.as_deref(), &mut log) else {
+                return Exit::Error;
+            };
+            let options = SyncOptions {
+                state_dir: &invocation.state_dir,
+                nft: &nft,
+                require_authoritative: *require_authoritative,
+                wait: wait.map(Duration::from_secs),
+            };
+            sync::sync(&options, out, &mut log)
+        }
+        Command::Render { snapshot, check } => {
+            let mut log = Log::new(err, journal);
+            let Some(nft) = nft_runner(invocation.nft.as_deref(), &mut log) else {
+                return Exit::Error;
+            };
+            let options = RenderOptions {
+                state_dir: &invocation.state_dir,
+                nft: &nft,
+                snapshot: snapshot.as_deref(),
+                check: *check,
+            };
+            sync::render(&options, out, &mut log)
+        }
         Command::Check => not_implemented("check", err),
         Command::Status { .. } => not_implemented("status", err),
-        Command::Render { .. } => not_implemented("render", err),
     }
+}
+
+/// The nft runner for `--nft PATH`: the path must be absolute, and one other than [`nft::DEFAULT_PATH`] is warned about on every run.
+///
+/// A relative path would resolve against the working directory, or a bare name against the child's `PATH`, and could start another program than the one meant; it is an error, exit 2.
+fn nft_runner<E: Write>(path: Option<&Path>, log: &mut Log<E>) -> Option<Nft> {
+    if let Some(path) = path {
+        let shown = path.to_string_lossy();
+        if !path.is_absolute() {
+            log.line(
+                Priority::Error,
+                "error",
+                &[
+                    ("reason", "usage"),
+                    ("detail", "--nft takes an absolute path"),
+                    ("path", &shown),
+                ],
+            );
+            return None;
+        }
+        if path != Path::new(nft::DEFAULT_PATH) {
+            log.line(Priority::Warning, "nft-path", &[("path", &shown)]);
+        }
+    }
+    Some(Nft::new(path))
 }
 
 /// `capture-floor FILE...`: checks the state dir, reads the floor from the files, then writes `floor` under the lock, waiting up to `wait` for it.
@@ -392,7 +452,7 @@ mod tests {
     fn run_args(args: &[&str]) -> (Exit, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let exit = run_with(args.iter().map(OsString::from), &mut out, &mut err);
+        let exit = run_with(args.iter().map(OsString::from), &mut out, &mut err, false);
         (
             exit,
             String::from_utf8_lossy(&out).into_owned(),
@@ -450,7 +510,7 @@ mod tests {
         ];
         let mut out = Vec::new();
         let mut err = Vec::new();
-        assert_eq!(run_with(args, &mut out, &mut err), Exit::Error);
+        assert_eq!(run_with(args, &mut out, &mut err, false), Exit::Error);
         assert!(out.is_empty());
     }
 
@@ -663,13 +723,8 @@ mod tests {
     #[test]
     fn commands_not_built_yet_exit_2_without_usage() {
         for (args, command) in [
-            (&["tn-p2p-allow-sync", "sync", "--wait", "30"][..], "sync"),
-            (&["tn-p2p-allow-sync", "check"], "check"),
+            (&["tn-p2p-allow-sync", "check"][..], "check"),
             (&["tn-p2p-allow-sync", "status", "--json"], "status"),
-            (
-                &["tn-p2p-allow-sync", "--nft", "/opt/nft", "render"],
-                "render",
-            ),
         ] {
             let (exit, out, err) = run_args(args);
             assert_eq!(exit, Exit::Error, "{args:?}");
@@ -678,6 +733,61 @@ mod tests {
                 err,
                 format!("tn-p2p-allow-sync: {command} is not implemented yet\n")
             );
+        }
+    }
+
+    #[test]
+    fn sync_and_render_refuse_a_missing_state_dir_and_touch_nothing() {
+        for command in ["sync", "render"] {
+            let args = [
+                "tn-p2p-allow-sync",
+                "--state-dir",
+                "/nonexistent/tn-p2p-allow-sync-state",
+                command,
+            ];
+            let (exit, out, err) = run_args(&args);
+            assert_eq!(exit, Exit::Error, "{command}");
+            assert_eq!(out, "", "{command}");
+            assert!(
+                err.starts_with("error reason=state-dir-invalid detail="),
+                "{command}: {err}"
+            );
+            assert_eq!(err.lines().count(), 1, "{command}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_nft_path_must_be_absolute_and_a_non_default_one_is_warned_about() {
+        for command in ["sync", "render"] {
+            let (exit, out, err) = run_args(&["tn-p2p-allow-sync", "--nft", "nft", command]);
+            assert_eq!((exit, out.as_str()), (Exit::Error, ""), "{command}");
+            assert_eq!(
+                err, "error reason=usage detail=\"--nft takes an absolute path\" path=nft\n",
+                "{command}"
+            );
+
+            let (exit, _, err) = run_args(&[
+                "tn-p2p-allow-sync",
+                "--state-dir",
+                "/nonexistent/tn-p2p-allow-sync-state",
+                "--nft",
+                "/opt/nft",
+                command,
+            ]);
+            assert_eq!(exit, Exit::Error, "{command}");
+            let lines: Vec<&str> = err.lines().collect();
+            assert_eq!(lines.len(), 2, "{command}: {err}");
+            assert_eq!(lines.first().copied(), Some("nft-path path=/opt/nft"));
+
+            let (_, _, err) = run_args(&[
+                "tn-p2p-allow-sync",
+                "--state-dir",
+                "/nonexistent/tn-p2p-allow-sync-state",
+                "--nft",
+                nft::DEFAULT_PATH,
+                command,
+            ]);
+            assert!(!err.contains("nft-path"), "{command}: {err}");
         }
     }
 
@@ -713,7 +823,7 @@ k2:
         ];
         let mut out = Vec::new();
         let mut err = Vec::new();
-        assert_eq!(run_with(args, &mut out, &mut err), Exit::Fresh);
+        assert_eq!(run_with(args, &mut out, &mut err, false), Exit::Fresh);
         assert!(out.is_empty() && err.is_empty());
         assert_eq!(
             std::fs::read_to_string(state.join(config::FLOOR_FILE))?,

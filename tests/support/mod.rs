@@ -2,8 +2,12 @@
 //!
 //! The library's unit tests include this file through `#[path]` in `src/lib.rs`, and integration tests through `mod support;`.
 //! Each includer uses only part of it, so dead code is allowed here.
+//!
+//! [`fake_rpc`] and [`FakeNft`] stand in for the node and for nft in the tests that run the built binary.
 
 #![allow(dead_code)]
+
+pub mod fake_rpc;
 
 use std::fs;
 use std::io;
@@ -63,5 +67,92 @@ impl Drop for TempDir {
         // a test that made the directory unreadable must not leave it behind
         let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o700));
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The fake nft script, `tests/support/fake-nft.sh`, as the checkout holds it.
+pub const FAKE_NFT_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/fake-nft.sh");
+
+/// The fake nft, linked from a directory of its own, with the files the script keeps next to itself.
+///
+/// The script documents its files; this type reads them and sets its knobs.
+/// It is a symlink to the checkout's script, never a copy: a sibling test that spawns a process while a copy is open for writing leaves the child holding that write descriptor until its exec, and running the copy then fails with "Text file busy".
+/// The script finds its state through `$0`, the link, so the state stays per test.
+#[derive(Debug)]
+pub struct FakeNft {
+    dir: PathBuf,
+}
+
+impl FakeNft {
+    /// Links the script from a new directory `nft` under `parent`, mode 0700.
+    pub fn install(parent: &Path) -> io::Result<Self> {
+        let dir = parent.join("nft");
+        fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        // no chmod: it would follow the link to the checkout's file, which git keeps executable
+        std::os::unix::fs::symlink(FAKE_NFT_SOURCE, dir.join("fake-nft.sh"))?;
+        Ok(Self { dir })
+    }
+
+    /// The script, the value of `--nft`.
+    pub fn path(&self) -> PathBuf {
+        self.dir.join("fake-nft.sh")
+    }
+
+    fn state(&self, name: &str) -> PathBuf {
+        self.dir.join("state").join(name)
+    }
+
+    /// Every call so far, one line of space-separated arguments each; none before the first call.
+    pub fn argv(&self) -> io::Result<Vec<String>> {
+        Ok(read_optional(&self.state("argv.log"))?
+            .map(|log| log.lines().map(str::to_owned).collect())
+            .unwrap_or_default())
+    }
+
+    /// What every `-f`, `-f -` and `-c -f -` call was given, in call order.
+    pub fn loaded(&self) -> io::Result<Vec<String>> {
+        let mut loaded = Vec::new();
+        for n in 1_u32.. {
+            match read_optional(&self.state(&format!("loaded.{n}.nft")))? {
+                Some(text) => loaded.push(text),
+                None => break,
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// The live table, one object per line, or `None` when no table is loaded.
+    pub fn table(&self) -> io::Result<Option<String>> {
+        read_optional(&self.state("table"))
+    }
+
+    /// The file that holds the live table, for a deletion that must happen at a chosen moment.
+    pub fn table_path(&self) -> PathBuf {
+        self.state("table")
+    }
+
+    /// Replaces the live table, as an operator's hand edit would.
+    pub fn set_table(&self, text: &str) -> io::Result<()> {
+        fs::write(self.state("table"), text)
+    }
+
+    /// Removes the live table, as `nft delete table` or a ruleset flush would.
+    pub fn delete_table(&self) -> io::Result<()> {
+        fs::remove_file(self.state("table"))
+    }
+
+    /// Sets the knob `name`: `fail-next` or `eperm`.
+    pub fn knob(&self, name: &str) -> io::Result<()> {
+        fs::create_dir_all(self.dir.join("state"))?;
+        fs::write(self.state(name), "")
+    }
+}
+
+/// The text of `path`, or `None` when it does not exist.
+pub fn read_optional(path: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }

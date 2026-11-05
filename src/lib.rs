@@ -10,11 +10,14 @@ pub mod addr;
 pub mod cli;
 pub mod config;
 pub mod fsutil;
+pub mod log;
 pub mod memory;
 pub mod nft;
 pub mod render;
 pub mod rpc;
 pub mod snapshot;
+pub mod status;
+pub mod sync;
 
 // the unit tests share the integration tests' std-only helpers
 #[cfg(test)]
