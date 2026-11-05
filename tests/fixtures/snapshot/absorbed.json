@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "epoch": 42,
+  "swarms": [
+    {
+      "network": "primary",
+      "worker_id": null,
+      "available": true,
+      "tracked_epoch": 42,
+      "admission": {
+        "configured": "Closed",
+        "effective": "Closed",
+        "epoch": 42,
+        "fallback": null,
+        "resolved_current": 4,
+        "required_current": 3,
+        "connected_current": 3,
+        "contradicted": 0
+      },
+      "entries": [
+        {
+          "bls_pubkey": "0xA1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1",
+          "slots": [
+            "current",
+            "observer"
+          ],
+          "peer_id": "12D3KooWC3",
+          "network_pubkey": "2323",
+          "multiaddrs": [
+            "/ip4/192.0.2.1/udp/49590/quic-v1",
+            "/dns4/validator.example/udp/49590/quic-v1",
+            "/ip6/::ffff:192.0.2.2/udp/49590/quic-v1",
+            "/ip4/169.254.1.1/udp/49590/quic-v1",
+            "not-a-multiaddr"
+          ],
+          "record_timestamp": 1793750400,
+          "source": "record",
+          "admitted": true
+        },
+        {
+          "bls_pubkey": "0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+          "slots": [
+            "eligible"
+          ],
+          "peer_id": "12D3KooWD4",
+          "network_pubkey": "2324",
+          "multiaddrs": [
+            "/ip4/198.51.100.1/udp/49590/quic-v1",
+            "/ip4/198.51.100.2/udp/49590/quic-v1",
+            "/ip4/198.51.100.3/udp/49590/quic-v1",
+            "/ip4/198.51.100.4/udp/49590/quic-v1",
+            "/ip4/198.51.100.5/udp/49590/quic-v1",
+            "/ip4/198.51.100.6/udp/49590/quic-v1",
+            "/ip4/198.51.100.7/udp/49590/quic-v1",
+            "/ip4/198.51.100.8/udp/49590/quic-v1",
+            "/ip4/198.51.100.9/udp/49590/quic-v1",
+            "/ip4/198.51.100.10/udp/49590/quic-v1",
+            "/ip4/198.51.100.11/udp/49590/quic-v1",
+            "/ip4/198.51.100.12/udp/49590/quic-v1",
+            "/ip4/198.51.100.13/udp/49590/quic-v1",
+            "/ip4/198.51.100.14/udp/49590/quic-v1",
+            "/ip4/198.51.100.15/udp/49590/quic-v1",
+            "/ip4/198.51.100.16/udp/49590/quic-v1",
+            "/ip4/198.51.100.17/udp/49590/quic-v1",
+            "/ip4/198.51.100.18/udp/49590/quic-v1",
+            "/ip4/198.51.100.19/udp/49590/quic-v1",
+            "/ip4/198.51.100.20/udp/49590/quic-v1",
+            "/ip4/198.51.100.21/udp/49590/quic-v1",
+            "/ip4/198.51.100.22/udp/49590/quic-v1",
+            "/ip4/198.51.100.23/udp/49590/quic-v1",
+            "/ip4/198.51.100.24/udp/49590/quic-v1",
+            "/ip4/198.51.100.25/udp/49590/quic-v1",
+            "/ip4/198.51.100.26/udp/49590/quic-v1",
+            "/ip4/198.51.100.27/udp/49590/quic-v1",
+            "/ip4/198.51.100.28/udp/49590/quic-v1",
+            "/ip4/198.51.100.29/udp/49590/quic-v1",
+            "/ip4/198.51.100.30/udp/49590/quic-v1",
+            "/ip4/198.51.100.31/udp/49590/quic-v1",
+            "/ip4/198.51.100.32/udp/49590/quic-v1",
+            "/ip4/198.51.100.33/udp/49590/quic-v1"
+          ],
+          "record_timestamp": 1793736000,
+          "source": "record",
+          "admitted": false
+        },
+        {
+          "bls_pubkey": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "slots": [
+            "next"
+          ],
+          "peer_id": "12D3KooWC3",
+          "network_pubkey": "2323",
+          "multiaddrs": [
+            "/ip4/192.0.2.3/udp/49590/quic-v1"
+          ],
+          "record_timestamp": 1793750400,
+          "source": "record",
+          "admitted": true
+        }
+      ]
+    }
+  ]
+}

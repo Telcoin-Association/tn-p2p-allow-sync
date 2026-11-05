@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "epoch": 42,
+  "swarms": [
+    {
+      "network": "primary",
+      "worker_id": null,
+      "available": false,
+      "tracked_epoch": null,
+      "admission": null,
+      "entries": []
+    }
+  ]
+}

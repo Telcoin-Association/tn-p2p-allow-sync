@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "epoch": 42,
+  "swarms": [
+    {
+      "network": "primary",
+      "worker_id": null,
+      "available": true,
+      "tracked_epoch": 42,
+      "admission": {
+        "configured": "Closed",
+        "effective": "Open",
+        "epoch": 42,
+        "fallback": "Stale",
+        "resolved_current": 4,
+        "required_current": 3,
+        "connected_current": 3,
+        "contradicted": 0
+      },
+      "entries": [
+        {
+          "bls_pubkey": "0x8f3a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c21d",
+          "slots": [
+            "current",
+            "eligible"
+          ],
+          "peer_id": "12D3KooWA1",
+          "network_pubkey": "2321",
+          "multiaddrs": [
+            "/ip4/203.0.113.10/udp/49590/quic-v1"
+          ],
+          "record_timestamp": 1793750400,
+          "source": "record",
+          "admitted": true
+        },
+        {
+          "bls_pubkey": "0xa71e000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009b4",
+          "slots": [
+            "eligible"
+          ],
+          "peer_id": "12D3KooWB2",
+          "network_pubkey": "2322",
+          "multiaddrs": [
+            "/ip4/198.51.100.7/udp/49590/quic-v1"
+          ],
+          "record_timestamp": 1793736000,
+          "source": "record",
+          "admitted": false
+        }
+      ]
+    }
+  ]
+}

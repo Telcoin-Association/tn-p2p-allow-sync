@@ -9,3 +9,4 @@
 pub mod addr;
 pub mod cli;
 pub mod render;
+pub mod snapshot;
