@@ -417,7 +417,7 @@ fn check_swarm_names(swarms: &[RawSwarm]) -> Result<(), SnapshotError> {
 /// Whether `name` is `primary` or `worker-N`, with `N` a worker id written in plain decimal.
 ///
 /// A leading zero is refused, so one worker cannot appear under two names.
-fn is_swarm_name(name: &str) -> bool {
+pub(crate) fn is_swarm_name(name: &str) -> bool {
     if name == PRIMARY_SWARM {
         return true;
     }

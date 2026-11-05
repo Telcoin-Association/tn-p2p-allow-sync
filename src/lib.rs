@@ -8,5 +8,6 @@
 
 pub mod addr;
 pub mod cli;
+pub mod memory;
 pub mod render;
 pub mod snapshot;
