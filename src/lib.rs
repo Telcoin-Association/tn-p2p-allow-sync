@@ -11,6 +11,7 @@ pub mod cli;
 pub mod config;
 pub mod fsutil;
 pub mod memory;
+pub mod nft;
 pub mod render;
 pub mod rpc;
 pub mod snapshot;

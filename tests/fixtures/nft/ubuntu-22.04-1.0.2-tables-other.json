@@ -1,0 +1,1 @@
+{"nftables": [{"metainfo": {"version": "1.0.2", "release_name": "Lester Gooch", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "filter", "handle": 1}}]}
