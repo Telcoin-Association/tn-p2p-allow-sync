@@ -7,7 +7,7 @@ They run on GitHub's hosted runners and on a maintainer's machine with the same 
 
 ### `ci.yaml`
 
-Five jobs, one command each, on `pull_request` and on every push to `main`:
+Six jobs, one command each, on `pull_request` and on every push to `main`:
 
 | Job | Command | What it stops |
 |---|---|---|
@@ -16,13 +16,16 @@ Five jobs, one command each, on `pull_request` and on every push to `main`:
 | `test` | `cargo test --locked` | a failing unit, golden or integration test |
 | `deny` | `cargo deny check` | an advisory, a duplicate crate version, a wildcard requirement, a license outside MIT, Apache-2.0 and Unicode-3.0, a source other than crates.io (`deny.toml`) |
 | `audit` | `cargo audit` | a RustSec advisory against `Cargo.lock` |
+| `release-dry-run` | `bash etc/tests/release_dry_run.sh` | a release step that would fail on this tree (`release.conf`, a hook, `cliff.toml` or `CHANGELOG.md` out of step with `release/release.sh`), a build that is not reproducible, and a program whose `--version` lines the release check refuses |
 
 `RUSTFLAGS=-D warnings` is set for the whole workflow, so a compiler warning fails `test` as well as `clippy`.
 The source never says `#![deny(warnings)]`: a new compiler release must not break a plain local build.
 `--locked` everywhere means `Cargo.lock` is the dependency set; a change to it is a reviewed change in the pull request.
 `deny` and `audit` fetch their advisory databases when they run, by design, so a newly published advisory turns them red on the next run with no change in this repository.
 
-Every job installs the toolchain of `rust-toolchain.toml` first (`rustup show active-toolchain || rustup toolchain install`), so the runner image's own Rust is never used.
+The five cargo jobs install the toolchain of `rust-toolchain.toml` first (`rustup show active-toolchain || rustup toolchain install`), so the runner image's own Rust is never used.
+`release-dry-run` installs none: its build runs in `BUILD_IMAGE` (see "Release workflow"), and it needs only docker with buildx, gpg and the network for the images and crates.io.
+`RELEASE_BUILD_STUB=1` swaps the docker build for a stub in a quick local run, and the script refuses it in CI.
 
 To run the gates locally, from the repository root:
 
@@ -32,10 +35,12 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo deny check
 cargo audit
+bash etc/tests/release_dry_run.sh
 cargo build --locked --release --target x86_64-unknown-linux-musl
 ```
 
 The last line is not a CI job; it shows that the release triple still links statically, and `target/x86_64-unknown-linux-musl/release/tn-p2p-allow-sync --version` prints the five version lines.
+`make ci` runs the five cargo gates with `RUSTFLAGS=-D warnings`, as CI does.
 
 ### `nft-real.yaml`
 
@@ -82,7 +87,7 @@ Build with `--target x86_64-unknown-linux-musl` there, so the static binary also
 
 ## Required checks
 
-Branch protection on `main` must require `fmt`, `clippy`, `test`, `deny` and `audit`, and the two checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)` and `nft-real (ubuntu-22.04)`.
+Branch protection on `main` must require `fmt`, `clippy`, `test`, `deny`, `audit` and `release-dry-run`, and the two checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)` and `nft-real (ubuntu-22.04)`.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
@@ -143,7 +148,67 @@ The runner image is a label (`ubuntu-24.04`, `ubuntu-22.04`), not a digest, so e
 `rustup` downloads the toolchain of `rust-toolchain.toml` and checks it against the Rust release manifest; that pin is the channel `1.94.1`, not a digest.
 The advisory databases `deny` and `audit` read are fetched fresh on every run, on purpose.
 
+## Release workflow
+
+`.github/workflows/release.yaml` checks a release tag, opens a draft GitHub release for it, and checks the release again once a maintainer has published it.
+It signs and publishes nothing: a maintainer builds, signs and publishes with the `make release-*` targets, which run `release/release.sh`, the release script of the [tn-release-signing](https://github.com/Telcoin-Association/tn-release-signing) submodule at `release/`, with this repository's values and hooks from `release.conf`.
+The procedure is in [`release/docs/signing.md`](../release/docs/signing.md), and the threshold and the keys are in [`release/KEYS.md`](../release/KEYS.md).
+
+| Job | Event | Runs | Token | Timeout |
+|---|---|---|---|---|
+| `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `release/release.sh check-tag`, then `release/release.sh notes` into the step summary | `contents: read`, `actions: read` | 15 min |
+| `draft-release` | a pushed `v*` tag, once `validate-tag` has passed | `release/release.sh draft` | `contents: write` | 5 min |
+| `verify-release` | a published release (`release: published`); a dispatch with `mode: verify` | `release/release.sh verify` with `TN_P2P_ALLOW_REBUILD=1` | `contents: read` | 30 min |
+
+The tag filter is broader than the tag grammar on purpose: a malformed `v` tag fails visibly in `validate-tag` instead of being ignored, and `TAG_RE` in `release.conf` decides what a release tag is.
+A dispatch (*Release* -> *Run workflow*) takes a `tag` and a `mode` and is possible only once the workflow is on `main`; `verify` works on a published release only, because a read-only token cannot see drafts.
+No job in `release.yaml` may share its name with a required check: GitHub matches a required check by name on a commit, whatever workflow reported it, and a tag can be pushed on any commit.
+
+### Scripts and keys come from the pointer on `main`
+
+Every job checks out `refs/heads/main`, never the tagged tree, with `fetch-depth: 0`, `submodules: true` and `persist-credentials: false`.
+`release.conf` comes from that checkout, and `release.sh` and the maintainer keys from the tn-release-signing commit that `main` records for `release/`.
+`release.sh` reads `keys/*.asc` and the `Signatures required` line of `KEYS.md` out of the submodule's object store at that commit, never from its checked-out files, and `make release-build` and `make release-publish` refuse a `release.sh` or `release.conf` that differs from `main`'s.
+A tag on a commit that edits a hook, moves the pointer or adds a key would otherwise be judged by its own edit.
+The job definitions are the exception: GitHub reads `release.yaml` from the tagged commit, so the tag ruleset below decides who can run it for a release tag.
+`submodules: true` fetches tn-release-signing with this repository's token, so that repository has to be public, as the operator's check, which clones it, needs anyway.
+
+### Reproducible instead of attested
+
+No attestation stands behind a release here, unlike telcoin-network: the full suite, the real-kernel job included, is a required pull request check, and the program is reproducible.
+`make release-build` builds the program twice from a pristine worktree of the tag, with `etc/Dockerfile` in `BUILD_IMAGE`, `--pull` and `--no-cache`, and uploads nothing unless both builds are the same file.
+`make release-verify` (where `TN_P2P_ALLOW_REBUILD` defaults to 1) and `verify-release` rebuild it from the tagged commit and require the same file again; `make release-sign` rebuilds only with `TN_P2P_ALLOW_REBUILD=1`, since an amd64 build under emulation on a Mac is slow.
+A rebuild takes `etc/Dockerfile` and the `BUILD_IMAGE` line of `release.conf` from the tagged commit, so an older release stays reproducible after `main` moves the image.
+Every check also runs the program's `--version` in `BUILD_IMAGE`, with no network, and requires the five lines of the release: version, the tag's commit, the triple, a `snapshot-versions` list holding 1, and `config-version 1`.
+The one job with a write token, `draft-release`, compiles nothing; the rebuild in `verify-release` runs the build code of every dependency, inside a container that receives no token, in a job whose token can only read.
+
+`ci.yaml`'s `release-dry-run` job runs all of this on every pull request, the real build included, through `etc/tests/release_dry_run.sh`.
+
+### The post-publish check is detective only
+
+`verify-release` repeats what `make release-publish` checked: the tag, the asset set and `SHA256SUMS`, the tarball's files, the signatures on `SHA256SUMS` against the keys at the pointer on `main`, the `--version` lines, and the rebuild.
+The release is public by the time it runs, so a failure is an alarm for a maintainer, not a gate.
+GitHub starts no workflow for an event a `GITHUB_TOKEN` caused, so after every publish check that a `verify-release` run exists for the tag, and start one with a `verify` dispatch if none does.
+
+### Settings the release workflow requires
+
+None of these is visible to the workflow, and each closes a gap the workflow leaves open.
+
+1. **Two tag rulesets on `refs/tags/v*`** (Settings -> Rules -> Rulesets): one with *Restrict creations* and the maintainers on its bypass list, and one with *Restrict updates* and *Restrict deletions* and an empty bypass list, so only a maintainer can create a `v*` tag and nobody can move or delete one.
+   A ruleset's bypass list applies to every rule in it, hence two.
+   The signature is not a GitHub rule: `validate-tag` and every later step refuse a tag without exactly one signature by an allowlisted key.
+2. **Immutable releases** (Settings -> General -> Releases), so the files `verify-release` checked are the files operators download.
+3. **A review from code owners on `main`** (*Require review from Code Owners*), so the rule in [`CODEOWNERS`](CODEOWNERS) on `/release`, `/.gitmodules` and `/release.conf` binds and every move of the pointer, change of its URL and change of `MIN_SIGNATURES` or a hook is in front of a maintainer ([`release/docs/signing.md`](../release/docs/signing.md#codeowners-for-the-pointer)).
+4. **`release-dry-run` among the required checks of `main`**, next to the five gates of `ci.yaml`.
+5. **The default workflow permission can stay read-only** (Settings -> Actions -> General -> Workflow permissions): `draft-release` asks for `contents: write` in its own `permissions:` block.
+
+### Images
+
+`BUILD_IMAGE` in `release.conf` (the build, the rebuild and the `--version` check) and `GIT_CLIFF_IMAGE` in `release/release.sh` (the changelog section `prep` writes) are pinned by digest.
+The first moves with `RUSTUP_TOOLCHAIN` in `etc/Dockerfile` and `rust-toolchain.toml`, by the commands in the comment above it, and the second moves with the submodule pointer.
+`docker` and `buildx` are the runner image's own, trusted and not pinned, like the rest of it.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins `1.94.1` with `rustfmt`, `clippy` and the `x86_64-unknown-linux-musl` target, and `rustup` applies it to every cargo call in the repository.
-To bump it, change `rust-toolchain.toml` and `rust-version` in `Cargo.toml` together, in one pull request, along with the release build image once that exists.
+To bump it, change `rust-toolchain.toml`, `rust-version` in `Cargo.toml`, `RUSTUP_TOOLCHAIN` in `etc/Dockerfile` and `BUILD_IMAGE` in `release.conf` together, in one pull request.

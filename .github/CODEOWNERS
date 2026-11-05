@@ -1,0 +1,14 @@
+# Code owners of tn-p2p-allow-sync.
+#
+# grantkee is the only maintainer today, so every rule names that one login.
+# A maintainer who later holds a release key joins each rule.
+# The rules bind once the branch protection of main requires a review from code owners (.github/ACTIONS.md, "Settings the release workflow requires").
+
+# release signing: the pointer to tn-release-signing, where it is fetched from, and the values and hooks release.sh enforces
+/release       @grantkee
+/.gitmodules   @grantkee
+/release.conf  @grantkee
+# the release build: the image recipe both builds use, the tag workflow, and the Makefile targets that wrap each step
+/etc/Dockerfile                   @grantkee
+/.github/workflows/release.yaml   @grantkee
+/Makefile                         @grantkee

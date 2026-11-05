@@ -1,0 +1,194 @@
+# Public releases: check a release tag, open a draft release for it, and check the
+# release again once a maintainer has published it.
+#
+# CI validates and drafts; the job with a write token never builds. The program is built
+# on a maintainer's build server by `make release-build`, twice from the tag in an image
+# pinned by digest, and uploaded only when both builds are the same file. verify-release
+# rebuilds it from the tag the same way and compares it with the published one, with a
+# read-only token. The only job here with a write token runs the pinned actions/checkout,
+# which receives the token for its fetch and does not leave it in the checkout, and
+# release/release.sh, which calls gh. That token guards nothing by itself: anyone with
+# write access can get the same permission from a workflow on their own branch. No token
+# in CI can sign: the signatures on the tag and on SHA256SUMS come from maintainer keys
+# that never touch a runner, and they are what protects a release. The procedure:
+# release/docs/signing.md, with the values and hooks of this repository in release.conf.
+#
+# Every job checks out main as it stands when the job starts, never the tagged tree, with
+# the release/ submodule at the commit main records for it. release.conf comes from main,
+# and release.sh and the maintainer keys from the tn-release-signing commit that main's
+# pointer names: release.sh reads the keys out of the submodule's object store at that
+# commit, never from checked-out files. A tag on a commit that edits a hook, moves the
+# pointer or adds a key would otherwise be judged by its own edit. The rebuild in
+# verify-release takes etc/Dockerfile and the image pin from the tagged commit instead,
+# because the question there is whether that commit gives the published program.
+# This file itself is not covered by that. GitHub reads the job definitions from the
+# tagged commit (for a dispatch, from the branch it is run on), so who may push a `v*`
+# tag is decided by the tag ruleset, a repository setting (.github/ACTIONS.md, "Release
+# workflow"). The ruleset limits who can create, move or delete a `v*` tag and nothing
+# else; it does not limit who can write releases.
+#
+# The post-publish check (`verify-release`) is detective only. The release is already
+# public when it runs, so a failure is an alarm for a maintainer, not a gate.
+#
+# No job here may share its name with a required check of ci.yaml or nft-real.yaml.
+# GitHub matches a required check by name on a commit, whatever workflow reported it,
+# and a tag can be pushed on any commit, a pull request's head included.
+name: Release
+
+on:
+  # Deliberately broader than the tag grammar: a malformed `v` tag runs and fails
+  # visibly in validate-tag instead of being ignored. TAG_RE in release.conf is the
+  # authority on what a release tag is.
+  push:
+    tags: ["v*"]
+  # `published` also fires when a draft is published as a prerelease, which every rc
+  # release is; `prereleased` does not fire for those. The maintainer publishes with
+  # their own gh login, so the event fires. A publish made with a GITHUB_TOKEN starts no
+  # workflow, so a release published from another workflow is never checked here; the
+  # maintainer guide says to confirm a verify-release run exists after every publish and
+  # to dispatch `verify` if none does.
+  release:
+    types: [published]
+  # Runs only once this file is on the default branch. `validate` repeats the tag
+  # checks and drafts nothing; run on an old, unsigned tag it fails, which shows the
+  # gate fails closed. `verify` repeats the post-publish check; the token cannot see
+  # draft releases, so it works on published ones only.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        type: string
+      mode:
+        description: "validate: the tag checks; verify: the post-publish check"
+        required: true
+        type: choice
+        options: [validate, verify]
+        default: validate
+
+# Everything here reads the repository; validate-tag also reads its own workflow run, and
+# draft-release alone adds the write it needs to create the draft (least privilege, CodeQL
+# actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
+# One run per event and tag at a time. A running run is never cancelled, but GitHub
+# keeps only the newest waiting run in a group and cancels the one already waiting
+# there. With the event in the key, a dispatch can never displace a waiting push or
+# release run; only another run of the same event and tag can, such as a third dispatch
+# for one tag. A cancelled run shows as cancelled and can be re-run.
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# The steps read the tag from here and nowhere else. Every `run:` below uses
+# "$RELEASE_TAG" and interpolates no expression, so the tag reaches the shell as data,
+# and release/release.sh rejects anything outside the tag grammar before it uses it.
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+
+jobs:
+  # Proves: the tag is an annotated tag signed by a key in the allowlist at the
+  # tn-release-signing commit main records; it points at a commit on main whose Cargo
+  # version and CHANGELOG section match the tag. The step summary shows the notes the
+  # draft will carry.
+  # Does not prove: who pushed the tag, or that it cannot be moved or deleted later.
+  # That is the tag ruleset's job, a repository setting no workflow can check.
+  validate-tag:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'validate')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # actions: read lets the check read when GitHub created this run. On the push of a tag
+    # the first run compares the tag with every release tag in the checkout; a re-run
+    # compares it with the tags created before that time, the time of the push, whatever
+    # date the tag itself carries.
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # main, never the tag; the header says why. `refs/heads/main` is fully qualified so
+      # that a tag named `main` cannot be picked up. fetch-depth: 0 brings every tag and
+      # refs/remotes/origin/main, which the signature, ancestry and version checks read.
+      # submodules: true checks release/ out at the commit main records, which holds
+      # release.sh and the keys; the script fetches nothing in CI. The job definition comes
+      # from the tagged commit instead, and what stops a tag on a commit that edits it is
+      # the tag ruleset (see the header).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Check the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./release/release.sh check-tag "$RELEASE_TAG"
+
+      - name: Release notes
+        run: ./release/release.sh notes "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  # Proves nothing of its own: it runs only after validate-tag passed for the same push,
+  # and creates the draft release with the notes, or refreshes the notes of a draft it
+  # created before. The draft carries no assets; the maintainer's `make release-build`
+  # uploads them and `make release-publish` makes the release public.
+  # Does not prove: that the draft stays as written. Anyone with write access can edit a
+  # draft, so every later step re-verifies the assets and signatures rather than trusting
+  # it, and keeping a published release from changing is the job of immutable releases,
+  # a repository setting.
+  draft-release:
+    needs: validate-tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # The only write in this workflow. contents: write lets the token create, edit,
+    # publish and delete releases and their assets, and push any branch or tag that no
+    # ruleset protects. It holds no artifact and cannot sign one, and the operator's
+    # check verifies SHA256SUMS.asc against the keys at the pointer on main.
+    permissions:
+      contents: write
+    steps:
+      # main and its release/ submodule, as in validate-tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./release/release.sh draft "$RELEASE_TAG"
+
+  # Proves: the published release is still what `make release-publish` verified, which
+  # re-checks the asset set after its prompt and again after publishing. It repeats the
+  # tag checks, then checks the asset set and SHA256SUMS, the tarball's files, the
+  # maintainer signatures on SHA256SUMS against the allowlist at the pointer on main, the
+  # five --version lines of the program, and, with TN_P2P_ALLOW_REBUILD=1, that a rebuild
+  # from the tagged commit gives the same program byte for byte.
+  # Does not prove anything in advance: the release is public before this runs, so a
+  # failure is an alarm, not a gate. Keeping the release from changing after this check
+  # is the job of immutable releases, a repository setting.
+  verify-release:
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'verify')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # read-only: the rebuild runs the build code of every dependency, inside a container
+    # that receives no token
+    permissions:
+      contents: read
+    steps:
+      # main and its release/ submodule, as in validate-tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Verify the published release and rebuild it from the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TN_P2P_ALLOW_REBUILD: "1"
+        run: ./release/release.sh verify "$RELEASE_TAG"

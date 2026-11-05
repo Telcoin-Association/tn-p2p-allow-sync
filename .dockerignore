@@ -1,0 +1,15 @@
+# The release build (etc/Dockerfile) needs the sources, Cargo.toml and Cargo.lock; nothing
+# here reaches the program, and keeping it out keeps the build context small.
+
+# build output, which would also hide a stale program from the build
+target
+
+# git metadata, the release submodule and the CI files: the commit reaches the build as the
+# GIT_SHA build arg, so neither .git nor git is needed
+.git
+.gitmodules
+release
+.github
+
+# local work
+tasks

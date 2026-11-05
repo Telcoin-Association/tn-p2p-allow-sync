@@ -1,4 +1,5 @@
-# The gates of every pull request and every push to main: fmt, clippy, test, deny, audit.
+# The gates of every pull request and every push to main: fmt, clippy, test, deny, audit,
+# and a dry run of the release.
 #
 # Each job runs one command, the same one a maintainer runs locally before pushing, so a
 # red job reproduces with the command its last step names (.github/ACTIONS.md lists them).
@@ -118,3 +119,21 @@ jobs:
 
       - name: cargo audit
         run: cargo audit
+
+  # every step of release/release.sh on a copy of this tree, in a dry run with a throwaway
+  # key, and with the real build: two builds and the rebuild of verify must give one program.
+  # It needs no toolchain on the runner (the build runs in release.conf's BUILD_IMAGE) and
+  # no token beyond reading the repository and the release/ submodule.
+  release-dry-run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Release dry run
+        run: bash etc/tests/release_dry_run.sh
