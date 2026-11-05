@@ -39,14 +39,50 @@ The last line is not a CI job; it shows that the release triple still links stat
 
 ### `nft-real.yaml`
 
-It arrives with the real-kernel tests and runs `tests/real_nft.rs` under `sudo` on `ubuntu-22.04` and `ubuntu-24.04`, pinned rather than `ubuntu-latest` because the question it answers is about kernels and nft versions.
-It is required on every pull request that touches `render`, `nft` or `sync` (`src/render.rs`, `src/nft.rs`, `src/sync.rs` and their goldens and fixtures): such a pull request does not merge without a green run on both runners.
+One job, `nft-real`, on a matrix of `ubuntu-24.04` and `ubuntu-22.04`, on `pull_request` and on every push to `main`.
+The runners are pinned by release rather than `ubuntu-latest` because the question the job answers is about kernels and nft versions: 22.04 ships nft 1.0.2 and 24.04 ships nft 1.0.9.
+It installs `nftables` and `iproute2`, builds the test binary as the runner user (`cargo test --locked --no-run --test real_nft`), runs only that binary under `sudo -E` with `--ignored`, and uploads `target/real-nft/` (the raw `nft -j` listing after each step and `summary.txt`) as the artifact `real-nft-<runner>`.
+
+`tests/real_nft.rs` creates a network namespace and a veth pair, loads the rendered program into the runner's own namespace, and sends UDP from the far end of the pair:
+
+| Step | What it asserts |
+|---|---|
+| traffic | the accept and drop counters count exactly the datagrams from the listed and the unlisted source, only the listed ones are delivered, and a port outside the program is left alone |
+| re-apply | loading the same program, then one with one more element, keeps both counters' totals, and the rules go on counting into them; a reset fails the job, and the choice of program form goes back to the plan (open question 9) instead of the job switching forms |
+| reload | after `nft delete table`, the program recreates the table with both counters at zero |
+| top of the address space | how nft lists `0.0.0.0/0`, `::/0`, `128.0.0.0/1` and `8000::/1` in the static sets: a prefix or the equivalent range passes, the sync's idempotence compare matches either, and `summary.txt` records which one nft printed |
+| load time | a program of 10000 IPv4 plus 10000 IPv6 addresses loads in under 10 s over the live table, again over itself, and from nothing |
+
+The test refuses to run where table `inet tn_p2p_allow` already exists, and deletes the table and the namespace when it ends.
+Without root, nft or ip it prints why and passes; the job sets `TN_REAL_NFT_REQUIRED=1`, which turns that skip into a failure.
+
+It is required on every pull request that touches `render`, `nft`, `sync` or `addr`: such a pull request does not merge without a green run on both runners.
 A `paths:` filter alone cannot carry that rule, because GitHub treats a required check that never reported as pending and the pull request waits for it forever.
-The workflow therefore has to report on every pull request and decide inside the job whether the suite needs to run.
+The workflow therefore reports on every pull request, and its first step decides from `git diff --name-only HEAD^1 HEAD`, the merge commit against the base branch tip, whether the suite runs.
+It runs when the pull request touches any of these:
+
+- `src/render.rs`, `src/nft.rs`, `src/sync.rs`, and `src/addr.rs`, which parses and masks the networks the program and the compare are built from;
+- `tests/golden/`, `tests/fixtures/nft/`, `tests/support/`, `tests/real_nft.rs`;
+- `.github/workflows/nft-real.yaml`;
+- `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, since a dependency or a compiler changes the code of the four modules too.
+
+Otherwise the job ends green with a notice.
+A push to `main` always runs the suite, and so does a pull request whose diff cannot be computed.
+The list lives in the `watched` pattern of the workflow's first step; change both together.
+
+To run the test locally, as root on a Linux host:
+
+```sh
+cargo test --locked --no-run --test real_nft
+sudo target/debug/deps/real_nft-<hash> --ignored --exact real_kernel_nft --nocapture
+```
+
+In a container, `ip netns add` has to mount `/run/netns`, so the container needs `--cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN --security-opt apparmor=unconfined`.
+Build with `--target x86_64-unknown-linux-musl` there, so the static binary also starts in an image whose glibc is older than the host's, and mount the checkout at its own path, because the test writes to `target/real-nft/` under the path it was built in.
 
 ## Required checks
 
-Branch protection on `main` must require `fmt`, `clippy`, `test`, `deny` and `audit`, and the `nft-real.yaml` check once that workflow exists.
+Branch protection on `main` must require `fmt`, `clippy`, `test`, `deny` and `audit`, and the two checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)` and `nft-real (ubuntu-22.04)`.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
@@ -60,9 +96,10 @@ A SHA cannot move, so the code that runs is the code that was reviewed when the 
 |---|---|---|---|---|
 | `actions/checkout` | `v7.0.1` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | node24 | every job |
 | `taiki-e/install-action` | `v2.87.22` | `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` | composite (shell steps only) | `deny`, `audit` |
+| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real` |
 
 These are the releases `telcoin-network` pins, so one review of an upstream release covers both repositories.
-Both are lightweight tags, so the tag ref names the commit directly.
+All three are lightweight tags, so the tag ref names the commit directly.
 
 The tools `install-action` installs are pinned by an explicit version as well:
 
@@ -101,7 +138,8 @@ A tool version moves the same way: pick the release, confirm the pinned `install
 
 ### What a pin does not cover
 
-The runner image is a label (`ubuntu-24.04`), not a digest, so everything preinstalled on it, `rustup` included, is trusted and not pinned.
+The runner image is a label (`ubuntu-24.04`, `ubuntu-22.04`), not a digest, so everything preinstalled on it, `rustup` included, is trusted and not pinned.
+`nft-real` installs `nftables` and `iproute2` from the runner release's own archive, unpinned on purpose: the job tests the versions a validator on that release gets.
 `rustup` downloads the toolchain of `rust-toolchain.toml` and checks it against the Rust release manifest; that pin is the channel `1.94.1`, not a digest.
 The advisory databases `deny` and `audit` read are fetched fresh on every run, on purpose.
 
