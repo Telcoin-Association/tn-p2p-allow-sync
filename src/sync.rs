@@ -407,6 +407,7 @@ fn log_absorbed<E: Write>(log: &mut Log<E>, warnings: &Warnings) {
         ("dns-skipped", warnings.dns_skipped),
         ("unparsed", warnings.unparsed),
         ("truncated-lists", warnings.truncated_lists),
+        ("pool-ahead", warnings.pool_ahead),
     ] {
         if n > 0 {
             log.line(
@@ -1449,6 +1450,36 @@ mod tests {
             snapshot_from_bytes(&huge).map(|_| ()),
             Err("rpc-body-too-large".to_owned())
         );
+    }
+
+    #[test]
+    fn a_pool_ahead_of_its_window_is_logged_once_with_the_other_kinds() {
+        let logged = |warnings: &Warnings| {
+            let mut out = Vec::new();
+            log_absorbed(&mut Log::new(&mut out, false), warnings);
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let ahead = Warnings {
+            pool_ahead: 1,
+            ..Warnings::default()
+        };
+        assert_eq!(logged(&ahead), "absorbed kind=pool-ahead count=1\n");
+
+        let both = Warnings {
+            pool_ahead: 1,
+            dns_skipped: 2,
+            ..Warnings::default()
+        };
+        let text = logged(&both);
+        assert_eq!(text.matches("kind=pool-ahead").count(), 1, "{text}");
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "absorbed kind=dns-skipped count=2",
+                "absorbed kind=pool-ahead count=1"
+            ],
+        );
+        assert_eq!(logged(&Warnings::default()), "");
     }
 
     #[test]

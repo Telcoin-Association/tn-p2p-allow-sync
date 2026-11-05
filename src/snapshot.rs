@@ -256,7 +256,7 @@ pub struct Snapshot {
 /// One swarm of a [`Snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Swarm {
-    /// Whether the entries are the swarm's complete tracked set: it answered, its pool is published, and its fallback is null or `Unresolved`.
+    /// Whether the entries are the swarm's complete tracked set: it answered, its pool is published and not behind its admission window, and its fallback is null or `Unresolved`.
     ///
     /// The primary of a parsed snapshot is always authoritative.
     /// A worker swarm that is not is additions-only: its addresses are kept and refreshed, its missing keys are never removed.
@@ -308,6 +308,8 @@ pub struct Warnings {
     pub unparsed: u64,
     /// Address lists longer than [`MAX_MULTIADDRS_PER_LIST`], of which only the first entries are read.
     pub truncated_lists: u64,
+    /// One when the primary's `tracked_epoch` is above the epoch of its admission window; the pool is accepted as published.
+    pub pool_ahead: u64,
 }
 
 /// Why a snapshot is not authoritative; [`SnapshotError::token`] is the `STALE_REASON`.
@@ -325,7 +327,7 @@ pub enum SnapshotError {
     Bls,
     /// `primary-unavailable`: no primary swarm, or one with `available: false`.
     PrimaryUnavailable,
-    /// `pool-unpublished`: the primary's `tracked_epoch` is null.
+    /// `pool-unpublished`: the primary's `tracked_epoch` is null, or below the epoch of its admission window.
     PoolUnpublished,
     /// `fallback-missing`: the primary's fallback is `Missing`.
     FallbackMissing,
@@ -386,15 +388,19 @@ pub fn parse(result: Value) -> Result<Snapshot, SnapshotError> {
         return Err(SnapshotError::Entries);
     }
     // read before the swarms are consumed, reported after their keys are checked
-    let epoch = primary_epoch(&raw.swarms);
+    let primary = primary_epoch(&raw.swarms);
     let mut warnings = Warnings::default();
     let mut swarms = BTreeMap::new();
     for raw_swarm in raw.swarms {
         let (name, swarm) = read_swarm(raw_swarm, &mut warnings)?;
         swarms.insert(name, swarm);
     }
+    let PrimaryEpoch { epoch, ahead } = primary?;
+    if ahead {
+        bump(&mut warnings.pool_ahead);
+    }
     Ok(Snapshot {
-        epoch: epoch?,
+        epoch,
         swarms,
         warnings,
     })
@@ -428,8 +434,16 @@ pub(crate) fn is_swarm_name(name: &str) -> bool {
     })
 }
 
+/// The primary swarm's tracked epoch in a snapshot it makes authoritative.
+struct PrimaryEpoch {
+    /// The primary's `tracked_epoch`.
+    epoch: u64,
+    /// Whether `epoch` is above the epoch of the primary's admission window.
+    ahead: bool,
+}
+
 /// The snapshot's epoch, if the primary swarm makes the snapshot authoritative (rule 1 of the fail-open rules).
-fn primary_epoch(swarms: &[RawSwarm]) -> Result<u64, SnapshotError> {
+fn primary_epoch(swarms: &[RawSwarm]) -> Result<PrimaryEpoch, SnapshotError> {
     let primary = swarms
         .iter()
         .find(|swarm| swarm.network == PRIMARY_SWARM)
@@ -440,10 +454,22 @@ fn primary_epoch(swarms: &[RawSwarm]) -> Result<u64, SnapshotError> {
         .ok_or(SnapshotError::PoolUnpublished)?;
     // an available swarm always reports its status, so a missing one is a broken schema
     let admission = primary.admission.as_ref().ok_or(SnapshotError::Malformed)?;
+    if pool_behind(epoch, admission) {
+        return Err(SnapshotError::PoolUnpublished);
+    }
+    let ahead = admission.epoch.is_some_and(|window| epoch > window);
     match fallback_fault(admission.fallback.as_deref()) {
         Some(fault) => Err(fault),
-        None => Ok(epoch),
+        None => Ok(PrimaryEpoch { epoch, ahead }),
     }
+}
+
+/// Whether a swarm's pool, tracked at `tracked_epoch`, is behind the epoch of its admission window.
+///
+/// The tracked sets change only on a publication, so after a failed pool read they are still the previous epoch's.
+/// A window without an epoch leaves the pool alone.
+fn pool_behind(tracked_epoch: u64, admission: &RawAdmission) -> bool {
+    admission.epoch.is_some_and(|window| tracked_epoch < window)
 }
 
 /// The failure a fallback means for membership, or `None` when the listed keys can be trusted.
@@ -460,12 +486,14 @@ fn fallback_fault(fallback: Option<&str>) -> Option<SnapshotError> {
 
 /// Reads one swarm whose name and size were checked; fails only on a bad key.
 fn read_swarm(raw: RawSwarm, warnings: &mut Warnings) -> Result<(String, Swarm), SnapshotError> {
+    // a pool behind its window still lists the previous epoch's keys, which must not strike the keys it failed to publish
     let authoritative = raw.available
-        && raw.tracked_epoch.is_some()
-        && raw
-            .admission
-            .as_ref()
-            .is_some_and(|admission| fallback_fault(admission.fallback.as_deref()).is_none());
+        && raw.tracked_epoch.zip(raw.admission.as_ref()).is_some_and(
+            |(tracked_epoch, admission)| {
+                !pool_behind(tracked_epoch, admission)
+                    && fallback_fault(admission.fallback.as_deref()).is_none()
+            },
+        );
     let mut entries = BTreeMap::new();
     for raw_entry in &raw.entries {
         let (key, uppercase) =
@@ -548,6 +576,7 @@ mod tests {
 
     const GOOD: &str = include_str!("../tests/fixtures/snapshot/good.json");
     const ABSORBED: &str = include_str!("../tests/fixtures/snapshot/absorbed.json");
+    const WORKER_BEHIND: &str = include_str!("../tests/fixtures/snapshot/worker-behind.json");
 
     /// Every stored fixture that fails, with the token it must give.
     const FAILING: &[(&str, &str, &str)] = &[
@@ -599,6 +628,11 @@ mod tests {
         (
             "pool-unpublished",
             include_str!("../tests/fixtures/snapshot/pool-unpublished.json"),
+            "pool-unpublished",
+        ),
+        (
+            "pool-behind",
+            include_str!("../tests/fixtures/snapshot/pool-behind.json"),
             "pool-unpublished",
         ),
         (
@@ -749,6 +783,7 @@ mod tests {
                 dns_skipped: 1,
                 unparsed: 1,
                 truncated_lists: 1,
+                pool_ahead: 0,
             }
         );
         let primary = swarm(&snapshot, PRIMARY_SWARM)?;
@@ -819,6 +854,8 @@ mod tests {
             ("42", Some("null"), true),
             ("42", Some(r#""Unresolved""#), true),
             ("null", Some("null"), false),
+            ("41", Some("null"), false),
+            ("43", Some("null"), true),
             ("42", Some(r#""Missing""#), false),
             ("42", Some(r#""Stale""#), false),
             ("42", Some(r#""Contradictory""#), false),
@@ -877,6 +914,63 @@ mod tests {
         *at(&mut result, "/epoch")? = Value::Null;
         *at(&mut result, "/swarms/0/tracked_epoch")? = 43.into();
         assert_eq!(parse(result)?.epoch, 43);
+        Ok(())
+    }
+
+    #[test]
+    fn a_pool_behind_the_admission_window_is_unpublished() -> TestResult {
+        // tracked_epoch, admission epoch, token, pool_ahead
+        let behind = Some("pool-unpublished");
+        let cases = [
+            (Value::from(41), Value::from(42), behind, 0),
+            (Value::from(0), Value::from(42), behind, 0),
+            (Value::from(42), Value::from(42), None, 0),
+            (Value::from(43), Value::from(42), None, 1),
+            (Value::from(41), Value::Null, None, 0),
+        ];
+        for (tracked, window, token, ahead) in cases {
+            let mut result = value(GOOD)?;
+            *at(&mut result, "/swarms/0/tracked_epoch")? = tracked.clone();
+            *at(&mut result, "/swarms/0/admission/epoch")? = window.clone();
+            let case = format!("tracked {tracked} window {window}");
+            match parse(result) {
+                Ok(snapshot) => {
+                    assert_eq!(token, None, "{case}");
+                    assert_eq!(Some(snapshot.epoch), tracked.as_u64(), "{case}");
+                    assert_eq!(snapshot.warnings.pool_ahead, ahead, "{case}");
+                    assert!(swarm(&snapshot, PRIMARY_SWARM)?.authoritative, "{case}");
+                }
+                Err(e) => assert_eq!(Some(e.token().as_str()), token, "{case}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_worker_behind_its_admission_window_is_additions_only() -> TestResult {
+        let snapshot = parse(value(WORKER_BEHIND)?)?;
+        assert_eq!(snapshot.epoch, 42);
+        assert_eq!(snapshot.warnings, Warnings::default());
+        assert!(swarm(&snapshot, PRIMARY_SWARM)?.authoritative);
+        let worker = swarm(&snapshot, "worker-0")?;
+        assert!(!worker.authoritative);
+        assert_eq!(worker.tracked_epoch, Some(41));
+        // an additions-only swarm still refreshes the addresses it lists
+        assert_eq!(
+            entry(worker, &example_key("8f3a", "c21d"))?.ips,
+            BTreeSet::from([v4(203, 0, 113, 10)])
+        );
+
+        // only behind counts: a worker ahead of its window, or with no window epoch, stays authoritative and warns nothing
+        for (tracked, window) in [(Value::from(43), Value::from(42)), (41.into(), Value::Null)] {
+            let mut result = value(WORKER_BEHIND)?;
+            *at(&mut result, "/swarms/1/tracked_epoch")? = tracked.clone();
+            *at(&mut result, "/swarms/1/admission/epoch")? = window.clone();
+            let snapshot = parse(result)?;
+            let case = format!("tracked {tracked} window {window}");
+            assert!(swarm(&snapshot, "worker-0")?.authoritative, "{case}");
+            assert_eq!(snapshot.warnings.pool_ahead, 0, "{case}");
+        }
         Ok(())
     }
 
@@ -1055,11 +1149,19 @@ mod tests {
         )?;
         assert_eq!(token_of(result).as_deref(), Some("snapshot-swarms"));
 
-        // an unpublished pool outranks a fallback
+        // an unpublished pool outranks a fallback, and so does a pool behind its window
+        for tracked in [Value::Null, Value::from(41)] {
+            let mut result = value(GOOD)?;
+            *at(&mut result, "/swarms/0/tracked_epoch")? = tracked;
+            *at(&mut result, "/swarms/0/admission/fallback")? = "Missing".into();
+            assert_eq!(token_of(result).as_deref(), Some("pool-unpublished"));
+        }
+
+        // a missing admission outranks a pool behind its window, which needs the window to be judged
         let mut result = value(GOOD)?;
-        *at(&mut result, "/swarms/0/tracked_epoch")? = Value::Null;
-        *at(&mut result, "/swarms/0/admission/fallback")? = "Missing".into();
-        assert_eq!(token_of(result).as_deref(), Some("pool-unpublished"));
+        *at(&mut result, "/swarms/0/tracked_epoch")? = 41.into();
+        *at(&mut result, "/swarms/0/admission")? = Value::Null;
+        assert_eq!(token_of(result).as_deref(), Some("snapshot-malformed"));
         Ok(())
     }
 
