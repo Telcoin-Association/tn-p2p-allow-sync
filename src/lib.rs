@@ -8,7 +8,14 @@
 
 pub mod addr;
 pub mod cli;
+pub mod config;
+pub mod fsutil;
 pub mod memory;
 pub mod render;
 pub mod rpc;
 pub mod snapshot;
+
+// the unit tests share the integration tests' std-only helpers
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
