@@ -386,6 +386,13 @@ step "$clone" env RELEASE_REMOTE_SSH="$FX/fake-ssh" RELEASE_GPG_KEY="$fpr" \
 expect_rc 2 "make release-sign-remote refuses a stand-in ssh outside a dry run"
 expect_err "RELEASE_REMOTE_SSH is for dry runs" "it says the stand-in is for dry runs"
 
+# ~/dir is dir: the stand-in runs the remote command here, so the missing directory is
+# looked for under the clone, and the error is the prelude's
+step "$clone" rel RELEASE_REMOTE_SSH="$FX/fake-ssh" make --no-print-directory release-setup-remote "REMOTE=buildbox:~/nowhere"
+expect_rc 2 "make release-setup-remote fails on a checkout that is not there"
+expect_err "no directory nowhere on buildbox: pass REMOTE=buildbox:<path of the checkout>" "it reads ~/nowhere as nowhere under the server's home and says so"
+: >"$FAKE_SSH_LOG"
+
 step "$clone" rel RELEASE_REMOTE_SSH="$FX/fake-ssh" RELEASE_REMOTE_GNUPGHOME="$RR" \
     make --no-print-directory release-setup-remote "REMOTE=buildbox:$clone"
 expect_rc 0 "make release-setup-remote creates the server's GnuPG home over ssh"

@@ -116,7 +116,7 @@ The server does not need to know the signing key: the laptop resolves it and pas
 `REMOTE` is required, and there is no default host: a `-remote` target without it prints its usage and exits 2.
 `REMOTE=host` names the ssh destination, an alias from `~/.ssh/config` or `user@host`.
 A port or other ssh options belong in `~/.ssh/config` under that alias, since a `:` after the host starts the directory.
-`REMOTE=host:dir` also names the checkout on the server, relative to the server's home unless it starts with `/`.
+`REMOTE=host:dir` also names the checkout on the server, relative to the server's home unless it starts with `/`; a leading `~/` is accepted and means the same.
 Without `:dir` the checkout is the directory under the server's home with the same name as the laptop's checkout, `tn-p2p-allow-sync` for a clone that kept the default name.
 The host may hold only letters, digits and `_.@-`, and the directory only letters, digits and `_./-`; anything else stops the run with exit 2.
 

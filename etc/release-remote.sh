@@ -285,11 +285,17 @@ cmd_run() {
         *:*) DIR=${remote#*:} ;;
         *) DIR=$(basename "$ROOT") ;;
     esac
+    # a relative dir is relative to the server's home already, so ~/dir means dir
+    # shellcheck disable=SC2088  # the tilde is meant literally: the server's shell would expand it
+    case "$DIR" in
+        '~') DIR=. ;;
+        '~/'*) DIR=${DIR#'~/'} ;;
+    esac
     # no character a shell or ssh treats specially, and no leading - that ssh or cd would
     # take for an option
     if ! matches "$HOST" '^[A-Za-z0-9_.@][A-Za-z0-9_.@-]*$' || ! matches "$DIR" '^[A-Za-z0-9_./][A-Za-z0-9_./-]*$'; then
         info "error: REMOTE=$remote gives host '$HOST' and dir '$DIR'"
-        info "usage: REMOTE=host[:dir]: host is the ssh destination, an alias or user@host (letters, digits and _.@-); dir is the checkout there, relative to its home unless absolute (letters, digits and _./-; default: $(basename "$ROOT"))"
+        info "usage: REMOTE=host[:dir]: host is the ssh destination, an alias or user@host (letters, digits and _.@-); dir is the checkout there, relative to its home unless absolute, so ~/dir and dir are the same (letters, digits and _./-; default: $(basename "$ROOT"))"
         exit 2
     fi
     if [ "$step" != setup ]; then
