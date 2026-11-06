@@ -98,6 +98,7 @@ On the server that socket belongs to a GnuPG home of its own, so the server's ow
 - A `gh` login with write access to the repository, for `build`, `sign` and `publish`; `verify` needs it too, to see the draft.
 - ssh push access to `origin`, for `tag`.
 - A login shell that reads POSIX syntax, such as bash, zsh or sh, because the remote command is one `cd ... && ...` line; fish does not parse it.
+- The tools on the PATH of a command run over ssh, which reads no `.bashrc`: the step adds `~/.local/bin`, `~/.cargo/bin`, `/usr/local/bin`, `/snap/bin` and `/opt/homebrew/bin` when they exist, checks the step's tools before `make` and names a missing one with where it looked; `RELEASE_REMOTE_PATH=<dir>[:<dir>]`, given on the laptop, puts other directories first.
 - GnuPG installed, and no gpg configuration.
   The `-remote` targets create the home `~/.gnupg-tn-release`, or the absolute path in `RELEASE_REMOTE_GNUPGHOME`, the first time they need it, and it holds only the public keys of `release/keys` and `no-autostart`.
 

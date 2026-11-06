@@ -36,7 +36,9 @@
 # release.sh resolves it; run sends its fingerprint to the server as RELEASE_GPG_KEY, so the
 # server needs none configured. run passes every RELEASE_* and TN_P2P_ALLOW_* variable of its
 # environment on to the server; RELEASE_REMOTE_SSH, a stand-in for ssh, is for dry runs alone
-# (RELEASE_DRY_RUN=1). Everything this script prints itself goes to stderr: stdout carries
+# (RELEASE_DRY_RUN=1), and RELEASE_REMOTE_PATH names directories step puts first on the
+# server's PATH, since a command run over ssh reads no .bashrc. Everything this script prints
+# itself goes to stderr: stdout carries
 # only the socket path of setup and socket, and the step's own output.
 # run executes on the laptop, which may be a Mac whose bash is 3.2: like release.sh, this
 # script stays bash 3.2 portable (no mapfile, coproc, associative arrays or ${x,,}, and the
@@ -157,15 +159,53 @@ cmd_check() {
     die 1 "the agent at $sock does not hold $fpr: is it the laptop's gpg-agent, forwarded with its extra socket, and does gpg --card-status on the laptop show the YubiKey?"
 }
 
+# A command run over ssh gets a shell that reads no .bashrc, so the user's tool directories
+# are not on its PATH: the usual ones are appended when they exist, and the directories of
+# RELEASE_REMOTE_PATH, sent from the laptop, come first.
+STEP_DIRS='.local/bin .cargo/bin'
+SYSTEM_DIRS='/usr/local/bin /snap/bin /opt/homebrew/bin /home/linuxbrew/.linuxbrew/bin'
+
+step_path() {
+    local d extra
+    for d in $STEP_DIRS; do
+        d=$HOME/$d
+        [ -d "$d" ] || continue
+        case ":$PATH:" in *":$d:"*) ;; *) PATH="$PATH:$d" ;; esac
+    done
+    for d in $SYSTEM_DIRS; do
+        [ -d "$d" ] || continue
+        case ":$PATH:" in *":$d:"*) ;; *) PATH="$PATH:$d" ;; esac
+    done
+    extra=${RELEASE_REMOTE_PATH:-}
+    if [ -n "$extra" ]; then PATH="$extra:$PATH"; fi
+    export PATH
+}
+
+# The tools a step runs on this machine, checked before make so the error says where they are
+# looked for; release.sh checks them again as it goes.
+step_tools() {
+    case "$1" in
+        prep) printf '%s\n' 'git cargo docker' ;;
+        tag) printf '%s\n' 'git gpg' ;;
+        build | verify | publish) printf '%s\n' 'git gh docker tar gzip' ;;
+        sign) printf '%s\n' 'git gh gpg docker tar gzip' ;;
+    esac
+}
+
 # make release-STEP in this checkout; tag and sign sign through the forwarded agent, so they
 # check it first and point gpg at the home its socket belongs to
 cmd_step() {
-    local step=$1 tag=$2 label=${3:-}
+    local step=$1 tag=$2 label=${3:-} t missing=
+    step_path
+    for t in make $(step_tools "$step"); do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    [ -z "$missing" ] ||
+        die 2 "missing on $(uname -n):$missing; a command run over ssh reads no .bashrc, so its PATH holds the system directories plus ~/.local/bin, ~/.cargo/bin, /usr/local/bin, /snap/bin and /opt/homebrew/bin when they exist; install the tool in one of them, or pass RELEASE_REMOTE_PATH=<dir>[:<dir>] from the laptop"
     if [ "$step" = tag ] || [ "$step" = sign ]; then
         export GNUPGHOME=$HOMEDIR
         cmd_check
     fi
-    need make
     info "==> ${label:+$label }$(uname -n): make release-$step TAG=$tag"
     cd "$ROOT"
     exec make --no-print-directory "release-$step" "TAG=$tag"
