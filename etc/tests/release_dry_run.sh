@@ -20,6 +20,13 @@
 # --version checks run in docker either way. cargo (prep's cargo update) and gh are stubs
 # that log their calls; the run requires that gh never ran and that origin got no tag.
 #
+# The remote leg signs an unsigned copy of the release again the way the maintainer does it
+# from the laptop, with make release-sign-remote REMOTE=buildbox:<clone>, and verifies it with
+# make release-verify-remote. A stand-in ssh (RELEASE_REMOTE_SSH, which etc/release-remote.sh
+# honors only in a dry run) links the fixture agent's extra socket where ssh -R would put it,
+# at the agent socket of the server's GnuPG home, and runs the remote command here, so the
+# clone is the server's checkout and its home signs through the restricted socket alone.
+#
 #   bash etc/tests/release_dry_run.sh [DIR]
 #
 # DIR (new or empty) keeps the fixture for inspection; without it a temp dir is removed. It
@@ -80,9 +87,12 @@ else
 fi
 trap t_exit EXIT
 
-# the steps see only the variables each one sets
-for v in $(env | sed -n 's/^\(RELEASE_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
-unset GITHUB_ACTIONS GITHUB_EVENT_NAME GITHUB_RUN_ID GITHUB_RUN_ATTEMPT GITHUB_REPOSITORY TN_P2P_ALLOW_REBUILD
+# the steps see only the variables each one sets; etc/release-remote.sh forwards every
+# RELEASE_* and TN_P2P_ALLOW_* variable to the server
+for v in $(env | sed -n -e 's/^\(RELEASE_[A-Za-z0-9_]*\)=.*/\1/p' -e 's/^\(TN_P2P_ALLOW_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$v"
+done
+unset GITHUB_ACTIONS GITHUB_EVENT_NAME GITHUB_RUN_ID GITHUB_RUN_ATTEMPT GITHUB_REPOSITORY REMOTE FAKE_SSH_NO_FORWARD
 
 t_ok() {
     T_PASS=$((T_PASS + 1))
@@ -118,6 +128,16 @@ expect_out() {
 
 expect_err() {
     if grep -F -q -e "$1" "$T_ERR"; then t_ok "$2"; else t_fail "$2 (stderr lacks '$1')"; fi
+}
+
+expect_out_or_err() {
+    if grep -F -q -e "$1" "$T_OUT" "$T_ERR"; then t_ok "$2"; else t_fail "$2 (neither stdout nor stderr has '$1')"; fi
+}
+
+# expect_err_line TEXT1 TEXT2 WHAT: one line of stderr holds both texts. The second grep reads
+# all its input (no -q), so that the first never dies of SIGPIPE under pipefail.
+expect_err_line() {
+    if grep -F -e "$1" "$T_ERR" | grep -F -e "$2" >/dev/null; then t_ok "$3"; else t_fail "$3 (no stderr line has '$1' and '$2')"; fi
 }
 
 # check WHAT COMMAND...: COMMAND succeeds (a fact about the fixture, not a step's output).
@@ -317,30 +337,97 @@ expect_rc 0 "verify accepts the signed release and its rebuild from the tag"
 expect_out "verified $tag commit=$r1 signatures=1/1" "verify counts alice's signature"
 expect_err "rebuilt $tag from $r1: the same tn-p2p-allow-sync, sha256 $b1" "the rebuild from the tag gives the released program"
 
-# the same signature over a GnuPG home of its own whose agent socket is a forward of the
-# fixture agent's extra socket, which is what make release-sign-remote finds once ssh -R has
-# brought the laptop's: the restricted socket allows the signature and nothing more
+# the same signature the way the maintainer makes it from the laptop: make release-sign-remote
+# REMOTE=host:dir checks the key and the agent here, sets up the server's GnuPG home over one
+# connection, then runs make release-sign in the server's checkout over a second one whose
+# ssh -R forwards the agent's restricted extra socket to the socket gpg uses in that home. The
+# stand-in ssh logs each connection's host and forward to FAKE_SSH_LOG, links the fixture
+# agent's extra socket where the forward would put it (unless FAKE_SSH_NO_FORWARD=1), runs the
+# remote command here, so REMOTE=buildbox:$clone makes the clone the server's checkout, and
+# removes the link when the command ends, as sshd does when it closes the forward
+FAKE_SSH_LOG=$FX/fake-ssh.log
+export FAKE_SSH_LOG
+cat >"$FX/fake-ssh" <<'EOF'
+#!/usr/bin/env bash
+# stands in for ssh in the dry run: ssh [-t] [-o opt] [-R remote:local] host command
+set -eu
+fwd=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -t) shift ;;
+        -o) shift 2 ;;
+        -R) fwd=$2; shift 2 ;;
+        -*) printf 'fake ssh: unexpected option %s\n' "$1" >&2; exit 255 ;;
+        *) break ;;
+    esac
+done
+[ $# -eq 2 ] || { printf 'fake ssh: expected host and one command, got %s arguments\n' "$#" >&2; exit 255; }
+printf '%s%s\n' "$1" "${fwd:+ -R $fwd}" >>"$FAKE_SSH_LOG"
+if [ -n "$fwd" ] && [ "${FAKE_SSH_NO_FORWARD:-0}" != 1 ]; then
+    [ ! -e "${fwd%%:*}" ] || exit 255   # a socket in the way: what ExitOnForwardFailure=yes gives
+    ln -s "${fwd#*:}" "${fwd%%:*}"
+    trap 'rm -f "${fwd%%:*}"' EXIT
+fi
+# not exec: the shell stays, so that its EXIT trap removes the link
+bash -c "$2"
+EOF
+chmod 0755 "$FX/fake-ssh"
+xsock=$(gpgconf --homedir "$GNUPGHOME" --list-dirs agent-extra-socket)
 RR=$FX/gr
-step "$clone" ./etc/release-remote.sh setup "$RR"
-expect_rc 0 "release-remote.sh setup creates the home and imports the maintainer keys"
+
+step "$clone" make release-sign-remote "TAG=$tag"
+expect_rc 2 "make release-sign-remote refuses without REMOTE"
+expect_out_or_err "usage: make release-sign-remote TAG=vX.Y.Z[-rcN] REMOTE=host[:dir]" "it prints the usage with REMOTE"
+
+# outside a dry run the wrapper runs the real ssh alone; RELEASE_GPG_KEY gets it past the key
+# check here, so the refusal shows wherever the wrapper makes it
+step "$clone" env RELEASE_REMOTE_SSH="$FX/fake-ssh" RELEASE_GPG_KEY="$fpr" \
+    make release-sign-remote "TAG=$tag" "REMOTE=buildbox:$clone"
+expect_rc 2 "make release-sign-remote refuses a stand-in ssh outside a dry run"
+expect_err "RELEASE_REMOTE_SSH is for dry runs" "it says the stand-in is for dry runs"
+
+step "$clone" rel RELEASE_REMOTE_SSH="$FX/fake-ssh" RELEASE_REMOTE_GNUPGHOME="$RR" \
+    make --no-print-directory release-setup-remote "REMOTE=buildbox:$clone"
+expect_rc 0 "make release-setup-remote creates the server's GnuPG home over ssh"
 expect_err "maintainer keys imported: 1 from " "setup imports alice's key alone"
-expect_err 'ssh -R ' "setup prints the ssh -R command"
-RSOCK=$("$clone/etc/release-remote.sh" socket "$RR")
-step "$clone" env RELEASE_GPG_KEY="$fpr" ./etc/release-remote.sh check "$RR"
-expect_rc 2 "check refuses while no agent is forwarded"
-expect_err "no agent socket at $RSOCK" "check names the socket it expects"
-ln -s "$(gpgconf --homedir "$GNUPGHOME" --list-dirs agent-extra-socket)" "$RSOCK"
-step "$clone" env RELEASE_GPG_KEY="$fpr" ./etc/release-remote.sh check "$RR"
-expect_rc 0 "check finds alice's key behind the forwarded socket"
-expect_err "holds $fpr" "check names the key it found"
-step "$clone" rel RELEASE_DIR="$rd2" RELEASE_YES=1 RELEASE_SUMS_SHA256="$sums" RELEASE_GPG_KEY="$fpr" \
-    make --no-print-directory release-sign-remote "TAG=$tag" "RELEASE_REMOTE_GNUPGHOME=$RR"
-expect_rc 0 "make release-sign-remote signs over the forwarded agent"
+expect_err "==> 1/1 buildbox:" "setup prints its one stage"
+expect_err "==> done: buildbox is ready" "setup says the server is ready"
+check "setup connects once, without a forward" test "$(cat "$FAKE_SSH_LOG" 2>/dev/null)" = buildbox
+check "the server's home never starts an agent" grep -q -x -e no-autostart "$RR/gpg.conf"
+
+RSOCK=$(RELEASE_REMOTE_GNUPGHOME="$RR" "$clone/etc/release-remote.sh" socket)
+step "$clone" rel FAKE_SSH_NO_FORWARD=1 RELEASE_REMOTE_SSH="$FX/fake-ssh" RELEASE_REMOTE_GNUPGHOME="$RR" \
+    RELEASE_DIR="$rd2" RELEASE_YES=1 RELEASE_SUMS_SHA256="$sums" RELEASE_GPG_KEY="$fpr" \
+    make --no-print-directory release-sign-remote "TAG=$tag" "REMOTE=buildbox:$clone"
+expect_rc 2 "make release-sign-remote stops when the forward brings no agent"
+expect_err "no agent socket at $RSOCK" "the server names the socket it expects"
+
+step "$clone" rel RELEASE_REMOTE_SSH="$FX/fake-ssh" RELEASE_REMOTE_GNUPGHOME="$RR" \
+    RELEASE_DIR="$rd2" RELEASE_YES=1 RELEASE_SUMS_SHA256="$sums" RELEASE_GPG_KEY="$fpr" \
+    make --no-print-directory release-sign-remote "TAG=$tag" "REMOTE=buildbox:$clone"
+expect_rc 0 "make release-sign-remote signs on the server over the forwarded agent"
 expect_out "signed $tag as @alice: 1/1 signatures" "the signature over ssh counts as alice's"
-check "the home for signing over ssh holds no private key" test -z "$(ls -A "$RR/private-keys-v1.d" 2>/dev/null)"
-step "$clone" rel RELEASE_DIR="$rd2" TN_P2P_ALLOW_REBUILD=0 ./release/release.sh verify "$tag"
-expect_rc 0 "verify accepts the release signed over ssh"
+expect_err "==> 1/4 here:" "stage 1 checks the key and the agent here"
+expect_err ", a file key here" "stage 1 finds alice's key in a file"
+expect_err "==> 3/4 buildbox: connecting with the agent forwarded to $RSOCK" "stage 3 names the socket the forward binds"
+expect_err_line "==> 4/4 " ": make release-sign TAG=$tag" "the server prints stage 4, make release-sign"
+expect_err "==> release-sign $tag: fetches the draft's files" "make release-sign says what the step does"
+expect_err "holds $fpr" "the server finds alice's key behind the forwarded socket"
+expect_err "==> done: release-sign $tag on buildbox finished" "the run ends with done"
+check "the step's connection forwards the fixture agent's extra socket" \
+    test "$(tail -n 1 "$FAKE_SSH_LOG" 2>/dev/null)" = "buildbox -R $RSOCK:$xsock"
+check "the connection before it sets the home up, without a forward" \
+    test "$(tail -n 2 "$FAKE_SSH_LOG" 2>/dev/null | head -n 1)" = buildbox
+check "the server's home never held a private key" test -z "$(ls -A "$RR/private-keys-v1.d" 2>/dev/null)"
+check "the forwarded socket is gone once the step ends" test ! -e "$RSOCK" -a ! -L "$RSOCK"
+
+step "$clone" rel RELEASE_REMOTE_SSH="$FX/fake-ssh" RELEASE_DIR="$rd2" TN_P2P_ALLOW_REBUILD=0 \
+    make --no-print-directory release-verify-remote "TAG=$tag" "REMOTE=buildbox:$clone"
+expect_rc 0 "make release-verify-remote accepts the release signed over ssh"
 expect_out "verified $tag commit=$r1 signatures=1/1" "verify counts the signature made over ssh"
+expect_err "==> 1/2 buildbox: connecting" "verify prints its first stage"
+expect_err_line "==> 2/2 " ": make release-verify TAG=$tag" "the server prints stage 2, make release-verify"
+check "verify connects without a forward" test "$(tail -n 1 "$FAKE_SSH_LOG" 2>/dev/null)" = buildbox
 
 # a rebuild that differs fails verify; release.conf is changed in the clone only, which verify,
 # unlike build and publish, does not compare with main
