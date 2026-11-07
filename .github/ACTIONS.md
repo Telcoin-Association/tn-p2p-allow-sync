@@ -22,6 +22,13 @@ Six jobs, one command each, on `pull_request` and on every push to `main`:
 The source never says `#![deny(warnings)]`: a new compiler release must not break a plain local build.
 `--locked` everywhere means `Cargo.lock` is the dependency set; a change to it is a reviewed change in the pull request.
 `deny` and `audit` fetch their advisory databases when they run, by design, so a newly published advisory turns them red on the next run with no change in this repository.
+That next run comes within a week even with no pull request open: both also run every Monday at 05:23 UTC on `main` (`schedule`), and every other job of `ci.yaml` skips that event.
+GitHub runs a schedule only on the default branch and disables it after 60 days without activity in the repository.
+A disabled schedule shows under *Actions* -> *CI* as disabled, and *Enable workflow* there turns it back on; check it after a quiet stretch, since nothing else reports it.
+A dispatch (*Actions* -> *CI* -> *Run workflow*) runs every job on the branch it is started on.
+
+A new push to a pull request cancels the runs of `ci.yaml` and `nft-real.yaml` for its previous head (`concurrency`, with `cancel-in-progress` on `pull_request` only).
+Every other run is a concurrency group of its own, because GitHub cancels a waiting run when a newer one joins its group: a push to `main`, the schedule and a dispatch never wait for, cancel or displace another run, so every push to `main` reports.
 
 The five cargo jobs install the toolchain of `rust-toolchain.toml` first (`rustup show active-toolchain || rustup toolchain install`), so the runner image's own Rust is never used.
 `release-dry-run` installs none: its build runs in `BUILD_IMAGE` (see "Release workflow"), and it needs only docker with buildx, gpg and the network for the images and crates.io.

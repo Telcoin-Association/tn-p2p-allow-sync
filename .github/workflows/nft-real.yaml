@@ -21,6 +21,13 @@ on:
   push:
     branches: [main]
 
+# A new push to a pull request cancels the run for its previous head. Every other run is a
+# group of its own, so a push to main is never displaced by a later one and always runs the
+# suite (the same rule as ci.yaml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # nothing here writes; the job asks for read access to the repository and no more
 permissions: {}
 
