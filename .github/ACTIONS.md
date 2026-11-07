@@ -1,7 +1,8 @@
 # How CI works
 
-The binary runs as root on every validator, so every pull request passes the same five gates before it merges, and every push to `main` runs them again.
+The binary runs as root on every validator, so every pull request passes the same gates before it merges, and every push to `main` runs them again: the seven jobs of `ci.yaml` (`fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`) and the three legs of `nft-real.yaml` (`nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`), the ten checks of "Required checks".
 They run on GitHub's hosted runners and on a maintainer's machine with the same commands; nothing here depends on a cache, a secret or a write token.
+`scheduled.yaml` adds weekly mutation testing and fuzzing on `main`, which report and gate nothing.
 
 ## Workflows
 
@@ -159,6 +160,7 @@ cargo +nightly-2026-10-15 fuzz run <target> artifacts/<target>/<crash-file>   # 
 Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`, and the three checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`.
 `coverage` and `nft-real (debian:13)` are new in v0.1.1 and have to be added to the list by hand; `coverage` belongs there, because a gate that is not required lets a pull request merge while it is red.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
+No job of `release.yaml` or `scheduled.yaml` may share its name with one of these checks (today: `validate-tag`, `draft-release`, `rebuild`, `verify-release`, `mutants`, `fuzz`): GitHub matches a required check by name on a commit, whatever workflow reported it.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
 ## Action pins
@@ -286,7 +288,7 @@ None of these is visible to the workflow, and each closes a gap the workflow lea
    The signature is not a GitHub rule: `validate-tag` and every later step refuse a tag without exactly one signature by an allowlisted key.
 2. **Immutable releases** (Settings -> General -> Releases), so the files `verify-release` checked are the files operators download.
 3. **A review from code owners on `main`** (*Require review from Code Owners*), so the rule in [`CODEOWNERS`](CODEOWNERS) on `/release`, `/.gitmodules` and `/release.conf` binds and every move of the pointer, change of its URL and change of `MIN_SIGNATURES` or a hook is in front of a maintainer ([`release/docs/signing.md`](../release/docs/signing.md#codeowners-for-the-pointer)).
-4. **`release-dry-run` among the required checks of `main`**, next to the five gates of `ci.yaml`.
+4. **`release-dry-run` among the required checks of `main`**, next to the other jobs of `ci.yaml` and the three checks of `nft-real.yaml` ("Required checks").
 5. **The default workflow permission can stay read-only** (Settings -> Actions -> General -> Workflow permissions): `draft-release` asks for `contents: write` in its own `permissions:` block.
 
 ### Images
