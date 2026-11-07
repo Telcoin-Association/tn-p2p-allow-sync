@@ -1,0 +1,6 @@
+# what cargo fuzz writes: build output, the corpus it grows, the failing inputs it finds and
+# coverage reports; an input worth keeping goes to regressions/<target>/ (README.md)
+/target/
+/corpus/
+/artifacts/
+/coverage/
