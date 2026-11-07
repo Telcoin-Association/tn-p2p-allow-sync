@@ -15,10 +15,11 @@
 # The build is real: hook_build builds the program twice with etc/Dockerfile in BUILD_IMAGE,
 # and verify rebuilds it, so the run also proves the build reproducible; it needs docker
 # with buildx and the network (the images, crates.io). RELEASE_BUILD_STUB=1 replaces the one
-# docker build (tn_build_program) with a script that prints the five --version lines, for a
-# quick run; it is refused in CI, which always builds for real. prep's git-cliff and the
-# --version checks run in docker either way. cargo (prep's cargo update) and gh are stubs
-# that log their calls; the run requires that gh never ran and that origin got no tag.
+# docker build (tn_build_program) with a small static ELF program that prints the five
+# --version lines (mkelf below), for a quick run; it is refused in CI, which always builds for
+# real. prep's git-cliff and the --version checks run in docker either way. cargo (prep's
+# cargo update) and gh are stubs that log their calls; the run requires that gh never ran and
+# that origin got no tag.
 #
 # The remote leg signs an unsigned copy of the release again the way the maintainer does it
 # from the laptop, with make release-sign-remote REMOTE=buildbox:<clone>, and verifies it with
@@ -26,6 +27,12 @@
 # honors only in a dry run) links the fixture agent's extra socket where ssh -R would put it,
 # at the agent socket of the server's GnuPG home, and runs the remote command here, so the
 # clone is the server's checkout and its home signs through the restricted socket alone.
+#
+# The gates a dry run skips (the comparison with the CI rebuild, the required checks on the
+# tag's commit) run last, one case at a time, as release.sh's own tests call its functions,
+# with a gh that answers from fixture files (through jq, as gh's --jq does). So do the static
+# program check, the panic strategy check and etc/ci-rebuild.sh, which rebuilds the tag from a
+# checkout of main whose origin has it, with the build stub in both modes.
 #
 #   bash etc/tests/release_dry_run.sh [DIR]
 #
@@ -61,7 +68,7 @@ if [ "$STUB" = 1 ] && [ "${GITHUB_ACTIONS:-}" = true ]; then
     bail "RELEASE_BUILD_STUB=1 is refused in CI, which runs the real build"
 fi
 
-for tool in git gpg gpgconf gpg-connect-agent make docker tar gzip awk sed; do
+for tool in git gpg gpgconf gpg-connect-agent make docker tar gzip awk sed od jq; do
     command -v "$tool" >/dev/null 2>&1 || bail "missing required tool: $tool"
 done
 docker info >/dev/null 2>&1 || bail "docker does not answer"
@@ -204,6 +211,68 @@ stub gh 1
 PATH=$bin:$PATH
 export PATH
 
+# mkelf [-i INTERP] FILE LINE...: writes FILE, a static x86-64 ELF64 program (one PT_LOAD and
+# no PT_INTERP program header) that prints the LINEs and exits 0. With -i it also has a
+# PT_INTERP header naming INTERP, as a dynamically linked program has; that one is never run.
+cat >"$FX/mkelf" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+interp=
+if [ "$1" = -i ]; then
+    interp=$2
+    shift 2
+fi
+out=$1
+shift
+msg=
+for line in "$@"; do msg=$msg$line$'\n'; done
+# le VALUE N: VALUE as N little-endian bytes, in printf's octal escapes
+le() {
+    local v=$1 n=$2
+    while [ "$n" -gt 0 ]; do
+        printf '\\%03o' $((v & 255))
+        v=$((v >> 8))
+        n=$((n - 1))
+    done
+}
+base=4194304
+nph=1
+if [ -n "$interp" ]; then nph=2; fi
+code=$((64 + 56 * nph))
+len=${#msg}
+ioff=$((code + 33 + len))
+size=$ioff
+if [ -n "$interp" ]; then size=$((ioff + ${#interp} + 1)); fi
+{
+    # ELF header: \177ELF, ELFCLASS64, ELFDATA2LSB, EV_CURRENT, padding; ET_EXEC, EM_X86_64,
+    # e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, then no
+    # section headers
+    printf "\\177ELF$(le 2 1)$(le 1 1)$(le 1 1)$(le 0 9)$(le 2 2)$(le 62 2)$(le 1 4)$(le $((base + code)) 8)$(le 64 8)$(le 0 8)$(le 0 4)$(le 64 2)$(le 56 2)$(le "$nph" 2)$(le 64 2)$(le 0 2)$(le 0 2)"
+    if [ -n "$interp" ]; then
+        # PT_INTERP, PF_R, the path after the message
+        printf "$(le 3 4)$(le 4 4)$(le "$ioff" 8)$(le $((base + ioff)) 8)$(le $((base + ioff)) 8)$(le $((${#interp} + 1)) 8)$(le $((${#interp} + 1)) 8)$(le 1 8)"
+    fi
+    # PT_LOAD, PF_R|PF_X, the whole file at base
+    printf "$(le 1 4)$(le 5 4)$(le 0 8)$(le "$base" 8)$(le "$base" 8)$(le "$size" 8)$(le "$size" 8)$(le 4096 8)"
+    # write(1, msg, len); exit(0): mov eax,1; mov edi,1; lea rsi,[rip+16]; mov edx,len;
+    # syscall; mov eax,60; xor edi,edi; syscall, then the message
+    printf "$(le 184 1)$(le 1 4)$(le 191 1)$(le 1 4)$(le 72 1)$(le 141 1)$(le 53 1)$(le 16 4)$(le 186 1)$(le "$len" 4)$(le 15 1)$(le 5 1)$(le 184 1)$(le 60 4)$(le 49 1)$(le 255 1)$(le 15 1)$(le 5 1)"
+    printf '%s' "$msg"
+    if [ -n "$interp" ]; then printf '%s\000' "$interp"; fi
+} >"$out"
+chmod 0755 "$out"
+EOF
+chmod 0755 "$FX/mkelf"
+
+# the build stub: tn_build_program writes the program mkelf makes for the five --version lines
+build_stub="
+# dry-run fixture: a small static ELF program that prints the five --version lines stands in
+# for the docker build of the program
+tn_build_program() {
+    mkdir -p \"\$1\"
+    '$FX/mkelf' \"\$1/\$PROJECT\" \"\$PROJECT \$VERSION\" \"commit \$COMMIT\" \"target \$TRIPLE\" 'snapshot-versions 1' 'config-version 1'
+}"
+
 # the signing repository: the checked-out release/ tree with alice as the only key
 w=$FX/signing-work
 git -C "$FX" init -q "$w"
@@ -223,25 +292,7 @@ git -C "$FX" init -q "$w"
 git -C "$ROOT" ls-files -s | awk -F '\t' '{ split($1, m, " ") } m[1] != "160000" && $2 != ".gitmodules" { print $2 }' >"$FX/files"
 tar -cf - -C "$ROOT" -T "$FX/files" | tar -xf - -C "$w"
 fx_git -C "$w" submodule add -q "$FX/signing.git" release
-if [ "$STUB" = 1 ]; then
-    cat >>"$w/release.conf" <<'EOF'
-
-# dry-run fixture (RELEASE_BUILD_STUB=1): a script that prints the five --version lines
-# stands in for the docker build of the program
-tn_build_program() {
-    mkdir -p "$1"
-    cat >"$1/$PROJECT" <<STUB
-#!/bin/sh
-echo '$PROJECT $VERSION'
-echo 'commit $COMMIT'
-echo 'target $TRIPLE'
-echo 'snapshot-versions 1'
-echo 'config-version 1'
-STUB
-    chmod 0755 "$1/$PROJECT"
-}
-EOF
-fi
+if [ "$STUB" = 1 ]; then printf '%s\n' "$build_stub" >>"$w/release.conf"; fi
 git -C "$w" add -A
 git -C "$w" commit -q -m 'chore: the tree of tn-p2p-allow-sync for a release dry run' \
     -m "The tracked files of $ROOT, with tn-release-signing $signing_sha and a throwaway key."
@@ -295,6 +346,8 @@ step "$clone" rel ./release/release.sh check-tag "$tag"
 expect_rc 0 "check-tag accepts $tag"
 expect_out "commit=$r1 signer=alice fingerprint=$fpr channel=stable version=$version features= prerelease=false" \
     "check-tag prints the commit, the signer and the version"
+expect_err "$r1 keeps panic = \"unwind\" in its release build" "check-tag finds the panic strategy unwind at the tag"
+expect_err "dry run: not checking the CI results of $r1" "a dry run leaves the required checks on the tag's commit alone"
 
 step "$clone" rel ./release/release.sh notes "$tag"
 expect_rc 0 "notes renders the release body"
@@ -330,6 +383,7 @@ step "$clone" rel RELEASE_DIR="$rd" RELEASE_YES=1 RELEASE_SUMS_SHA256="$sums" RE
     ./release/release.sh sign "$tag"
 expect_rc 0 "sign adds alice's signature over SHA256SUMS"
 expect_out "signed $tag as @alice: 1/1 signatures" "sign counts one of one required signature"
+expect_err "dry run: not comparing tn-p2p-allow-sync with the CI rebuild of $tag" "a dry run signs without the CI rebuild"
 
 step "$clone" rel RELEASE_DIR="$rd" TN_P2P_ALLOW_REBUILD=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-}" \
     ./release/release.sh verify "$tag"
@@ -467,17 +521,13 @@ sourced() {
         _ "$tag" "$r1" "$@"
 }
 
-# version_case WHAT RC TEXT LINE...: tn_check_version on a program printing LINE..., with $tag
-# and the release commit, exits RC with TEXT on stderr, so a failure is the check's own and
-# not, say, docker's.
+# version_case WHAT RC TEXT LINE...: tn_check_version on a static program printing LINE...,
+# with $tag and the release commit, exits RC with TEXT on stderr, so a failure is the check's
+# own and not, say, docker's.
 version_case() {
-    local what=$1 want=$2 text=$3 line
+    local what=$1 want=$2 text=$3
     shift 3
-    {
-        printf '#!/bin/sh\n'
-        for line in "$@"; do printf "echo '%s'\n" "$line"; done
-    } >"$FX/program"
-    chmod 0755 "$FX/program"
+    "$FX/mkelf" "$FX/program" "$@"
     sourced tn_check_version "$FX/program"
     if [ "$T_RC" = "$want" ] && grep -F -q -e "$text" "$T_ERR"; then
         t_ok "$what"
@@ -508,6 +558,193 @@ expect_rc 0 "a tree's build image is read from its release.conf"
 expect_out "$(sed -n "s/^BUILD_IMAGE='\(.*\)'\$/\1/p" "$ROOT/release.conf")" "the image is the BUILD_IMAGE line"
 sourced tn_tree_image "$FX/tree-bad"
 expect_rc 1 "a tree whose release.conf has no BUILD_IMAGE line is not built"
+
+# ---------------------------------------------------------------------------------------------
+# The release gates, one case at a time
+
+# a static program passes; a dynamically linked one, or a script, is refused before it runs
+gate_rel=$FX/gate-release
+mkdir -p "$gate_rel/x"
+tar -xzf "$rd/$tarball" -C "$gate_rel/x"
+sourced tn_check_static "$gate_rel/x/$d/tn-p2p-allow-sync"
+expect_rc 0 "the release's program has no PT_INTERP program header"
+"$FX/mkelf" -i /lib/ld-musl-x86_64.so.1 "$FX/dynamic" "$v1" "$c1" "$t1" "snapshot-versions 1" "config-version 1"
+sourced tn_check_version "$FX/dynamic"
+expect_rc 1 "a program with a PT_INTERP program header fails the --version check"
+expect_err "tn-p2p-allow-sync in $tarball has a PT_INTERP program header" "it says the program is linked dynamically"
+sourced tn_check_version /bin/true
+expect_rc 1 "the host's dynamically linked /bin/true fails it too"
+expect_err "has a PT_INTERP program header" "it finds the PT_INTERP header of /bin/true"
+printf '#!/bin/sh\necho %s\n' "$v1" >"$FX/script"
+chmod 0755 "$FX/script"
+sourced tn_check_version "$FX/script"
+expect_rc 1 "a script fails it"
+expect_err "tn-p2p-allow-sync in $tarball is not an x86-64 ELF64 program" "it says the script is no ELF program"
+
+# the panic strategy stays unwind: a commit whose [profile.release] sets panic = "abort"
+sourced tn_check_unwind "$r1"
+expect_rc 0 "the release commit keeps panic = \"unwind\""
+abort_blob=$(git -C "$clone" show "$r1:Cargo.toml" |
+    awk '{ print } $0 == "[profile.release]" { print "panic = \"abort\"" }' | git -C "$clone" hash-object -w --stdin)
+GIT_INDEX_FILE=$FX/abort.index git -C "$clone" read-tree "$r1"
+GIT_INDEX_FILE=$FX/abort.index git -C "$clone" update-index --cacheinfo "100644,$abort_blob,Cargo.toml"
+abort_tree=$(GIT_INDEX_FILE=$FX/abort.index git -C "$clone" write-tree)
+abort=$(git -C "$clone" commit-tree -p "$r1" -m 'fixture: panic = "abort"' "$abort_tree")
+sourced tn_check_unwind "$abort"
+expect_rc 1 "a commit whose Cargo.toml sets panic = \"abort\" is refused"
+expect_err "Cargo.toml at $abort sets the panic strategy to abort (line " "it names the file and the line"
+
+# gh for the gates: logs its arguments to GH_FIXTURE/gh.log, then answers from the files there,
+# applying --jq with jq as gh does: runs.json (run list), artifact-RUN-NAME/ (run download),
+# release.json (release view; without it the release does not exist), check-runs.json (api)
+GHFX=$FX/gh-fixture
+mkdir -p "$GHFX" "$FX/gate-bin"
+cat >"$FX/gate-bin/gh" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$GH_FIXTURE/gh.log"
+cmd="$1 $2"
+shift 2
+jqx=. dest= name= arg=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --jq) jqx=$2; shift 2 ;;
+        -D) dest=$2; shift 2 ;;
+        -n) name=$2; shift 2 ;;
+        --repo | --workflow | --commit | --event | --json) shift 2 ;;
+        --paginate) shift ;;
+        *) arg=$1; shift ;;
+    esac
+done
+case $cmd in
+    "run list") exec jq -r "$jqx" "$GH_FIXTURE/runs.json" ;;
+    "run download")
+        if [ ! -d "$GH_FIXTURE/artifact-$arg-$name" ]; then echo "no valid artifacts found to download" >&2; exit 1; fi
+        cp "$GH_FIXTURE/artifact-$arg-$name"/* "$dest/" ;;
+    "release view")
+        if [ ! -f "$GH_FIXTURE/release.json" ]; then echo "release not found" >&2; exit 1; fi
+        exec jq -r "$jqx" "$GH_FIXTURE/release.json" ;;
+    api\ */check-runs*) exec jq -r "$jqx" "$GH_FIXTURE/check-runs.json" ;;
+    *) echo "fixture gh: no answer for gh $cmd" >&2; exit 1 ;;
+esac
+EOF
+chmod 0755 "$FX/gate-bin/gh"
+
+# gated DRAFT FUNCTION ARG...: FUNCTION of release.sh or release.conf after load_conf and
+# parse_tag of $tag, outside a dry run, with COMMIT the release commit, REPO, WORK and
+# REL_DRAFT=DRAFT set as the step that runs it sets them, and the fixture gh first on PATH.
+gated() {
+    local draft=$1
+    shift
+    rm -rf "$FX/gate-work"
+    mkdir "$FX/gate-work"
+    : >"$GHFX/gh.log"
+    # shellcheck disable=SC2016 # the inner shell expands them
+    step "$clone" env PATH="$FX/gate-bin:$PATH" GH_FIXTURE="$GHFX" bash -c \
+        '. ./release/release.sh && load_conf && parse_tag "$1" && COMMIT=$2 REPO=$DEFAULT_REPO WORK=$3 REL_DRAFT=$4 && shift 4 && "$@"' \
+        _ "$tag" "$r1" "$FX/gate-work" "$draft" "$@"
+}
+
+# check_runs ID=NAME=CONCLUSION...: check-runs.json, the check runs on the release commit; the
+# conclusion pending stands for a run in progress
+check_runs() {
+    local r id name concl state sep=
+    {
+        printf '{"total_count": %d, "check_runs": [' "$#"
+        for r in "$@"; do
+            id=${r%%=*}
+            r=${r#*=}
+            name=${r%=*}
+            concl="\"${r##*=}\""
+            state=completed
+            if [ "$concl" = '"pending"' ]; then state=in_progress concl=null; fi
+            printf '%s{"id": %s, "name": "%s", "status": "%s", "conclusion": %s}' "$sep" "$id" "$name" "$state" "$concl"
+            sep=', '
+        done
+        printf ']}\n'
+    } >"$GHFX/check-runs.json"
+}
+
+# the required checks on the tag's commit (hook_check_tag_extra, as check-tag runs it)
+check_runs 10=test=failure 11=fmt=success 12=clippy=success 13=test=success 14=deny=success 15=audit=success \
+    16=release-dry-run=success '17=nft-real (ubuntu-24.04)=success' '18=nft-real (ubuntu-22.04)=success' \
+    '19=nft-real (debian:13)=success' 20=validate-tag=pending
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 0 "check-tag accepts a commit on which every required check passed"
+expect_err "CI passed on $r1: fmt, clippy, test, deny, audit, release-dry-run, nft-real (ubuntu-24.04), nft-real (ubuntu-22.04), nft-real (debian:13)" \
+    "it lists the required checks, of which the newest run counts"
+check "it reads the check runs of the release commit" \
+    grep -q -F -e "api repos/Telcoin-Association/tn-p2p-allow-sync/commits/$r1/check-runs" "$GHFX/gh.log"
+
+check_runs 11=fmt=success 12=clippy=success 21=clippy=failure 13=test=success 14=deny=success 15=audit=success \
+    16=release-dry-run=success '17=nft-real (ubuntu-24.04)=success' '18=nft-real (ubuntu-22.04)=pending'
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 1 "check-tag refuses a commit with a failed, a running and a missing required check"
+expect_err "CI has not passed on $r1: clippy (failure), nft-real (ubuntu-22.04) (in_progress), nft-real (debian:13) (no check run)" \
+    "it names each of them and what it found"
+
+printf '{"isDraft": false, "isPrerelease": false, "author": {"login": "github-actions[bot]"}, "assets": []}\n' >"$GHFX/release.json"
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 0 "the required checks of a published release are not asked for again"
+expect_err "release $tag is published: not checking the CI results of $r1 again" "it says the release is published"
+rm "$GHFX/release.json"
+
+# the CI rebuild: the draft's program against the artifact of the release workflow's run on
+# the push of the tag (hook_check_release_files, as sign, verify and publish run it)
+printf '[{"databaseId": 302, "status": "completed", "conclusion": "success", "headBranch": "%s"}, {"databaseId": 301, "status": "completed", "conclusion": "failure", "headBranch": "v0.0.1"}]\n' \
+    "$tag" >"$GHFX/runs.json"
+mkdir -p "$GHFX/artifact-302-rebuild-$tag"
+printf '%s  tn-p2p-allow-sync\n' "$packed" >"$GHFX/artifact-302-rebuild-$tag/program.sha256"
+gated true hook_check_release_files "$gate_rel"
+expect_rc 0 "sign accepts a draft whose program the CI rebuild of $tag also gave"
+expect_err "the CI rebuild of $tag from $r1 (run 302 of release.yaml) gave the same tn-p2p-allow-sync, sha256 $packed" \
+    "it names the run and the sha256"
+check "it looks for the release workflow's run on the push of $tag at the release commit" \
+    grep -q -F -e "run list --repo Telcoin-Association/tn-p2p-allow-sync --workflow release.yaml --commit $r1 --event push " "$GHFX/gh.log"
+check "it downloads that run's artifact rebuild-$tag" \
+    grep -q -x -F -e "run download 302 --repo Telcoin-Association/tn-p2p-allow-sync -n rebuild-$tag -D $FX/gate-work/ci-rebuild" "$GHFX/gh.log"
+
+drift=$(printf drift | sha256sum | awk '{ print $1 }')
+printf '%s  tn-p2p-allow-sync\n' "$drift" >"$GHFX/artifact-302-rebuild-$tag/program.sha256"
+gated true hook_check_release_files "$gate_rel"
+expect_rc 1 "sign refuses a draft whose program the CI rebuild did not give"
+expect_err "the draft's tn-p2p-allow-sync has sha256 $packed, but the CI rebuild of $tag from $r1 (run 302 of release.yaml) gave sha256 $drift" \
+    "it names both sha256s"
+
+printf '[{"databaseId": 301, "status": "completed", "conclusion": "failure", "headBranch": "v0.0.1"}]\n' >"$GHFX/runs.json"
+gated true hook_check_release_files "$gate_rel"
+expect_rc 2 "sign stops while the push of $tag has no run of the release workflow"
+expect_err "wait for the CI rebuild of $tag, then run this step again" "it says to wait for the CI rebuild"
+
+gated false hook_check_release_files "$gate_rel"
+expect_rc 0 "verify of a published release does not look for the CI rebuild"
+expect_err "release $tag is published: not comparing tn-p2p-allow-sync with the CI rebuild of $tag again" \
+    "it says the release is published"
+
+# etc/ci-rebuild.sh as the rebuild job runs it: in a checkout of main whose origin has the
+# tag. The build stub stands in for docker in both modes; verify above rebuilt the tag with
+# tn_build_commit, which the script builds with too.
+cio=$FX/ci-origin.git
+git -C "$FX" init -q --bare "$cio"
+git -C "$cio" fetch -q "$clone" '+refs/heads/main:refs/heads/main' "+refs/tags/$tag:refs/tags/$tag"
+fx_git -C "$FX" clone -q --recurse-submodules "$cio" "$FX/ci"
+printf '%s\n' "$build_stub" >>"$FX/ci/release.conf"
+"$FX/mkelf" "$FX/stub-program" "$v1" "$c1" "$t1" "snapshot-versions 1" "config-version 1"
+stub_hex=$(sha256sum "$FX/stub-program" | awk '{ print $1 }')
+step "$FX/ci" env GITHUB_STEP_SUMMARY="$FX/summary.md" ./etc/ci-rebuild.sh "$tag" "$FX/ci-out"
+expect_rc 0 "etc/ci-rebuild.sh rebuilds $tag in a checkout of main"
+check "its program.sha256 is one line: the sha256 of the build of $r1, two spaces, the program's name" \
+    test "$(cat "$FX/ci-out/program.sha256" 2>/dev/null)" = "$stub_hex  tn-p2p-allow-sync" \
+    -a "$(awk 'END { print NR }' "$FX/ci-out/program.sha256" 2>/dev/null)" = 1
+check "it adds the tag, the commit and the sha256 to the step summary" \
+    test "$(cat "$FX/summary.md" 2>/dev/null)" = "- CI rebuild of \`$tag\` from \`$r1\`: \`tn-p2p-allow-sync\` sha256 \`$stub_hex\`"
+
+git -C "$FX/ci" tag -d "$tag" >/dev/null
+git -C "$FX/ci" tag "$tag" "$r1"
+step "$FX/ci" ./etc/ci-rebuild.sh "$tag" "$FX/ci-out2"
+expect_rc 1 "etc/ci-rebuild.sh refuses a local $tag that differs from origin's"
+expect_err "a local tag differs from the one on origin" "it says the local tag differs"
+check "it writes no program.sha256 then" test ! -e "$FX/ci-out2/program.sha256"
 
 # ---------------------------------------------------------------------------------------------
 # Nothing left the machine.
