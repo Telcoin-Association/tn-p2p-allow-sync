@@ -491,7 +491,7 @@ Log-only tokens, never written to `status`: `usage` (a relative `--nft`), `snaps
 The deployment's `on` maps exit 1 with `reason=rpc-method-missing` on the stdout line to "this node release lacks tn_admissionSnapshot, or tn is not in its --http.api; update the node or add tn to --http.api", and `check-node.sh` prints the same text for that reason.
 `check-node.sh` reports at once: `rpc-method-missing`, `snapshot-version-*`, `epoch-regressed` and `state-invalid`, which can need the operator; any `RESULT=error`; and a sync unit whose last run failed, by its `Result` and `ExecMainStatus` (exit 0, 3 and 4 are not failures).
 It reports every other reason once `STALE_SINCE` is older than 2 epochs.
-`firewall-setup.sh --p2p-committee status` warns at once on the same four reasons.
+`firewall-setup.sh --p2p-committee status` warns at once on the same four reasons, on any `RESULT=error`, and on a failed sync-unit result, with the same wording as check-node.
 
 ## Outputs
 
