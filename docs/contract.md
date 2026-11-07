@@ -68,7 +68,7 @@ nft refusing a call for lack of privilege is exit 2 with `nft: operation not per
 | Exit | `sync` | `check` | `status` | `render` | `capture-floor` |
 |---|---|---|---|---|---|
 | 0 | applied, or already loaded | `ok` | printed | program printed | `floor` written |
-| 1 | `--require-authoritative` only: any exit-3 reason, nothing written | `missing` or `absent` | never | a stale reason, no program | never |
+| 1 | `--require-authoritative` only: any exit-3 reason, nothing written | `missing`, `absent` or `dormant` | never | a stale reason, no program | never |
 | 2 | usage, local error, unsafe state dir, nft unavailable | usage, unsafe state dir, `config-invalid`, `nft-unavailable`, stdout failed | usage, unsafe state dir, stdout failed | usage, unsafe state dir, invalid input, `nft-unavailable` or `nft-check-failed` with `--check`, stdout failed | usage, unsafe state dir, unreadable input, write failed |
 | 3 | stale, last-good program kept | `stale` or `behind`: cannot judge | never | never | never |
 | 4 | busy: the lock is held | never | never | never | busy after 30 s |
@@ -500,13 +500,17 @@ result=ok missing_total=0 mismatch_total=0
 | `ok` | every current committee address of the primary swarm is in `allow_v4` or `allow_v6` | 0 | `mismatch` lines |
 | `missing` | a current committee address is in neither allow set, and `state.json` holds one such address or cannot be read | 1 | `missing` and `mismatch` lines |
 | `absent` | the table does not exist; the node is not asked | 1 | none |
+| `dormant` | the table exists but is dormant, so it enforces nothing, whatever the snapshot says | 1 | `missing` and `mismatch` lines as for the table awake; none when the snapshot is not authoritative or its epoch is below `EPOCH` |
 | `behind` | the snapshot's epoch is above `EPOCH`, no good sync has run yet, or every missing current address is one `state.json` does not hold yet: the next sync catches up | 3 | `missing` and `mismatch` lines, for information |
 | `stale` | the snapshot is not authoritative, or its epoch is below `EPOCH` | 3 | none |
+
+When more than one verdict applies, the first of these wins: an error (exit 2), `absent`, `dormant`, `stale`, `behind`, `missing`, `ok`.
 
 - An address counts as present only as the very element, a full-length prefix included; a static network that covers it does not count.
 - A mismatch is a key, in any swarm, whose `record_multiaddrs` give other addresses than its `multiaddrs`; both are allowed, so mismatches never change the verdict.
 - The totals count every missing address and every mismatched key, past the 5 lines shown.
 - `stale` logs `stale reason=<token>`, and for a snapshot below `EPOCH` `stale reason=epoch-regressed snapshot_epoch=N applied_epoch=N`; `behind` logs `behind snapshot_epoch=N applied_epoch=N`, with `applied_epoch=` empty before the first good sync and both epochs equal when the missing addresses are ones `state.json` does not hold yet.
+- `ok`, `missing`, `absent` and `dormant` log no closing line, so a `dormant` run logs no stale reason even when the snapshot is not authoritative.
 
 ### The status file
 
@@ -555,6 +559,7 @@ result=ok missing_total=0 mismatch_total=0
 | `COUNTER_DROP_PACKETS`, `COUNTER_DROP_BYTES` | integer or empty | counter `tn_drop_p2p_unlisted` |
 
 The counters are empty when nft could not list the table, the table is absent or the counter is gone.
+`LOADED` is `true` for a dormant table too; `check` is what reports it.
 `status` takes no lock and writes nothing.
 
 ### `status --json`
