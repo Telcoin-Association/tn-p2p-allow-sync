@@ -107,12 +107,12 @@ jobs:
     # actions: read lets the check read when GitHub created this run. On the push of a tag
     # the first run compares the tag with every release tag in the checkout; a re-run
     # compares it with the tags created before that time, the time of the push, whatever
-    # date the tag itself carries. checks: read lets the tag gate of release.conf read the
-    # check runs of the tagged commit, which must all have passed.
+    # date the tag itself carries. The tag gate of release.conf reads the jobs of the
+    # push-to-main runs of ci.yaml and nft-real.yaml on the tagged commit through the same
+    # actions: read; it reads no check runs.
     permissions:
       contents: read
       actions: read
-      checks: read
     steps:
       # main, never the tag; the header says why. `refs/heads/main` is fully qualified so
       # that a tag named `main` cannot be picked up. fetch-depth: 0 brings every tag and

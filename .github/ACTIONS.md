@@ -254,14 +254,14 @@ The procedure is in [`release/docs/signing.md`](../release/docs/signing.md), and
 
 | Job | Event | Runs | Token | Timeout |
 |---|---|---|---|---|
-| `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `release/release.sh check-tag`, then `release/release.sh notes` into the step summary | `contents: read`, `actions: read`, `checks: read` | 15 min |
+| `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `release/release.sh check-tag`, then `release/release.sh notes` into the step summary | `contents: read`, `actions: read` | 15 min |
 | `draft-release` | a pushed `v*` tag, once `validate-tag` has passed | `release/release.sh draft` | `contents: write` | 5 min |
 | `rebuild` | a pushed `v*` tag, once `validate-tag` has passed | `bash etc/ci-rebuild.sh "$RELEASE_TAG" "$RUNNER_TEMP/rebuild"`, then uploads its `program.sha256` as the artifact `rebuild-<tag>`, such as `rebuild-v0.1.1` | `contents: read` | 30 min |
 | `verify-release` | a published release (`release: published`); a dispatch with `mode: verify` | `release/release.sh verify` with `TN_P2P_ALLOW_REBUILD=1` | `contents: read` | 30 min |
 
 The tag filter is broader than the tag grammar on purpose: a malformed `v` tag fails visibly in `validate-tag` instead of being ignored, and `TAG_RE` in `release.conf` decides what a release tag is.
 A dispatch (*Release* -> *Run workflow*) takes a `tag` and a `mode` and is possible only once the workflow is on `main`; `verify` works on a published release only, because a read-only token cannot see drafts.
-`actions: read` lets `check-tag` read when GitHub created its run, and lets the tag gate of `release.conf` list the runs of `ci.yaml` and `nft-real.yaml` on the tagged commit and read their jobs; the gate reads no check runs, so the job's `checks: read` is unused.
+`actions: read` lets `check-tag` read when GitHub created its run, and lets the tag gate of `release.conf` list the runs of `ci.yaml` and `nft-real.yaml` on the tagged commit and read their jobs; the gate reads no check runs, so the job needs no `checks: read`.
 No job in `release.yaml` may share its name with a required check: GitHub matches a required check by name on a commit, whatever workflow reported it, and a tag can be pushed on any commit.
 
 ### Scripts and keys come from the pointer on `main`
