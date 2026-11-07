@@ -413,11 +413,11 @@ Every token below appears as `STALE_REASON` in `status`, as `reason=` on the std
 | Token | Trigger | `sync` exit | `RESULT` |
 |---|---|---|---|
 | `rpc-unreachable` | connection refused, broken or closed before any response byte, or a connect, read or overall timeout | 3 | `stale` |
-| `rpc-http-<code>` | an HTTP status other than 200, such as `rpc-http-503` | 3 | `stale` |
+| `rpc-http-<code>` | an HTTP status other than 200, such as `rpc-http-503`; the first status line is the answer, so an interim 1xx, which the request never asks for, reads as its code | 3 | `stale` |
 | `rpc-bad-http` | a response that breaks HTTP/1.1 framing | 3 | `stale` |
 | `rpc-body-too-large` | a head over 16 KiB or a decoded body over 8 MiB | 3 | `stale` |
 | `snapshot-malformed` | a body that is not JSON, no `result`, a `result` that is not an object, no valid `version`, a shape outside the v1 model, or an available primary with `admission: null` | 3 | `stale` |
-| `rpc-method-missing` | JSON-RPC error -32601: this node release lacks `tn_admissionSnapshot` | 3 | `stale` |
+| `rpc-method-missing` | JSON-RPC error -32601: the node lacks `tn_admissionSnapshot`, because its release predates the method or `tn` is not in its `--http.api` | 3 | `stale` |
 | `rpc-error-<code>` | any other JSON-RPC error, its code written literally, so -32001 reads `rpc-error--32001`; an `error` member without an integer `code` is `snapshot-malformed` | 3 | `stale` |
 | `snapshot-version-<n>` | `version` other than 1, such as `snapshot-version-2` | 3 | `stale` |
 | `snapshot-swarms` | no swarm, more than 16, a bad name or a name listed twice | 3 | `stale` |
@@ -428,7 +428,7 @@ Every token below appears as `STALE_REASON` in `status`, as `reason=` on the std
 | `fallback-missing` | the primary's fallback is `Missing` | 3 | `stale` |
 | `fallback-stale` | the primary's fallback is `Stale` | 3 | `stale` |
 | `fallback-contradictory` | the primary's fallback is `Contradictory`, or a value this build does not know | 3 | `stale` |
-| `epoch-regressed` | the snapshot's epoch is below the applied epoch; after a far-future `tracked_epoch` was accepted once, every honest snapshot regresses, and the recovery is `off`, then `on` | 3 | `stale` |
+| `epoch-regressed` | the snapshot's epoch is below the applied epoch; it clears by itself once the node's tracked epoch is back at or above the applied one, as after a node whose startup record sync failed replays old epochs; after a far-future `tracked_epoch` was accepted once, every honest snapshot regresses, it never clears, and the recovery is `off`, then `on` | 3 | `stale` |
 | `empty-set` | memory holds no address after the snapshot | 3 | `stale` |
 | `config-invalid` | `config` is missing, unreadable or breaks the grammar | 2 | `error` |
 | `floor-invalid` | `floor` is unreadable or malformed; for `capture-floor`, an input it cannot read | 2 | `error` |
@@ -442,8 +442,10 @@ Every token below appears as `STALE_REASON` in `status`, as `reason=` on the std
 
 Log-only tokens, never written to `status`: `usage` (a relative `--nft`), `snapshot-unreadable` (`render --snapshot` cannot read its file), `nft-check-failed` (`render --check` and nft rejected the program), `output-failed` (stdout could not be written, or `status --json` could not be serialised) and `no-epoch-duration` (the `epoch-info-failed` reason of an answer without a positive integer `epochDuration`).
 
-The deployment's `on` maps exit 1 with `reason=rpc-method-missing` on the stdout line to "this node release lacks tn_admissionSnapshot".
-`check-node.sh` reports `rpc-method-missing`, `snapshot-version-*` and `epoch-regressed` at once, since they never clear on their own, and every other reason once `STALE_SINCE` is older than 2 epochs.
+The deployment's `on` maps exit 1 with `reason=rpc-method-missing` on the stdout line to "this node release lacks tn_admissionSnapshot, or tn is not in its --http.api; update the node or add tn to --http.api", and `check-node.sh` prints the same text for that reason.
+`check-node.sh` reports at once: `rpc-method-missing`, `snapshot-version-*`, `epoch-regressed` and `state-invalid`, which can need the operator; any `RESULT=error`; and a sync unit whose last run failed, by its `Result` and `ExecMainStatus` (exit 0, 3 and 4 are not failures).
+It reports every other reason once `STALE_SINCE` is older than 2 epochs.
+`firewall-setup.sh --p2p-committee status` warns at once on the same four reasons.
 
 ## Outputs
 
@@ -589,7 +591,7 @@ Every log line goes to stderr, one event per line: the event name, then `key=val
   The prefix appears only when `JOURNAL_STREAM` names the device and inode of fd 2, systemd's documented check, so interactive output stays plain.
 - A value that is not plain printable ASCII is written quoted and escaped, so an event always stays on one line.
 - A run writes at most 8 lines; past that, the eighth is replaced by `log-capped dropped=N`.
-- The events: `error`, `stale`, `refused`, `busy`, `behind`, `nft-path`, `nft-unavailable`, `static-catch-all`, `static-covered`, `floor-missing`, `absorbed kind=<kind> count=N`, `epoch-info-failed`, `status-unreadable`, `status-value-invalid` and `log-capped`.
+- The events: `error`, `stale`, `refused`, `busy`, `behind`, `nft-path`, `nft-unavailable`, `listing-unreadable`, `static-catch-all`, `static-covered`, `floor-missing`, `absorbed kind=<kind> count=N`, `epoch-info-failed`, `status-unreadable`, `status-value-invalid` and `log-capped`.
 - `capture-floor` writes its single failure line without a prefix: `capture-floor: <token>: <detail>`.
 
 The deployment reads exit codes, stdout lines and the status file, never the log lines.
