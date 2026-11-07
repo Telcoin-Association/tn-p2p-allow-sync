@@ -51,5 +51,33 @@ run traffic nft -j list table inet tn_p2p_allow
 run reload-traffic nft -f "$d/traffic.nft"
 run traffic-reloaded nft -j list table inet tn_p2p_allow
 nft delete table inet tn_p2p_allow
+# The cases below come after all the others so that the handles in the files above stay as they were.
+# dormant: the table switched off by hand. A datagram from 127.0.0.1, which is not listed, to a P2P port
+# is counted before the table is dormant, not while it is, and again once the program is re-applied
+run load-dormant nft -f "$d/program.nft"
+bash -c 'printf x > /dev/udp/127.0.0.1/49590'
+run dormant-add nft add table inet tn_p2p_allow '{ flags dormant; }'
+bash -c 'for i in 1 2; do printf x > /dev/udp/127.0.0.1/49590; done'
+run dormant nft -j list table inet tn_p2p_allow
+run dormant-tables nft -j list tables inet
+run dormant-text nft list table inet tn_p2p_allow
+run reapply-dormant nft -f "$d/program.nft"
+bash -c 'for i in 1 2; do printf x > /dev/udp/127.0.0.1/49590; done'
+run dormant-reapplied nft -j list table inet tn_p2p_allow
+run dormant-reapplied-text nft list table inet tn_p2p_allow
+nft delete table inet tn_p2p_allow
+# the same flag on a table holding every element form: which garbage nft 1.0.x prints depends on the content
+nft -f "$d/forms.nft"
+nft add table inet tn_p2p_allow '{ flags dormant; }'
+run dormant-forms nft -j list table inet tn_p2p_allow
+nft delete table inet tn_p2p_allow
+for c in adjacent single-port; do
+    run "check-$c" sh -c "nft -c -f - < $d/$c.nft"
+    run "load-$c" nft -f "$d/$c.nft"
+    run "$c" nft -j list table inet tn_p2p_allow
+    run "reload-$c" nft -f "$d/$c.nft"
+    run "$c-reloaded" nft -j list table inet tn_p2p_allow
+    nft delete table inet tn_p2p_allow
+done
 # hand the files back to whoever owns the checkout
 chown -R "$(stat -c %u:%g "$d")" "$out"
