@@ -594,6 +594,74 @@ mod tests {
     const ABSORBED: &str = include_str!("../tests/fixtures/snapshot/absorbed.json");
     const WORKER_BEHIND: &str = include_str!("../tests/fixtures/snapshot/worker-behind.json");
 
+    /// Every required field of the v1 model by object and name, with values of another type.
+    ///
+    /// A missing key and each of these values are `snapshot-malformed`.
+    /// The four present-possibly-null fields take null, so their mistypes are not null.
+    const REQUIRED: &[(&str, &str, &[&str])] = &[
+        ("", "version", &[r#""1""#, "null"]),
+        ("", "swarms", &["null", "{}", r#"["primary"]"#]),
+        ("/swarms/0", "network", &["null", "0"]),
+        ("/swarms/0", "available", &["null", r#""true""#]),
+        ("/swarms/0", "tracked_epoch", &[r#""0x2a""#]),
+        ("/swarms/0", "admission", &[r#""Closed""#, "[]"]),
+        ("/swarms/0", "entries", &["null", "{}", r#"["0x8f3a"]"#]),
+        ("/swarms/0/admission", "configured", &["null", "3"]),
+        ("/swarms/0/admission", "effective", &["null", "3"]),
+        ("/swarms/0/admission", "epoch", &[r#""0x2a""#]),
+        ("/swarms/0/admission", "fallback", &["false"]),
+        (
+            "/swarms/0/admission",
+            "resolved_current",
+            &["null", r#""4""#],
+        ),
+        (
+            "/swarms/0/admission",
+            "required_current",
+            &["null", r#""3""#],
+        ),
+        (
+            "/swarms/0/admission",
+            "connected_current",
+            &["null", r#""3""#],
+        ),
+        ("/swarms/0/admission", "contradicted", &["null", r#""0""#]),
+        ("/swarms/0/entries/0", "bls_pubkey", &["null", "0"]),
+        (
+            "/swarms/0/entries/0",
+            "slots",
+            &["null", r#""current""#, "[1]"],
+        ),
+        (
+            "/swarms/0/entries/0",
+            "multiaddrs",
+            &["null", r#""/ip4/203.0.113.10/udp/49590/quic-v1""#, "[1]"],
+        ),
+        ("/swarms/0/entries/0", "source", &["null", "1"]),
+        ("/swarms/0/entries/0", "admitted", &["null", r#""true""#]),
+    ];
+
+    /// Every optional field of the v1 model by object and name, with values of another type.
+    ///
+    /// The field may be null or absent; each of these values is `snapshot-malformed`.
+    /// `network_pubkey` is read as any JSON value, so no value mistypes it.
+    const OPTIONAL: &[(&str, &str, &[&str])] = &[
+        ("", "epoch", &[r#""0x2a""#]),
+        ("/swarms/0", "worker_id", &[r#""0""#]),
+        ("/swarms/0/entries/0", "peer_id", &["1"]),
+        ("/swarms/0/entries/0", "network_pubkey", &[]),
+        (
+            "/swarms/0/entries/0",
+            "record_multiaddrs",
+            &[r#""/ip4/203.0.113.10/udp/49590/quic-v1""#],
+        ),
+        (
+            "/swarms/0/entries/0",
+            "record_timestamp",
+            &[r#""1793750400""#],
+        ),
+    ];
+
     /// Every stored fixture that fails, with the token it must give.
     const FAILING: &[(&str, &str, &str)] = &[
         (
@@ -1086,6 +1154,53 @@ mod tests {
                 Some("snapshot-malformed"),
                 "{object}/{field}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_required_field_is_required_and_every_optional_one_may_be_absent() -> TestResult {
+        let malformed = Some("snapshot-malformed");
+        for (object, field, mistypes) in REQUIRED {
+            let mut missing = value(GOOD)?;
+            remove(&mut missing, object, field)?;
+            assert_eq!(
+                token_of(missing).as_deref(),
+                malformed,
+                "{object}/{field} missing"
+            );
+            for mistyped in *mistypes {
+                let mut result = value(GOOD)?;
+                set(&mut result, object, field, value(mistyped)?)?;
+                assert_eq!(
+                    token_of(result).as_deref(),
+                    malformed,
+                    "{object}/{field}: {mistyped}"
+                );
+            }
+        }
+
+        // an unused optional field changes nothing, whether null or absent
+        let good = parse(value(GOOD)?)?;
+        for (object, field, mistypes) in OPTIONAL {
+            let mut result = value(GOOD)?;
+            set(&mut result, object, field, Value::Null)?;
+            assert_eq!(
+                parse(result.clone()),
+                Ok(good.clone()),
+                "{object}/{field}: null"
+            );
+            remove(&mut result, object, field)?;
+            assert_eq!(parse(result), Ok(good.clone()), "{object}/{field} absent");
+            for mistyped in *mistypes {
+                let mut result = value(GOOD)?;
+                set(&mut result, object, field, value(mistyped)?)?;
+                assert_eq!(
+                    token_of(result).as_deref(),
+                    malformed,
+                    "{object}/{field}: {mistyped}"
+                );
+            }
         }
         Ok(())
     }
