@@ -62,7 +62,7 @@ if [ "$STUB" = 1 ] && [ "${GITHUB_ACTIONS:-}" = true ]; then
     bail "RELEASE_BUILD_STUB=1 is refused in CI, which runs the real build"
 fi
 
-for tool in git gpg gpgconf gpg-connect-agent make docker tar gzip awk sed; do
+for tool in git gpg gpgconf gpg-connect-agent make docker tar gzip awk sed od; do
     command -v "$tool" >/dev/null 2>&1 || bail "missing required tool: $tool"
 done
 docker info >/dev/null 2>&1 || bail "docker does not answer"
@@ -549,6 +549,28 @@ expect_rc 0 "a tree's build image is read from its release.conf"
 expect_out "$(sed -n "s/^BUILD_IMAGE='\(.*\)'\$/\1/p" "$ROOT/release.conf")" "the image is the BUILD_IMAGE line"
 sourced tn_tree_image "$FX/tree-bad"
 expect_rc 1 "a tree whose release.conf has no BUILD_IMAGE line is not built"
+
+# ---------------------------------------------------------------------------------------------
+# The release gates, one case at a time
+
+# a static program passes; a dynamically linked one, or a script, is refused before it runs
+gate_rel=$FX/gate-release
+mkdir -p "$gate_rel/x"
+tar -xzf "$rd/$tarball" -C "$gate_rel/x"
+sourced tn_check_static "$gate_rel/x/$d/tn-p2p-allow-sync"
+expect_rc 0 "the release's program has no PT_INTERP program header"
+"$FX/mkelf" -i /lib/ld-musl-x86_64.so.1 "$FX/dynamic" "$v1" "$c1" "$t1" "snapshot-versions 1" "config-version 1"
+sourced tn_check_version "$FX/dynamic"
+expect_rc 1 "a program with a PT_INTERP program header fails the --version check"
+expect_err "tn-p2p-allow-sync in $tarball has a PT_INTERP program header" "it says the program is linked dynamically"
+sourced tn_check_version /bin/true
+expect_rc 1 "the host's dynamically linked /bin/true fails it too"
+expect_err "has a PT_INTERP program header" "it finds the PT_INTERP header of /bin/true"
+printf '#!/bin/sh\necho %s\n' "$v1" >"$FX/script"
+chmod 0755 "$FX/script"
+sourced tn_check_version "$FX/script"
+expect_rc 1 "a script fails it"
+expect_err "tn-p2p-allow-sync in $tarball is not an x86-64 ELF64 program" "it says the script is no ELF program"
 
 # ---------------------------------------------------------------------------------------------
 # Nothing left the machine.
