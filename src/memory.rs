@@ -895,6 +895,156 @@ mod tests {
         Ok(())
     }
 
+    /// A canonical `state.json` as v0.1.0 writes it, written by hand: three keys over `primary`, `worker-2` and `worker-10`, IPv4 and IPv6, and one strike.
+    ///
+    /// Every release must read it, so a change of order or form here is a change of the contract.
+    const GOLDEN_STATE: &[u8] = include_bytes!("../tests/fixtures/state/golden.json");
+
+    /// A key of the golden: `0x`, the byte `first` and zeros.
+    fn led(first: u8) -> BlsKey {
+        let mut bytes = [0; BLS_KEY_LEN];
+        if let Some(lead) = bytes.first_mut() {
+            *lead = first;
+        }
+        BlsKey::from_bytes(bytes)
+    }
+
+    /// `text` with its one occurrence of `from` replaced by `to`.
+    fn replace_once(text: &str, from: &str, to: &str) -> Result<String, Box<dyn Error>> {
+        if text.matches(from).count() != 1 {
+            return Err(format!("{from} is not in the text exactly once").into());
+        }
+        Ok(text.replacen(from, to, 1))
+    }
+
+    #[test]
+    fn a_golden_state_file_loads_and_reserialises_byte_equal() -> TestResult {
+        let state = load_state(Some(GOLDEN_STATE))?;
+        assert_eq!(serialize(&state), GOLDEN_STATE);
+        assert_eq!((state.version, state.epoch, state.keys.len()), (1, 42, 3));
+        // swarm names sort as text, so worker-10 comes before worker-2
+        let swarms: Vec<&str> = state
+            .keys
+            .get(&led(0x11))
+            .ok_or("0x11 is not in the golden")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(swarms, ["primary", "worker-10", "worker-2"]);
+        // IPv4 first, although "2001:db8::10" sorts before "203.0.113.10" as text
+        assert_eq!(
+            ips(&state, led(0x11), "primary"),
+            Some(BTreeMap::from([
+                (v4(203, 0, 113, 10), 42),
+                (doc6(0x10), 42)
+            ]))
+        );
+        assert_eq!(absent(&state, led(0x33), "worker-10"), Some(1));
+        // seen two epochs ago, the oldest the TTL keeps
+        assert_eq!(
+            ips(&state, led(0x33), "worker-10"),
+            Some(BTreeMap::from([(v4(198, 51, 100, 8), 40)]))
+        );
+        assert_eq!(
+            allow_ips(&state),
+            BTreeSet::from([
+                v4(198, 51, 100, 7),
+                v4(198, 51, 100, 8),
+                v4(203, 0, 113, 10),
+                doc6(0x10),
+                doc6(0x22),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_golden_state_is_what_apply_reaches_and_keeps() -> TestResult {
+        let (k1, k2, k3) = (led(0x11), led(0x22), led(0x33));
+        let (a4, a6, b6) = (v4(203, 0, 113, 10), doc6(0x10), doc6(0x22));
+        let (c7, c8) = (v4(198, 51, 100, 7), v4(198, 51, 100, 8));
+        let primary: &[(BlsKey, &[IpAddr])] = &[(k1, &[a4, a6]), (k2, &[b6]), (k3, &[c7])];
+        let worker_2: &[(BlsKey, &[IpAddr])] = &[(k1, &[a4]), (k2, &[b6])];
+        let worker_10: &[(BlsKey, &[IpAddr])] = &[(k1, &[a4])];
+        // epoch 40 lists 0x33 in worker-10, 41 drops it there (the first strike), 42 finds worker-10 timed out
+        let listed: [SwarmSpec<'_>; 3] = [
+            ("primary", true, primary),
+            ("worker-2", true, worker_2),
+            ("worker-10", true, &[(k1, &[a4]), (k3, &[c8])]),
+        ];
+        let dropped: [SwarmSpec<'_>; 3] = [
+            ("primary", true, primary),
+            ("worker-2", true, worker_2),
+            ("worker-10", true, worker_10),
+        ];
+        let timed_out: [SwarmSpec<'_>; 3] = [
+            ("primary", true, primary),
+            ("worker-2", true, worker_2),
+            ("worker-10", false, worker_10),
+        ];
+        let mut state = State::default();
+        apply(&mut state, &snapshot(40, &listed))?;
+        apply(&mut state, &snapshot(41, &dropped))?;
+        apply(&mut state, &snapshot(42, &timed_out))?;
+        assert_eq!(serialize(&state), GOLDEN_STATE);
+
+        // the run of tests/state_golden.rs: the same snapshot again neither strikes nor resets 0x33 in worker-10
+        let outcome = apply(&mut state, &snapshot(42, &timed_out))?;
+        let nothing = ApplyOutcome {
+            keys: 3,
+            added: 0,
+            removed: 0,
+            expired: 0,
+        };
+        assert_eq!(outcome, nothing);
+        assert_eq!(serialize(&state), GOLDEN_STATE);
+        Ok(())
+    }
+
+    #[test]
+    fn a_reordered_or_respaced_golden_is_state_invalid() -> TestResult {
+        let golden = std::str::from_utf8(GOLDEN_STATE)?;
+        let value: serde_json::Value = serde_json::from_str(golden)?;
+        let worker_10 = r#""worker-10":{"absent":0,"ips":{"203.0.113.10":42}}"#;
+        let worker_2 = r#""worker-2":{"absent":0,"ips":{"203.0.113.10":42}}"#;
+        let cases = [
+            (
+                "worker-2 before worker-10",
+                replace_once(
+                    golden,
+                    &format!("{worker_10},{worker_2}"),
+                    &format!("{worker_2},{worker_10}"),
+                )?,
+            ),
+            (
+                "addresses in text order",
+                replace_once(
+                    golden,
+                    r#"{"203.0.113.10":42,"2001:db8::10":42}"#,
+                    r#"{"2001:db8::10":42,"203.0.113.10":42}"#,
+                )?,
+            ),
+            (
+                "a space",
+                replace_once(golden, r#","keys":"#, r#", "keys":"#)?,
+            ),
+        ];
+        for (name, text) in &cases {
+            // the same JSON value, spelt another way
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(text)?,
+                value,
+                "{name}"
+            );
+            assert_eq!(
+                load_state(Some(text.as_bytes())),
+                Err(MemoryError::StateInvalid),
+                "{name}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn tokens_follow_the_contract() {
         assert_eq!(MemoryError::StateInvalid.token(), "state-invalid");
