@@ -231,18 +231,20 @@ The advisory databases `deny` and `audit` read are fetched fresh on every run, o
 
 ## Release workflow
 
-`.github/workflows/release.yaml` checks a release tag, opens a draft GitHub release for it, and checks the release again once a maintainer has published it.
+`.github/workflows/release.yaml` checks a release tag, opens a draft GitHub release for it, rebuilds the program from the tag on a runner, and checks the release again once a maintainer has published it.
 It signs and publishes nothing: a maintainer builds, signs and publishes with the `make release-*` targets, which run `release/release.sh`, the release script of the [tn-release-signing](https://github.com/Telcoin-Association/tn-release-signing) submodule at `release/`, with this repository's values and hooks from `release.conf`.
 The procedure is in [`release/docs/signing.md`](../release/docs/signing.md), and the threshold and the keys are in [`release/KEYS.md`](../release/KEYS.md).
 
 | Job | Event | Runs | Token | Timeout |
 |---|---|---|---|---|
-| `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `release/release.sh check-tag`, then `release/release.sh notes` into the step summary | `contents: read`, `actions: read` | 15 min |
+| `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `release/release.sh check-tag`, then `release/release.sh notes` into the step summary | `contents: read`, `actions: read`, `checks: read` | 15 min |
 | `draft-release` | a pushed `v*` tag, once `validate-tag` has passed | `release/release.sh draft` | `contents: write` | 5 min |
+| `rebuild` | a pushed `v*` tag, once `validate-tag` has passed | `bash etc/ci-rebuild.sh "$RELEASE_TAG" "$RUNNER_TEMP/rebuild"`, then uploads its `program.sha256` as the artifact `rebuild-<tag>`, such as `rebuild-v0.1.1` | `contents: read` | 30 min |
 | `verify-release` | a published release (`release: published`); a dispatch with `mode: verify` | `release/release.sh verify` with `TN_P2P_ALLOW_REBUILD=1` | `contents: read` | 30 min |
 
 The tag filter is broader than the tag grammar on purpose: a malformed `v` tag fails visibly in `validate-tag` instead of being ignored, and `TAG_RE` in `release.conf` decides what a release tag is.
 A dispatch (*Release* -> *Run workflow*) takes a `tag` and a `mode` and is possible only once the workflow is on `main`; `verify` works on a published release only, because a read-only token cannot see drafts.
+`actions: read` lets `check-tag` read when GitHub created its run, and `checks: read` lets the tag gate of `release.conf` read the check runs of the tagged commit.
 No job in `release.yaml` may share its name with a required check: GitHub matches a required check by name on a commit, whatever workflow reported it, and a tag can be pushed on any commit.
 
 ### Scripts and keys come from the pointer on `main`
@@ -259,9 +261,13 @@ The job definitions are the exception: GitHub reads `release.yaml` from the tagg
 No attestation stands behind a release here, unlike telcoin-network: the full suite, the real-kernel job included, is a required pull request check, and the program is reproducible.
 `make release-build` builds the program twice from a pristine worktree of the tag, with `etc/Dockerfile` in `BUILD_IMAGE`, `--pull` and `--no-cache`, and uploads nothing unless both builds are the same file.
 `make release-verify` (where `TN_P2P_ALLOW_REBUILD` defaults to 1) and `verify-release` rebuild it from the tagged commit and require the same file again; `make release-sign` rebuilds only with `TN_P2P_ALLOW_REBUILD=1`, since an amd64 build under emulation on a Mac is slow.
+Those builds before publish all run on the build server, so `rebuild` adds one the server does not control: on the push of the tag, before anything is signed, a GitHub runner builds the tagged commit the same way with `etc/ci-rebuild.sh`.
+It writes `program.sha256`, one line `<sha256>  tn-p2p-allow-sync`, to the step summary and uploads it as the artifact `rebuild-<tag>` (for v0.1.1, `rebuild-v0.1.1`).
+Only the push of the tag runs `rebuild`, never a dispatch or a published release, so the run that holds `rebuild-<tag>` is the `push` run of that tag (`gh run list --workflow release.yaml --event push`, then `gh run download <run-id> -n rebuild-<tag>`).
+The maintainer's sign step compares the draft's program with that sha256.
 A rebuild takes `etc/Dockerfile` and the `BUILD_IMAGE` line of `release.conf` from the tagged commit, so an older release stays reproducible after `main` moves the image.
 Every check also runs the program's `--version` in `BUILD_IMAGE`, with no network, and requires the five lines of the release: version, the tag's commit, the triple, a `snapshot-versions` list holding 1, and `config-version 1`.
-The one job with a write token, `draft-release`, compiles nothing; the rebuild in `verify-release` runs the build code of every dependency, inside a container that receives no token, in a job whose token can only read.
+The one job with a write token, `draft-release`, compiles nothing; the builds in `rebuild` and `verify-release` run the build code of every dependency, inside a container that receives no token, in jobs whose token can only read.
 
 `ci.yaml`'s `release-dry-run` job runs all of this on every pull request, the real build included, through `etc/tests/release_dry_run.sh`.
 
