@@ -181,7 +181,7 @@ A SHA cannot move, so the code that runs is the code that was reviewed when the 
 |---|---|---|---|---|
 | `actions/checkout` | `v7.0.1` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | node24 | every job |
 | `taiki-e/install-action` | `v2.87.22` | `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` | composite (shell steps only) | `deny`, `audit`, `coverage`, `mutants`, `fuzz`, `deny-weekly`, `audit-weekly` |
-| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real`, `coverage`, `mutants`, `fuzz` |
+| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real`, `coverage`, `rebuild`, `mutants`, `fuzz` |
 
 These are the releases `telcoin-network` pins, so one review of an upstream release covers both repositories.
 All three are lightweight tags, so the tag ref names the commit directly.
