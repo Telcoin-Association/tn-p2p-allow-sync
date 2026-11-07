@@ -340,6 +340,7 @@ step "$clone" rel ./release/release.sh check-tag "$tag"
 expect_rc 0 "check-tag accepts $tag"
 expect_out "commit=$r1 signer=alice fingerprint=$fpr channel=stable version=$version features= prerelease=false" \
     "check-tag prints the commit, the signer and the version"
+expect_err "$r1 keeps panic = \"unwind\" in its release build" "check-tag finds the panic strategy unwind at the tag"
 
 step "$clone" rel ./release/release.sh notes "$tag"
 expect_rc 0 "notes renders the release body"
@@ -571,6 +572,19 @@ chmod 0755 "$FX/script"
 sourced tn_check_version "$FX/script"
 expect_rc 1 "a script fails it"
 expect_err "tn-p2p-allow-sync in $tarball is not an x86-64 ELF64 program" "it says the script is no ELF program"
+
+# the panic strategy stays unwind: a commit whose [profile.release] sets panic = "abort"
+sourced tn_check_unwind "$r1"
+expect_rc 0 "the release commit keeps panic = \"unwind\""
+abort_blob=$(git -C "$clone" show "$r1:Cargo.toml" |
+    awk '{ print } $0 == "[profile.release]" { print "panic = \"abort\"" }' | git -C "$clone" hash-object -w --stdin)
+GIT_INDEX_FILE=$FX/abort.index git -C "$clone" read-tree "$r1"
+GIT_INDEX_FILE=$FX/abort.index git -C "$clone" update-index --cacheinfo "100644,$abort_blob,Cargo.toml"
+abort_tree=$(GIT_INDEX_FILE=$FX/abort.index git -C "$clone" write-tree)
+abort=$(git -C "$clone" commit-tree -p "$r1" -m 'fixture: panic = "abort"' "$abort_tree")
+sourced tn_check_unwind "$abort"
+expect_rc 1 "a commit whose Cargo.toml sets panic = \"abort\" is refused"
+expect_err "Cargo.toml at $abort sets the panic strategy to abort (line " "it names the file and the line"
 
 # ---------------------------------------------------------------------------------------------
 # Nothing left the machine.
