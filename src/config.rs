@@ -19,9 +19,10 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::net::IpAddr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::addr::{self, AddrClass, Cidr};
@@ -41,6 +42,12 @@ pub const FLOOR_MODE: u32 = 0o600;
 
 /// The largest input `capture-floor` reads, 16 MiB; a larger file is refused rather than cut, since a cut file could drop a peer.
 pub const MAX_CAPTURE_INPUT: u64 = 16_777_216;
+
+// std exposes no libc constants; every Linux target fsutil accepts shares this value
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(target_vendor = "apple")]
+const O_NONBLOCK: i32 = 0x0004;
 
 const KEY_VERSION: &str = "CONFIG_VERSION";
 const KEY_RPC_PORT: &str = "RPC_PORT";
@@ -462,15 +469,20 @@ const fn is_multiaddr_byte(b: u8) -> bool {
 }
 
 /// Reads one `capture-floor` input: a regular file, symlinks followed, at most [`MAX_CAPTURE_INPUT`] bytes.
+///
+/// The open is non-blocking and the type is checked on the open file, so a FIFO, even one swapped in for the file, is refused at once instead of blocking the run.
+/// A regular file ignores `O_NONBLOCK`, and a socket file cannot be opened at all.
 fn read_capture_input(path: &Path) -> io::Result<Vec<u8>> {
-    // checked before the open, so that a FIFO cannot block the run
-    if !std::fs::metadata(path)?.is_file() {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "is not a regular file",
         ));
     }
-    let file = File::open(path)?;
     let mut bytes = Vec::new();
     file.take(MAX_CAPTURE_INPUT.saturating_add(1))
         .read_to_end(&mut bytes)?;
