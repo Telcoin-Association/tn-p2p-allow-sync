@@ -1,5 +1,11 @@
 # The gates of every pull request and every push to main: fmt, clippy, test, coverage, deny,
-# audit, and a dry run of the release. deny and audit also run weekly on main, on their own.
+# audit, and a dry run of the release. The weekly deny and audit on main are scheduled.yaml's
+# deny-weekly and audit-weekly.
+#
+# Every job runs on every event of this workflow, with no job-level `if:`. A job skipped by
+# its `if:` leaves a check run concluded `skipped` on the commit, under the name of a required
+# check, and the newest run of that name is what branch protection and the release gate of
+# release.conf (tn_check_ci_green) read.
 #
 # Each job runs one command, the same one a maintainer runs locally before pushing, so a
 # red job reproduces with the command its last step names (.github/ACTIONS.md lists them).
@@ -15,19 +21,13 @@ on:
   pull_request:
   push:
     branches: [main]
-  # deny and audit again every Monday on main, so an advisory published against a dependency
-  # of the released program turns them red with no pull request open; every other job skips
-  # this event. GitHub disables a schedule after 60 days without activity in the repository
-  # (.github/ACTIONS.md says how to turn it back on).
-  schedule:
-    - cron: "23 5 * * 1"
   # every job, on the branch it is started on
   workflow_dispatch:
 
 # A new push to a pull request cancels the run for its previous head, which nothing reads any
 # more. Every other run is a group of its own: GitHub cancels a waiting run when a newer one
-# joins its group, and every push to main has to report, so a push, the schedule and a
-# dispatch never wait for, cancel or displace another run.
+# joins its group, and every push to main has to report, so a push and a dispatch never wait
+# for, cancel or displace another run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -42,7 +42,6 @@ env:
 
 jobs:
   fmt:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -59,7 +58,6 @@ jobs:
         run: cargo fmt --check
 
   clippy:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -76,7 +74,6 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -96,7 +93,6 @@ jobs:
   # below etc/coverage-baseline (etc/coverage-gate.sh). The JSON summary and an lcov report
   # are kept as the artifact `coverage`, whether the gate passed or not.
   coverage:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -189,7 +185,6 @@ jobs:
   # It needs no toolchain on the runner (the build runs in release.conf's BUILD_IMAGE) and
   # no token beyond reading the repository and the release/ submodule.
   release-dry-run:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
