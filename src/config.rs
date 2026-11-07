@@ -56,7 +56,7 @@ pub struct Config {
     pub p2p_ports: BTreeSet<u16>,
     /// IPv4 entries of `P2P_ALLOW_FROM`: hosts as /32 and networks masked to their network address.
     ///
-    /// A host was passed through [`addr::canonical_ip`], so an IPv4-mapped IPv6 host is here as IPv4; [`Cidr::is_host`] tells hosts from networks.
+    /// A host was passed through [`addr::canonical_ip`] and a network through [`Cidr::unmapped`], so an IPv4-mapped IPv6 entry is here as IPv4; [`Cidr::is_host`] tells hosts from networks.
     /// No network here lies inside another one: see [`Config::covered_dropped`].
     pub static_v4: BTreeSet<Cidr>,
     /// IPv6 entries of `P2P_ALLOW_FROM`: hosts as /128 and networks masked to their network address.
@@ -334,7 +334,8 @@ fn parse_allow_from(value: &str) -> Result<(BTreeSet<Cidr>, BTreeSet<Cidr>), Str
             })?;
             host(ip)
         } else {
-            entry
+            // a mapped network, like a mapped host, only matches as the IPv4 network it names
+            entry.unmapped()
         };
         let family = match entry.net {
             IpAddr::V4(_) => &mut v4,
@@ -772,6 +773,14 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
                 "::ffff:169.254.1.1",
                 "P2P_ALLOW_FROM entry \"::ffff:169.254.1.1\" is an unspecified, multicast or link-local address, never a peer's source",
             ),
+            (
+                "10.0.0.0/8,::ffff:10.0.0.0/95",
+                "P2P_ALLOW_FROM entry \"::ffff:10.0.0.0/95\" is an IPv4-mapped address with a prefix length shorter than 96",
+            ),
+            (
+                "::ffff:0.0.0.0/0",
+                "P2P_ALLOW_FROM entry \"::ffff:0.0.0.0/0\" is an IPv4-mapped address with a prefix length shorter than 96",
+            ),
         ] {
             let text = format!(
                 "CONFIG_VERSION=1\nRPC_PORT=8545\nP2P_PORTS=49590\nP2P_ALLOW_FROM={value}\n"
@@ -788,6 +797,7 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
         assert_eq!(
             config.static_v4,
             cidrs(&[
+                "192.0.2.0/24",
                 "198.51.100.9",
                 "198.51.100.10",
                 "203.0.113.0/24",
@@ -796,7 +806,7 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
         );
         assert_eq!(
             config.static_v6,
-            cidrs(&["::ffff:192.0.2.0/120", "2001:db8::/64", "2001:db8:1::7"])?
+            cidrs(&["2001:db8::/64", "2001:db8:1::7"])?
         );
         assert!(config.static_v4.iter().filter(|c| c.is_host()).count() == 2);
         assert!(!config.catch_all);
@@ -844,11 +854,57 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
         assert_eq!(config.static_v6, cidrs(&["2001:db8::/32"])?);
         assert_eq!(config.covered_dropped, 4);
 
-        // a mapped network is IPv6 and never covers or is covered by an IPv4 one
+        // a mapped network is the IPv4 network it names, so it covers and is covered as one
         let config = with_allow_from("::ffff:10.0.0.0/104,10.3.0.0/16")?;
-        assert_eq!(config.static_v4, cidrs(&["10.3.0.0/16"])?);
-        assert_eq!(config.static_v6, cidrs(&["::ffff:10.0.0.0/104"])?);
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert!(config.static_v6.is_empty());
+        assert_eq!(config.covered_dropped, 1);
+
+        let config = with_allow_from("10.0.0.0/8,::ffff:10.3.0.0/112")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert!(config.static_v6.is_empty());
+        assert_eq!(config.covered_dropped, 1);
+
+        // the same network in both spellings is one entry, deduplicated as any repeated network is, not covered
+        let config = with_allow_from("10.0.0.0/8,::ffff:10.0.0.0/104")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert!(config.static_v6.is_empty());
         assert_eq!(config.covered_dropped, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_networks_become_ipv4_networks() -> TestResult {
+        let config = with_allow_from("::ffff:10.0.0.0/104")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert!(config.static_v6.is_empty());
+        assert!(!config.catch_all);
+
+        // masked as usual
+        let config = with_allow_from("::ffff:10.1.2.3/104,::ffff:192.0.2.77/127")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8", "192.0.2.76/31"])?);
+
+        // the whole mapped range is every IPv4 source
+        let config = with_allow_from("::ffff:0.0.0.0/96")?;
+        assert_eq!(config.static_v4, cidrs(&["0.0.0.0/0"])?);
+        assert!(config.static_v6.is_empty());
+        assert!(config.catch_all);
+
+        // a /128 is a host: it goes through the host canonicalisation and on to the allow set
+        let config = with_allow_from("::ffff:198.51.100.9/128,::ffff:198.51.100.10")?;
+        assert_eq!(config.static_v4, cidrs(&["198.51.100.9", "198.51.100.10"])?);
+        assert!(config.static_v4.iter().all(Cidr::is_host));
+        assert!(config.static_v6.is_empty());
+
+        // only the mapped form is converted: a wider IPv6 network around the mapped range stays IPv6
+        // and never covers the IPv4 network a mapped entry gives
+        let config = with_allow_from("::/80,::ffff:10.0.0.0/104")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert_eq!(config.static_v6, cidrs(&["::/80"])?);
+        assert_eq!(config.covered_dropped, 0);
+        let config = with_allow_from("::fffe:0:0/95")?;
+        assert!(config.static_v4.is_empty());
+        assert_eq!(config.static_v6, cidrs(&["::fffe:0:0/95"])?);
         Ok(())
     }
 

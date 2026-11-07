@@ -16,6 +16,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// The limit applies to `multiaddrs` and `record_multiaddrs` of a snapshot entry separately.
 pub const MAX_MULTIADDRS_PER_LIST: usize = 32;
 
+/// The prefix length of the IPv4-mapped range `::ffff:0:0/96`: the IPv6 bits in front of the IPv4 address.
+const MAPPED_PREFIX: u8 = 96;
+
 /// What the leading segment of a multiaddr says about the peer's address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrClass {
@@ -135,6 +138,23 @@ impl Cidr {
     pub fn is_host(&self) -> bool {
         self.prefix == full_prefix(self.net)
     }
+
+    /// The network as the kernel matches it: a network inside the IPv4-mapped range `::ffff:0:0/96` becomes the IPv4 network of the same addresses, as [`canonical_ip`] maps a host.
+    ///
+    /// `::ffff:a.b.c.d/N` gives `a.b.c.d/(N-96)`, masked as usual: `::ffff:10.0.0.0/104` is `10.0.0.0/8` and `::ffff:0.0.0.0/96` is `0.0.0.0/0`.
+    /// The kernel sees the source of an IPv4 packet as IPv4, never as `::ffff:a.b.c.d`, so the mapped form would match nothing.
+    /// Every other network is returned as it is; [`parse_cidr_or_host`] refuses a mapped address with a prefix shorter than 96.
+    pub fn unmapped(self) -> Self {
+        let mapped = match self.net {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .zip(self.prefix.checked_sub(MAPPED_PREFIX)),
+            IpAddr::V4(_) => None,
+        };
+        mapped
+            .and_then(|(v4, prefix)| Self::new(IpAddr::V4(v4), prefix))
+            .unwrap_or(self)
+    }
 }
 
 impl fmt::Display for Cidr {
@@ -178,6 +198,13 @@ pub enum AddrError {
         /// The longest prefix of the family: 32 or 128.
         max: u8,
     },
+    /// The address is IPv4-mapped (`::ffff:a.b.c.d`) and the prefix length is shorter than 96.
+    ///
+    /// Such a network reaches past the mapped range, so it has no IPv4 form, and as IPv6 it would match none of the IPv4 sources it names.
+    MappedPrefixTooShort {
+        /// The entry as given.
+        entry: String,
+    },
 }
 
 impl fmt::Display for AddrError {
@@ -195,6 +222,10 @@ impl fmt::Display for AddrError {
             Self::PrefixTooLong { entry, max } => {
                 write!(f, "{entry:?} has a prefix length longer than {max}")
             }
+            Self::MappedPrefixTooShort { entry } => write!(
+                f,
+                "{entry:?} is an IPv4-mapped address with a prefix length shorter than {MAPPED_PREFIX}"
+            ),
         }
     }
 }
@@ -207,6 +238,7 @@ impl std::error::Error for AddrError {}
 /// A network is masked to its network address, so `203.0.113.77/24` gives `203.0.113.0/24`.
 /// The address is a std IP literal: no hostname, zone, brackets, whitespace or shortened IPv4 form.
 /// The prefix is decimal digits without a sign or a leading zero.
+/// An IPv4-mapped address (`::ffff:a.b.c.d`) needs a prefix of at least 96; the network keeps its mapped form, and [`Cidr::unmapped`] gives the IPv4 one.
 pub fn parse_cidr_or_host(s: &str) -> Result<Cidr, AddrError> {
     let (addr, prefix) = match s.split_once('/') {
         Some((addr, prefix)) => (addr, Some(prefix)),
@@ -222,6 +254,13 @@ pub fn parse_cidr_or_host(s: &str) -> Result<Cidr, AddrError> {
             entry: s.to_owned(),
         })?,
     };
+    // the check needs the address as written: masking to a prefix below 96 clears the `ffff`
+    let mapped = matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
+    if mapped && prefix < MAPPED_PREFIX {
+        return Err(AddrError::MappedPrefixTooShort {
+            entry: s.to_owned(),
+        });
+    }
     Cidr::new(ip, prefix).ok_or_else(|| AddrError::PrefixTooLong {
         entry: s.to_owned(),
         max,
@@ -537,6 +576,7 @@ mod tests {
             ("2001:db8::/129", 128),
             ("2001:db8::/200", 128),
             ("2001:db8::/256", 128),
+            ("::ffff:10.0.0.0/129", 128),
         ] {
             assert_eq!(
                 parse_cidr_or_host(entry),
@@ -547,6 +587,65 @@ mod tests {
                 "{entry}"
             );
         }
+    }
+
+    #[test]
+    fn a_mapped_address_needs_a_prefix_of_at_least_96() -> TestResult {
+        for entry in [
+            "::ffff:10.0.0.0/95",
+            "::ffff:10.0.0.0/80",
+            "::ffff:a00:0/64",
+            "::ffff:0.0.0.0/0",
+        ] {
+            assert_eq!(
+                parse_cidr_or_host(entry),
+                Err(AddrError::MappedPrefixTooShort {
+                    entry: entry.to_owned()
+                }),
+                "{entry}"
+            );
+        }
+        // the rule reads the address as written: the compatible form and the networks around the mapped range are plain IPv6
+        for (entry, expected) in [
+            ("::ffff:10.0.0.0/96", "::ffff:0.0.0.0/96"),
+            ("::192.0.2.0/120", "::c000:200/120"),
+            ("::fffe:0:0/95", "::fffe:0:0/95"),
+            ("::/80", "::/80"),
+        ] {
+            assert_eq!(cidr(entry)?.to_string(), expected, "{entry}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unmapped_gives_the_ipv4_network_of_a_mapped_one() -> TestResult {
+        for (entry, expected) in [
+            ("::ffff:10.0.0.0/104", "10.0.0.0/8"),
+            ("::ffff:10.1.2.3/104", "10.0.0.0/8"),
+            ("::ffff:10.0.0.0/96", "0.0.0.0/0"),
+            ("::ffff:0.0.0.0/96", "0.0.0.0/0"),
+            ("::ffff:192.0.2.77/120", "192.0.2.0/24"),
+            ("::ffff:192.0.2.10/128", "192.0.2.10/32"),
+            ("::ffff:192.0.2.10", "192.0.2.10/32"),
+            // every other network stays as it is
+            ("192.0.2.0/24", "192.0.2.0/24"),
+            ("2001:db8::/32", "2001:db8::/32"),
+            ("::/0", "::/0"),
+            ("::/80", "::/80"),
+            ("::192.0.2.0/120", "::c000:200/120"),
+            ("::fffe:0:0/95", "::fffe:0:0/95"),
+        ] {
+            assert_eq!(cidr(entry)?.unmapped().to_string(), expected, "{entry}");
+        }
+        // a value built from the fields is trusted as written; one without an IPv4 form stays as it is
+        for prefix in [90, 200] {
+            let odd = Cidr {
+                net: v6("::ffff:10.0.0.0")?,
+                prefix,
+            };
+            assert_eq!(odd.unmapped(), odd, "/{prefix}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -612,6 +711,7 @@ mod tests {
             "node.example",
             "203.0.113.0/x",
             "203.0.113.0/33",
+            "::ffff:10.0.0.0/95",
             "bad\nline\u{1b}[2J",
         ]
         .map(|entry| parse_cidr_or_host(entry).map_or_else(|e| e.to_string(), |c| c.to_string()));
@@ -621,6 +721,7 @@ mod tests {
                 "\"node.example\" is not an IP address or a CIDR (hostnames are not resolved)",
                 "\"203.0.113.0/x\" has a prefix length that is not a plain decimal number",
                 "\"203.0.113.0/33\" has a prefix length longer than 32",
+                "\"::ffff:10.0.0.0/95\" is an IPv4-mapped address with a prefix length shorter than 96",
                 "\"bad\\nline\\u{1b}[2J\" is not an IP address or a CIDR (hostnames are not resolved)",
             ]
         );
