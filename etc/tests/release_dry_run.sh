@@ -28,6 +28,12 @@
 # at the agent socket of the server's GnuPG home, and runs the remote command here, so the
 # clone is the server's checkout and its home signs through the restricted socket alone.
 #
+# The gates a dry run skips (the comparison with the CI rebuild, the required checks on the
+# tag's commit) run last, one case at a time, as release.sh's own tests call its functions,
+# with a gh that answers from fixture files (through jq, as gh's --jq does). So do the static
+# program check, the panic strategy check and etc/ci-rebuild.sh, which rebuilds the tag from a
+# checkout of main whose origin has it, with the build stub in both modes.
+#
 #   bash etc/tests/release_dry_run.sh [DIR]
 #
 # DIR (new or empty) keeps the fixture for inspection; without it a temp dir is removed. It
@@ -377,6 +383,7 @@ step "$clone" rel RELEASE_DIR="$rd" RELEASE_YES=1 RELEASE_SUMS_SHA256="$sums" RE
     ./release/release.sh sign "$tag"
 expect_rc 0 "sign adds alice's signature over SHA256SUMS"
 expect_out "signed $tag as @alice: 1/1 signatures" "sign counts one of one required signature"
+expect_err "dry run: not comparing tn-p2p-allow-sync with the CI rebuild of $tag" "a dry run signs without the CI rebuild"
 
 step "$clone" rel RELEASE_DIR="$rd" TN_P2P_ALLOW_REBUILD=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-}" \
     ./release/release.sh verify "$tag"
@@ -681,6 +688,63 @@ gated '' hook_check_tag_extra "$r1" always
 expect_rc 0 "the required checks of a published release are not asked for again"
 expect_err "release $tag is published: not checking the CI results of $r1 again" "it says the release is published"
 rm "$GHFX/release.json"
+
+# the CI rebuild: the draft's program against the artifact of the release workflow's run on
+# the push of the tag (hook_check_release_files, as sign, verify and publish run it)
+printf '[{"databaseId": 302, "status": "completed", "conclusion": "success", "headBranch": "%s"}, {"databaseId": 301, "status": "completed", "conclusion": "failure", "headBranch": "v0.0.1"}]\n' \
+    "$tag" >"$GHFX/runs.json"
+mkdir -p "$GHFX/artifact-302-rebuild-$tag"
+printf '%s  tn-p2p-allow-sync\n' "$packed" >"$GHFX/artifact-302-rebuild-$tag/program.sha256"
+gated true hook_check_release_files "$gate_rel"
+expect_rc 0 "sign accepts a draft whose program the CI rebuild of $tag also gave"
+expect_err "the CI rebuild of $tag from $r1 (run 302 of release.yaml) gave the same tn-p2p-allow-sync, sha256 $packed" \
+    "it names the run and the sha256"
+check "it looks for the release workflow's run on the push of $tag at the release commit" \
+    grep -q -F -e "run list --repo Telcoin-Association/tn-p2p-allow-sync --workflow release.yaml --commit $r1 --event push " "$GHFX/gh.log"
+check "it downloads that run's artifact rebuild-$tag" \
+    grep -q -x -F -e "run download 302 --repo Telcoin-Association/tn-p2p-allow-sync -n rebuild-$tag -D $FX/gate-work/ci-rebuild" "$GHFX/gh.log"
+
+drift=$(printf drift | sha256sum | awk '{ print $1 }')
+printf '%s  tn-p2p-allow-sync\n' "$drift" >"$GHFX/artifact-302-rebuild-$tag/program.sha256"
+gated true hook_check_release_files "$gate_rel"
+expect_rc 1 "sign refuses a draft whose program the CI rebuild did not give"
+expect_err "the draft's tn-p2p-allow-sync has sha256 $packed, but the CI rebuild of $tag from $r1 (run 302 of release.yaml) gave sha256 $drift" \
+    "it names both sha256s"
+
+printf '[{"databaseId": 301, "status": "completed", "conclusion": "failure", "headBranch": "v0.0.1"}]\n' >"$GHFX/runs.json"
+gated true hook_check_release_files "$gate_rel"
+expect_rc 2 "sign stops while the push of $tag has no run of the release workflow"
+expect_err "wait for the CI rebuild of $tag, then run this step again" "it says to wait for the CI rebuild"
+
+gated false hook_check_release_files "$gate_rel"
+expect_rc 0 "verify of a published release does not look for the CI rebuild"
+expect_err "release $tag is published: not comparing tn-p2p-allow-sync with the CI rebuild of $tag again" \
+    "it says the release is published"
+
+# etc/ci-rebuild.sh as the rebuild job runs it: in a checkout of main whose origin has the
+# tag. The build stub stands in for docker in both modes; verify above rebuilt the tag with
+# tn_build_commit, which the script builds with too.
+cio=$FX/ci-origin.git
+git -C "$FX" init -q --bare "$cio"
+git -C "$cio" fetch -q "$clone" '+refs/heads/main:refs/heads/main' "+refs/tags/$tag:refs/tags/$tag"
+fx_git -C "$FX" clone -q --recurse-submodules "$cio" "$FX/ci"
+printf '%s\n' "$build_stub" >>"$FX/ci/release.conf"
+"$FX/mkelf" "$FX/stub-program" "$v1" "$c1" "$t1" "snapshot-versions 1" "config-version 1"
+stub_hex=$(sha256sum "$FX/stub-program" | awk '{ print $1 }')
+step "$FX/ci" env GITHUB_STEP_SUMMARY="$FX/summary.md" ./etc/ci-rebuild.sh "$tag" "$FX/ci-out"
+expect_rc 0 "etc/ci-rebuild.sh rebuilds $tag in a checkout of main"
+check "its program.sha256 is one line: the sha256 of the build of $r1, two spaces, the program's name" \
+    test "$(cat "$FX/ci-out/program.sha256" 2>/dev/null)" = "$stub_hex  tn-p2p-allow-sync" \
+    -a "$(awk 'END { print NR }' "$FX/ci-out/program.sha256" 2>/dev/null)" = 1
+check "it adds the tag, the commit and the sha256 to the step summary" \
+    test "$(cat "$FX/summary.md" 2>/dev/null)" = "- CI rebuild of \`$tag\` from \`$r1\`: \`tn-p2p-allow-sync\` sha256 \`$stub_hex\`"
+
+git -C "$FX/ci" tag -d "$tag" >/dev/null
+git -C "$FX/ci" tag "$tag" "$r1"
+step "$FX/ci" ./etc/ci-rebuild.sh "$tag" "$FX/ci-out2"
+expect_rc 1 "etc/ci-rebuild.sh refuses a local $tag that differs from origin's"
+expect_err "a local tag differs from the one on origin" "it says the local tag differs"
+check "it writes no program.sha256 then" test ! -e "$FX/ci-out2/program.sha256"
 
 # ---------------------------------------------------------------------------------------------
 # Nothing left the machine.
