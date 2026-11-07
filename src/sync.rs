@@ -227,10 +227,11 @@ fn program_rules(ports: &BTreeSet<u16>) -> Vec<Vec<Expr>> {
 /// Whether the live table, as `listing` shows it, is the loaded program for `sets` and `ports`.
 ///
 /// The four sets must hold exactly the desired elements, compared as parsed values after [`normalise`] and never as text.
-/// Chain `input` must have the program's type, hook, priority and policy and hold exactly its [`INPUT_RULES`] rules in order, each with its ports, its source set, its counter and its verdict; both [`COUNTERS`] must exist.
-/// A set, a rule or a counter deleted by hand, and a verdict, a policy or a port list changed by hand, make this false, so the next run re-applies and heals it.
+/// Chain `input` must have the program's type, hook, priority and policy and hold exactly its [`INPUT_RULES`] rules in order, each with its ports, its source set, its counter and its verdict; both [`COUNTERS`] must exist; the table must not be dormant.
+/// A set, a rule or a counter deleted by hand, a verdict, a policy or a port list changed by hand, and a table made dormant by hand make this false, so the next run re-applies and heals it: the program declares the table without flags, which wakes it.
 pub fn listing_matches(listing: &Listing, sets: &Sets, ports: &BTreeSet<u16>) -> bool {
-    listing.chain.as_ref() == Some(&program_chain())
+    !listing.dormant
+        && listing.chain.as_ref() == Some(&program_chain())
         && listing.rules == program_rules(ports)
         && COUNTERS
             .iter()
@@ -1257,6 +1258,40 @@ mod tests {
                 "case {n}"
             );
         }
+    }
+
+    #[test]
+    fn a_dormant_table_re_applies_even_when_everything_else_matches() {
+        let (sets, config) = sample();
+        let program = sets.program(&config.p2p_ports);
+        let ports = &config.p2p_ports;
+        let awake = listing_of(&sets);
+        assert!(is_unchanged(
+            &program,
+            Some(program.as_bytes()),
+            Some(&awake),
+            &sets,
+            ports
+        ));
+        // the same sets, rules and counters, counters with traffic included: the table enforces nothing
+        let mut dormant = Listing {
+            dormant: true,
+            ..awake
+        };
+        for counter in dormant.counters.values_mut() {
+            *counter = Counter {
+                packets: 1,
+                bytes: 29,
+            };
+        }
+        assert!(!listing_matches(&dormant, &sets, ports));
+        assert!(!is_unchanged(
+            &program,
+            Some(program.as_bytes()),
+            Some(&dormant),
+            &sets,
+            ports
+        ));
     }
 
     #[test]
