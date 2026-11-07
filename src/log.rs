@@ -4,18 +4,23 @@
 //! The prefix appears only when `JOURNAL_STREAM` names the device and inode of fd 2, systemd's documented check, so interactive output stays plain.
 //!
 //! A value that is not plain printable ASCII is written in Rust's quoted, escaped form, so every event stays on one line whatever it carries.
-//! Once a run has logged more than [`MAX_LINES`] lines, the last slot is spent on one `log-capped dropped=N` line instead.
+//!
+//! A run's closing line, the one that says how it ended, is logged with [`Log::last`]: it is never dropped and is always the last line written.
+//! The other lines share the first [`MAX_LINES`]` - 1` slots; once more of them come than fit, the last of those slots is spent on one `log-capped dropped=N` line instead.
 
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 
-/// The most lines one run writes to stderr, the `log-capped` line included.
+/// The most lines one run writes to stderr, the `log-capped` line and the closing line included.
 pub const MAX_LINES: usize = 8;
 
-/// Lines written as they come; the line after them is held until it is known whether the cap is reached.
-const IMMEDIATE_LINES: usize = MAX_LINES.saturating_sub(1);
+/// The slots of the lines before the closing line, the `log-capped` line included.
+const ORDINARY_LINES: usize = MAX_LINES.saturating_sub(1);
+
+/// Ordinary lines written as they come; the one after them is held until it is known whether the cap is reached.
+const IMMEDIATE_LINES: usize = ORDINARY_LINES.saturating_sub(1);
 
 /// The variable systemd sets to `<device>:<inode>` of the journal stream it connected to stdout and stderr.
 const JOURNAL_STREAM: &str = "JOURNAL_STREAM";
@@ -81,10 +86,23 @@ pub fn stderr_is_journal() -> bool {
     journal_matches(stream.as_deref(), fd2)
 }
 
+/// A log line kept as its parts, for a caller that learns only later whether it closes the run.
+#[derive(Debug, Clone, Copy)]
+pub struct Line<'a> {
+    /// How serious the line is.
+    pub priority: Priority,
+    /// The event name the line starts with.
+    pub event: &'a str,
+    /// The `key=value` fields after the event, in order.
+    pub fields: &'a [(&'a str, &'a str)],
+}
+
 /// The log of one run, written to `out`.
 ///
-/// The first [`MAX_LINES`]` - 1` lines are written as they come.
-/// The next one is held: if the run logs nothing more, it is written when the log is finished; if it does, it and every later line are dropped, and the last slot says how many went.
+/// Lines logged with [`Log::line`] or [`Log::plain`] share the first [`MAX_LINES`]` - 1` slots, and all but the last of those slots are written as the lines come.
+/// The line after them is held: if the run logs no other such line, it is written when the log is finished; if it does, it and every later one are dropped, and that slot says how many went.
+/// The closing line, logged with [`Log::last`] or [`Log::last_plain`], is held until the log is finished and then written after all of them, so it is never dropped and always last.
+/// A run has one closing line; a second one is a bug and is logged as an ordinary line instead, written in a free slot or dropped and counted, so the first stays last.
 /// Finishing happens on [`Log::finish`] or on drop, whichever comes first.
 #[derive(Debug)]
 pub struct Log<W: Write> {
@@ -93,6 +111,7 @@ pub struct Log<W: Write> {
     written: usize,
     held: Option<String>,
     dropped: u64,
+    closing: Option<String>,
     finished: bool,
 }
 
@@ -112,6 +131,7 @@ impl<W: Write> Log<W> {
             written: 0,
             held: None,
             dropped: 0,
+            closing: None,
             finished: false,
         }
     }
@@ -120,14 +140,7 @@ impl<W: Write> Log<W> {
     ///
     /// An empty value is written as `key=`; a value that holds anything but printable ASCII other than `"` and `\` is written quoted and escaped.
     pub fn line(&mut self, priority: Priority, event: &str, fields: &[(&str, &str)]) {
-        let mut text = String::from(prefix_for(priority, self.journal));
-        text.push_str(event);
-        for (key, value) in fields {
-            text.push(' ');
-            text.push_str(key);
-            text.push('=');
-            push_value(&mut text, value);
-        }
+        let text = self.format(priority, event, fields);
         self.emit(text);
     }
 
@@ -136,9 +149,41 @@ impl<W: Write> Log<W> {
         self.emit(text.to_owned());
     }
 
-    /// Writes the held line, or the `log-capped` line when lines were dropped, and flushes; later lines are dropped.
+    /// Logs the run's closing line, formatted as [`Log::line`] formats one: it is written when the log is finished, after every other line, and is never dropped.
+    pub fn last(&mut self, priority: Priority, event: &str, fields: &[(&str, &str)]) {
+        let text = self.format(priority, event, fields);
+        self.close_with(text);
+    }
+
+    /// Logs `text` as it is, with no prefix, as the run's closing line: a summary line the caller formatted, which must not hold a newline.
+    pub fn last_plain(&mut self, text: &str) {
+        self.close_with(text.to_owned());
+    }
+
+    /// Writes the held line, or the `log-capped` line when lines were dropped, then the closing line, and flushes; later lines are dropped.
     pub fn finish(mut self) {
         self.close();
+    }
+
+    fn format(&self, priority: Priority, event: &str, fields: &[(&str, &str)]) -> String {
+        let mut text = String::from(prefix_for(priority, self.journal));
+        text.push_str(event);
+        for (key, value) in fields {
+            text.push(' ');
+            text.push_str(key);
+            text.push('=');
+            push_value(&mut text, value);
+        }
+        text
+    }
+
+    fn close_with(&mut self, text: String) {
+        if self.finished || self.closing.is_some() {
+            // a second closing line is a bug; as an ordinary line it cannot take the first one's place
+            self.emit(text);
+        } else {
+            self.closing = Some(text);
+        }
     }
 
     fn emit(&mut self, text: String) {
@@ -151,7 +196,7 @@ impl<W: Write> Log<W> {
             self.written = self.written.saturating_add(1);
             return;
         }
-        // the last slot: held until the run logs another line or ends
+        // the last ordinary slot: held until the run logs another ordinary line or ends
         if self.held.take().is_some() {
             self.dropped = 2;
         } else {
@@ -172,6 +217,9 @@ impl<W: Write> Log<W> {
             );
             self.write(&text);
         } else if let Some(text) = self.held.take() {
+            self.write(&text);
+        }
+        if let Some(text) = self.closing.take() {
             self.write(&text);
         }
         // nothing is left to report a failed flush to
@@ -213,6 +261,18 @@ mod tests {
         for n in 0..lines {
             log.line(Priority::Warning, "event", &[("n", &n.to_string())]);
         }
+        drop(log);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// `lines` ordinary lines, then the closing line `stale reason=r`, finished by drop.
+    fn closed(lines: usize) -> String {
+        let mut out = Vec::new();
+        let mut log = Log::new(&mut out, false);
+        for n in 0..lines {
+            log.line(Priority::Warning, "event", &[("n", &n.to_string())]);
+        }
+        log.last(Priority::Warning, "stale", &[("reason", "r")]);
         drop(log);
         String::from_utf8_lossy(&out).into_owned()
     }
@@ -306,39 +366,141 @@ mod tests {
     }
 
     #[test]
-    fn eight_lines_fit_and_the_ninth_spends_the_last_slot_on_the_cap() {
+    fn seven_lines_fit_and_the_eighth_spends_the_last_slot_on_the_cap() {
+        let seven = logged(false, 7);
+        let expected: String = (0..7).map(|n| format!("event n={n}\n")).collect();
+        assert_eq!(seven, expected);
+
         let eight = logged(false, 8);
-        let expected: String = (0..8).map(|n| format!("event n={n}\n")).collect();
+        let mut expected: String = (0..6).map(|n| format!("event n={n}\n")).collect();
+        expected.push_str("log-capped dropped=2\n");
         assert_eq!(eight, expected);
 
-        let nine = logged(false, 9);
-        let mut expected: String = (0..7).map(|n| format!("event n={n}\n")).collect();
-        expected.push_str("log-capped dropped=2\n");
-        assert_eq!(nine, expected);
-
         let many = logged(true, 30);
-        let mut expected: String = (0..7).map(|n| format!("<4>event n={n}\n")).collect();
-        expected.push_str("<4>log-capped dropped=23\n");
+        let mut expected: String = (0..6).map(|n| format!("<4>event n={n}\n")).collect();
+        expected.push_str("<4>log-capped dropped=24\n");
         assert_eq!(many, expected);
-        assert_eq!(many.lines().count(), MAX_LINES);
+        assert_eq!(many.lines().count(), ORDINARY_LINES);
 
         assert_eq!(logged(false, 0), "");
         assert_eq!(logged(false, 1), "event n=0\n");
     }
 
     #[test]
+    fn the_held_line_is_written_on_drop_when_no_closing_line_comes() {
+        let mut out = Vec::new();
+        let mut log = Log::new(&mut out, false);
+        for n in 0..7 {
+            log.line(Priority::Warning, "event", &[("n", &n.to_string())]);
+        }
+        // six are written at once, and the seventh waits for the end
+        assert_eq!(
+            String::from_utf8_lossy(log.out.as_slice()).lines().count(),
+            6
+        );
+        drop(log);
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert_eq!(text.lines().count(), 7, "{text}");
+        assert!(text.ends_with("event n=5\nevent n=6\n"), "{text}");
+    }
+
+    #[test]
+    fn the_closing_line_is_never_dropped_and_always_last() {
+        // seven ordinary lines fit beside it
+        let mut expected: String = (0..7).map(|n| format!("event n={n}\n")).collect();
+        expected.push_str("stale reason=r\n");
+        assert_eq!(closed(7), expected);
+        assert_eq!(closed(7).lines().count(), MAX_LINES);
+
+        // past seven, the seventh slot counts every ordinary line not written
+        let mut expected: String = (0..6).map(|n| format!("event n={n}\n")).collect();
+        expected.push_str("log-capped dropped=2\nstale reason=r\n");
+        assert_eq!(closed(8), expected);
+        let mut expected: String = (0..6).map(|n| format!("event n={n}\n")).collect();
+        expected.push_str("log-capped dropped=14\nstale reason=r\n");
+        assert_eq!(closed(20), expected);
+
+        assert_eq!(closed(0), "stale reason=r\n");
+        assert_eq!(closed(1), "event n=0\nstale reason=r\n");
+    }
+
+    #[test]
+    fn the_closing_line_waits_for_the_end_and_carries_its_prefix() {
+        let mut out = Vec::new();
+        let mut log = Log::new(&mut out, true);
+        log.last(
+            Priority::Error,
+            "error",
+            &[("reason", "nft-apply-failed"), ("detail", "one\ntwo")],
+        );
+        // lines logged after it still come before it
+        log.line(
+            Priority::Warning,
+            "status-value-invalid",
+            &[("key", "EPOCH")],
+        );
+        assert_eq!(
+            String::from_utf8_lossy(log.out.as_slice()),
+            "<4>status-value-invalid key=EPOCH\n"
+        );
+        log.finish();
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "<4>status-value-invalid key=EPOCH\n<3>error reason=nft-apply-failed detail=\"one\\ntwo\"\n"
+        );
+
+        let mut out = Vec::new();
+        let mut log = Log::new(&mut out, true);
+        log.line(Priority::Warning, "floor-missing", &[]);
+        log.last_plain("result=rendered reason=");
+        log.finish();
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "<4>floor-missing\nresult=rendered reason=\n"
+        );
+    }
+
+    #[test]
+    fn a_second_closing_line_is_logged_as_an_ordinary_one() {
+        let mut out = Vec::new();
+        let mut log = Log::new(&mut out, false);
+        log.last(Priority::Warning, "stale", &[("reason", "first")]);
+        log.last(Priority::Error, "error", &[("reason", "second")]);
+        log.finish();
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "error reason=second\nstale reason=first\n"
+        );
+
+        // with every ordinary slot taken, it is dropped and counted
+        let mut out = Vec::new();
+        let mut log = Log::new(&mut out, false);
+        for n in 0..7 {
+            log.line(Priority::Warning, "event", &[("n", &n.to_string())]);
+        }
+        log.last(Priority::Warning, "stale", &[("reason", "first")]);
+        log.last_plain("result=stale reason=second");
+        log.finish();
+        let mut expected: String = (0..6).map(|n| format!("event n={n}\n")).collect();
+        expected.push_str("log-capped dropped=2\nstale reason=first\n");
+        assert_eq!(String::from_utf8_lossy(&out), expected);
+    }
+
+    #[test]
     fn finishing_twice_writes_once_and_later_lines_are_dropped() {
         let mut out = Vec::new();
         let mut log = Log::new(&mut out, false);
-        for n in 0..8 {
+        for n in 0..7 {
             log.line(Priority::Warning, "event", &[("n", &n.to_string())]);
         }
+        log.last(Priority::Warning, "stale", &[("reason", "r")]);
         log.close();
         log.line(Priority::Warning, "late", &[]);
+        log.last(Priority::Error, "error", &[("reason", "late")]);
         log.close();
         drop(log);
         let text = String::from_utf8_lossy(&out).into_owned();
-        assert_eq!(text.lines().count(), 8, "{text}");
-        assert!(text.ends_with("event n=7\n"), "{text}");
+        assert_eq!(text.lines().count(), MAX_LINES, "{text}");
+        assert!(text.ends_with("event n=6\nstale reason=r\n"), "{text}");
     }
 }

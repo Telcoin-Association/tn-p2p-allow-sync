@@ -1595,17 +1595,18 @@ fn stderr_never_exceeds_eight_lines() -> TestResult {
     assert!(ran.stdout.starts_with("result=applied "), "{ran:?}");
     for warning in [
         "nft-path ",
+        "floor-missing ",
         "static-catch-all ",
         "static-covered dropped=2",
         "absorbed kind=unknown-slots count=1",
         "absorbed kind=uppercase-keys count=1",
-        "absorbed kind=duplicate-keys count=1",
     ] {
         assert!(ran.logged(warning), "{warning}: {ran:?}");
     }
-    // nine or more lines were logged: seven are written and the eighth says how many were dropped
+    // eight or more lines were logged: six are written and the seventh says how many were dropped;
+    // the eighth slot is the closing line's, and a run that applies has none
     let lines: Vec<&str> = ran.stderr.lines().collect();
-    assert_eq!(lines.len(), 8, "{ran:?}");
+    assert_eq!(lines.len(), 7, "{ran:?}");
     assert!(
         lines
             .last()
