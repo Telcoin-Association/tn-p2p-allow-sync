@@ -1,9 +1,14 @@
-//! The state dir: its safety checks, reads that never follow a symlink, atomic writes, the run lock and the effective uid.
+//! The state dir: its safety checks, reads that never follow a symlink, atomic writes, the run lock and the effective uid; and the bounded read of a file named on the command line.
 //!
 //! Every file the tool reads or writes at run time lives in the state dir, so no temporary file ever lands in `/tmp`.
 //! The tool never creates the dir: the scripts create it as root with mode 0700, and [`StateDir::open`] refuses one that is a symlink, is not a directory, is owned by another uid or has any mode other than 0700, and a path whose last component is empty (a trailing `/`), `.` or `..`, behind which the kernel would follow a symlink.
 //!
 //! Files are opened with `O_NOFOLLOW` through [`OpenOptionsExt::custom_flags`], a safe API, so a symlink planted in the dir is refused rather than followed; the dir itself is opened for its fsync with `O_NOFOLLOW|O_DIRECTORY`.
+//!
+//! This module is the one place the crate opens, renames, removes or inspects a file by path; clippy.toml refuses those std::fs calls anywhere else.
+
+// the owner clippy.toml names for std::fs: every open, rename and remove of the crate is here
+#![allow(clippy::disallowed_methods)]
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -38,7 +43,7 @@ const PROC_SELF_STATUS: &str = "/proc/self/status";
         target_arch = "loongarch64"
     )
 ))]
-pub(crate) const O_NOFOLLOW: i32 = 0o400_000;
+const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(all(
     target_os = "linux",
     any(
@@ -58,7 +63,7 @@ const O_DIRECTORY: i32 = 0o200_000;
         target_arch = "powerpc64"
     )
 ))]
-pub(crate) const O_NOFOLLOW: i32 = 0o100_000;
+const O_NOFOLLOW: i32 = 0o100_000;
 #[cfg(all(
     target_os = "linux",
     any(
@@ -70,7 +75,7 @@ pub(crate) const O_NOFOLLOW: i32 = 0o100_000;
 ))]
 const O_DIRECTORY: i32 = 0o40_000;
 #[cfg(target_vendor = "apple")]
-pub(crate) const O_NOFOLLOW: i32 = 0x0100;
+const O_NOFOLLOW: i32 = 0x0100;
 #[cfg(target_vendor = "apple")]
 const O_DIRECTORY: i32 = 0x0010_0000;
 // the same on every Linux target above; the compile_error below covers the others
@@ -261,12 +266,33 @@ fn regular_file(meta: &fs::Metadata) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, what))
 }
 
+/// Reads a file an operator named on the command line: symlinks followed, a regular file only, at most `max + 1` bytes.
+///
+/// The open is `O_NONBLOCK` and the type is checked on the open file, so a FIFO, even one swapped in for the file, is refused at once instead of blocking the run.
+/// A regular file ignores `O_NONBLOCK`, and a socket file cannot be opened at all.
+/// The one byte past `max` lets the caller tell a file of exactly `max` bytes from a larger one; what a larger one means is the caller's to say.
+pub fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Removes what a run that died between create and rename left at the temporary name `path`, if anything.
 ///
 /// Unlinking a symlink removes the link, never its target.
 /// An empty directory in the way is removed too; one with anything in it is an error, never emptied.
 /// The caller holds the [`Lock`]: that is what makes the removal safe.
-pub(crate) fn remove_leftover(path: &Path) -> Result<(), FsError> {
+fn remove_leftover(path: &Path) -> Result<(), FsError> {
     let error = match fs::remove_file(path) {
         Ok(()) => return Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -398,24 +424,56 @@ impl StateDir {
     /// On failure the temporary file is removed and the old content stays.
     pub fn write_atomic(&self, name: &str, bytes: &[u8], mode: u32) -> Result<(), FsError> {
         let target = self.file(name)?;
-        let temp = self.file(&format!(".{name}.new"))?;
-        remove_leftover(&temp)?;
+        let temp = self.create(&format!(".{name}.new"), bytes, mode)?;
+        if let Err(e) = fs::rename(&temp, &target) {
+            // best effort: the error that matters is the rename's
+            let _ = fs::remove_file(&temp);
+            return Err(FsError::io(&target, "rename into place", e));
+        }
+        self.sync()
+    }
+
+    /// Creates the file `name` holding `bytes`, with exactly `mode` whatever the umask, syncs it and returns its path; a leftover under the name is removed first.
+    ///
+    /// The file is created with `O_CREAT|O_EXCL|O_NOFOLLOW`, so nothing is ever written through a symlink planted under the name.
+    /// On failure the new file is removed.
+    /// The caller holds the [`Lock`]: that is what makes removing a leftover safe.
+    pub fn create(&self, name: &str, bytes: &[u8], mode: u32) -> Result<PathBuf, FsError> {
+        let path = self.file(name)?;
+        remove_leftover(&path)?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(mode)
             .custom_flags(O_NOFOLLOW)
-            .open(&temp)
-            .map_err(|e| FsError::io(&temp, "create", e))?;
-        let placed = fill(file, &temp, bytes, mode).and_then(|()| {
-            fs::rename(&temp, &target).map_err(|e| FsError::io(&target, "rename into place", e))
-        });
-        if let Err(e) = placed {
+            .open(&path)
+            .map_err(|e| FsError::io(&path, "create", e))?;
+        if let Err(e) = fill(file, &path, bytes, mode) {
             // best effort: the error that matters is the one above
-            let _ = fs::remove_file(&temp);
+            let _ = fs::remove_file(&path);
             return Err(e);
         }
+        Ok(path)
+    }
+
+    /// Renames the file `from` to `to`, then syncs the directory so the rename survives a crash.
+    ///
+    /// On failure `from` stays where it is.
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), FsError> {
+        let source = self.file(from)?;
+        let target = self.file(to)?;
+        fs::rename(&source, &target).map_err(|e| FsError::io(&target, "rename into place", e))?;
         self.sync()
+    }
+
+    /// Removes the file `name`; nothing under the name is not an error, and a symlink is unlinked, never followed.
+    pub fn remove(&self, name: &str) -> Result<(), FsError> {
+        let path = self.file(name)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(FsError::io(&path, "remove", e)),
+        }
     }
 
     /// Syncs the directory, so a rename into it survives a crash.
