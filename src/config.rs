@@ -462,7 +462,7 @@ const fn is_multiaddr_byte(b: u8) -> bool {
 
 /// Reads one `capture-floor` input: a regular file, symlinks followed, at most [`MAX_CAPTURE_INPUT`] bytes.
 ///
-/// [`fsutil::read_bounded`] opens it non-blocking and checks the type on the open file, so a FIFO, even one swapped in for the file, is refused at once instead of blocking the run.
+/// [`fsutil::read_bounded`] checks the type before the open and again on the file it opens non-blocking, so a special file is never opened and a FIFO swapped in for the file is refused at once instead of blocking the run.
 fn read_capture_input(path: &Path) -> io::Result<Vec<u8>> {
     let bytes = fsutil::read_bounded(path, MAX_CAPTURE_INPUT)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CAPTURE_INPUT {
@@ -1375,7 +1375,7 @@ num_workers: 1
             println!("skipped: mkfifo is not on PATH");
             return Ok(());
         }
-        // a symlink is followed, and what it reaches is checked on the open file
+        // a symlink is followed, and what it reaches is checked
         let link = temp.join("committee.yaml");
         symlink(&fifo, &link)?;
         for bad in [fifo, link] {
@@ -1400,14 +1400,14 @@ num_workers: 1
         let input = socket.clone();
         let error = without_blocking(move || capture_floor(&[input]))?
             .map_err(|e| (e.token(), e.line(), e.to_string()));
-        // a socket cannot be opened, so the open's error is the detail
+        // refused by the check before the open, so the socket is never opened
         let Err((token, line, message)) = error else {
             return Err("the socket was accepted".into());
         };
         assert_eq!((token, line), ("floor-invalid", None));
-        assert!(
-            message.starts_with(&format!("{socket:?}: cannot read: ")),
-            "{message}"
+        assert_eq!(
+            message,
+            format!("{socket:?}: cannot read: is not a regular file")
         );
         Ok(())
     }
