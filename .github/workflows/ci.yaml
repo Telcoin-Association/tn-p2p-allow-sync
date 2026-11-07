@@ -1,5 +1,5 @@
-# The gates of every pull request and every push to main: fmt, clippy, test, deny, audit,
-# and a dry run of the release. deny and audit also run weekly on main, on their own.
+# The gates of every pull request and every push to main: fmt, clippy, test, coverage, deny,
+# audit, and a dry run of the release. deny and audit also run weekly on main, on their own.
 #
 # Each job runs one command, the same one a maintainer runs locally before pushing, so a
 # red job reproduces with the command its last step names (.github/ACTIONS.md lists them).
@@ -91,6 +91,51 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  # the same tests, instrumented: the total line coverage may not fall more than 0.5 points
+  # below etc/coverage-baseline (etc/coverage-gate.sh). The JSON summary and an lcov report
+  # are kept as the artifact `coverage`, whether the gate passed or not.
+  coverage:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml lists llvm-tools-preview, which cargo llvm-cov needs
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # same pin and the same fallback rule as cargo-deny below
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-llvm-cov@0.9.1
+          fallback: none
+
+      - name: Coverage
+        id: coverage
+        run: cargo llvm-cov --locked --summary-only --json --output-path target/coverage.json
+
+      # from the profiles of the run above; builds and runs nothing
+      - name: lcov report
+        run: cargo llvm-cov report --locked --lcov --output-path target/lcov.info
+
+      - name: Coverage gate
+        run: bash etc/coverage-gate.sh target/coverage.json etc/coverage-baseline
+
+      - name: Upload the coverage reports
+        if: always() && steps.coverage.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: |
+            target/coverage.json
+            target/lcov.info
 
   deny:
     runs-on: ubuntu-24.04

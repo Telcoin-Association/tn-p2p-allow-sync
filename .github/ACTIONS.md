@@ -7,16 +7,21 @@ They run on GitHub's hosted runners and on a maintainer's machine with the same 
 
 ### `ci.yaml`
 
-Six jobs, one command each, on `pull_request` and on every push to `main`:
+Seven jobs, one command each (`coverage` adds its gate), on `pull_request` and on every push to `main`:
 
 | Job | Command | What it stops |
 |---|---|---|
 | `fmt` | `cargo fmt --check` | unformatted code (stable rustfmt, no `rustfmt.toml`) |
 | `clippy` | `cargo clippy --all-targets --locked -- -D warnings` | any warning, and the deny lints and disallowed methods of `Cargo.toml` and `clippy.toml` |
 | `test` | `cargo test --locked` | a failing unit, golden or integration test |
+| `coverage` | `cargo llvm-cov --locked --summary-only --json --output-path target/coverage.json`, then `bash etc/coverage-gate.sh target/coverage.json etc/coverage-baseline` | a total line coverage more than 0.5 points below `etc/coverage-baseline` |
 | `deny` | `cargo deny check` | an advisory, a duplicate crate version, a wildcard requirement, a license outside MIT, Apache-2.0 and Unicode-3.0, a source other than crates.io (`deny.toml`) |
 | `audit` | `cargo audit` | a RustSec advisory against `Cargo.lock` |
 | `release-dry-run` | `bash etc/tests/release_dry_run.sh` | a release step that would fail on this tree (`release.conf`, a hook, `cliff.toml` or `CHANGELOG.md` out of step with `release/release.sh`), a build that is not reproducible, and a program whose `--version` lines the release check refuses |
+
+`coverage` runs the tests of `test` again, instrumented by `cargo llvm-cov` (its `llvm-tools-preview` comes with the toolchain of `rust-toolchain.toml`), and `etc/coverage-gate.sh` compares the total line coverage with the one number in `etc/coverage-baseline`.
+More than 0.5 points below it fails the job; more than 0.5 above it prints a reminder to raise the baseline, which moves up in the pull request that adds the tests and down only as a reviewed change to the gate.
+The job uploads `target/coverage.json` (the summary the gate reads) and `target/lcov.info` (per line, for an editor or a coverage viewer) as the artifact `coverage`, also when the gate fails.
 
 `RUSTFLAGS=-D warnings` is set for the whole workflow, so a compiler warning fails `test` as well as `clippy`.
 The source never says `#![deny(warnings)]`: a new compiler release must not break a plain local build.
@@ -30,7 +35,7 @@ A dispatch (*Actions* -> *CI* -> *Run workflow*) runs every job on the branch it
 A new push to a pull request cancels the runs of `ci.yaml` and `nft-real.yaml` for its previous head (`concurrency`, with `cancel-in-progress` on `pull_request` only).
 Every other run is a concurrency group of its own, because GitHub cancels a waiting run when a newer one joins its group: a push to `main`, the schedule and a dispatch never wait for, cancel or displace another run, so every push to `main` reports.
 
-The five cargo jobs install the toolchain of `rust-toolchain.toml` first (`rustup show active-toolchain || rustup toolchain install`), so the runner image's own Rust is never used.
+The cargo jobs install the toolchain of `rust-toolchain.toml` first (`rustup show active-toolchain || rustup toolchain install`), so the runner image's own Rust is never used.
 `release-dry-run` installs none: its build runs in `BUILD_IMAGE` (see "Release workflow"), and it needs only docker with buildx, gpg and the network for the images and crates.io.
 `RELEASE_BUILD_STUB=1` swaps the docker build for a stub in a quick local run, and the script refuses it in CI.
 
@@ -40,6 +45,8 @@ To run the gates locally, from the repository root:
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
+cargo llvm-cov --locked --summary-only --json --output-path target/coverage.json
+bash etc/coverage-gate.sh target/coverage.json etc/coverage-baseline
 cargo deny check
 cargo audit
 bash etc/tests/release_dry_run.sh
@@ -47,7 +54,7 @@ cargo build --locked --release --target x86_64-unknown-linux-musl
 ```
 
 The last line is not a CI job; it shows that the release triple still links statically, and `target/x86_64-unknown-linux-musl/release/tn-p2p-allow-sync --version` prints the five version lines.
-`make ci` runs the five cargo gates with `RUSTFLAGS=-D warnings`, as CI does.
+`make ci` runs `fmt`, `clippy`, `test`, `deny` and `audit` with `RUSTFLAGS=-D warnings`, as CI does.
 
 ### `nft-real.yaml`
 
@@ -94,7 +101,8 @@ Build with `--target x86_64-unknown-linux-musl` there, so the static binary also
 
 ## Required checks
 
-Branch protection on `main` must require `fmt`, `clippy`, `test`, `deny`, `audit` and `release-dry-run`, and the two checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)` and `nft-real (ubuntu-22.04)`.
+Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`, and the two checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)` and `nft-real (ubuntu-22.04)`.
+`coverage` is new in v0.1.1 and has to be added to the list by hand; it belongs there, because a gate that is not required lets a pull request merge while it is red.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
@@ -107,8 +115,8 @@ A SHA cannot move, so the code that runs is the code that was reviewed when the 
 | Action | Release | Commit | Runtime | Used by |
 |---|---|---|---|---|
 | `actions/checkout` | `v7.0.1` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | node24 | every job |
-| `taiki-e/install-action` | `v2.87.22` | `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` | composite (shell steps only) | `deny`, `audit` |
-| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real` |
+| `taiki-e/install-action` | `v2.87.22` | `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` | composite (shell steps only) | `deny`, `audit`, `coverage` |
+| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real`, `coverage` |
 
 These are the releases `telcoin-network` pins, so one review of an upstream release covers both repositories.
 All three are lightweight tags, so the tag ref names the commit directly.
@@ -119,9 +127,10 @@ The tools `install-action` installs are pinned by an explicit version as well:
 |---|---|---|
 | `cargo-deny` | `0.20.2` | the manifest in the pinned `install-action` commit, with its sha256 |
 | `cargo-audit` | `0.22.2` | the same |
+| `cargo-llvm-cov` | `0.9.1` | the same |
 
-`fallback: none` on both steps makes the step fail when the pinned manifest lacks the version, instead of fetching an unchecked build through `cargo-binstall`.
-Run the same versions locally (`cargo install --locked cargo-deny@0.20.2 cargo-audit@0.22.2`) so a local pass means a CI pass.
+`fallback: none` on every such step makes the step fail when the pinned manifest lacks the version, instead of fetching an unchecked build through `cargo-binstall`.
+Run the same versions locally (`cargo install --locked cargo-deny@0.20.2 cargo-audit@0.22.2 cargo-llvm-cov@0.9.1`) so a local pass means a CI pass.
 
 ### How a pin moves
 
@@ -217,5 +226,5 @@ The first moves with `RUSTUP_TOOLCHAIN` in `etc/Dockerfile` and `rust-toolchain.
 
 ## Toolchain
 
-`rust-toolchain.toml` pins `1.94.1` with `rustfmt`, `clippy` and the `x86_64-unknown-linux-musl` target, and `rustup` applies it to every cargo call in the repository.
+`rust-toolchain.toml` pins `1.94.1` with `rustfmt`, `clippy`, `llvm-tools-preview` (for `coverage`) and the `x86_64-unknown-linux-musl` target, and `rustup` applies it to every cargo call in the repository.
 To bump it, change `rust-toolchain.toml`, `rust-version` in `Cargo.toml`, `RUSTUP_TOOLCHAIN` in `etc/Dockerfile` and `BUILD_IMAGE` in `release.conf` together, in one pull request.
