@@ -236,6 +236,7 @@ A failure there logs `epoch-info-failed reason=<token>`, with the token of the R
 
 The scripts create the state dir as root with mode 0700; the tool never creates it.
 Every run checks it first and refuses, with `state-dir-invalid` and exit 2 before touching anything, a path that is missing, a symlink, not a directory, owned by a uid other than the effective one (read from `/proc/self/status`) or not exactly mode 0700.
+It also refuses a path whose last component is empty (a trailing `/`), `.` or `..`, with `does not end in a name; a trailing /, . or .. would follow a symlink`; the command line never passes one (see [Command line](#command-line)).
 
 | File | Written by | Format | When |
 |---|---|---|---|
@@ -247,11 +248,15 @@ Every run checks it first and refuses, with `state-dir-invalid` and exit 2 befor
 | `lock` | every locking run | empty, mode 0600, never deleted | created on the first locked run |
 
 Every file the tool writes has mode 0600 whatever the umask; a `lock` found with another mode is set to 0600 by the next locked run.
-The directory is opened for its sync with `O_NOFOLLOW|O_DIRECTORY`, so a symlink swapped in for it is never followed.
+The directory is checked once, with `lstat`, when the run starts, and then held by its path: every later file open is by path, each with `O_NOFOLLOW`, which guards the last component only.
+Each sync of the directory opens it with `O_NOFOLLOW|O_DIRECTORY`, so a sync never follows a symlink swapped in for it.
 `state.json`, `status` and `floor` are written atomically: the bytes go to `.<name>.new`, created with `O_CREAT|O_EXCL|O_NOFOLLOW` and synced, then renamed into place, then the directory is synced.
 The program is staged the same way in `.current.nft.new`.
 A leftover `.<name>.new` from a run that died is removed by the next writer, which holds the lock.
-Every file is opened without following symlinks, and every temporary file lives in the state dir, never in `/tmp`.
+An empty directory at that name is removed too; one with anything in it is never emptied, and the write is `state-io-failed` with a detail ending `cannot remove the leftover: a directory is in the way: <os error>`.
+Every file is opened without following symlinks, and every read also with `O_NONBLOCK`, so a FIFO is refused, never waited on.
+Reads have no size cap, since every file is in the euid-owned 0700 dir.
+Every temporary file lives in the state dir, never in `/tmp`.
 
 ### The lock
 
