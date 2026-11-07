@@ -260,6 +260,30 @@ fn regular_file(meta: &fs::Metadata) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, what))
 }
 
+/// Removes what a run that died between create and rename left at the temporary name `path`, if anything.
+///
+/// Unlinking a symlink removes the link, never its target.
+/// An empty directory in the way is removed too; one with anything in it is an error, never emptied.
+/// The caller holds the [`Lock`]: that is what makes the removal safe.
+pub(crate) fn remove_leftover(path: &Path) -> Result<(), FsError> {
+    let error = match fs::remove_file(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => e,
+    };
+    if error.kind() != io::ErrorKind::IsADirectory {
+        return Err(FsError::io(path, "remove the leftover", error));
+    }
+    fs::remove_dir(path).map_err(|e| {
+        let detail = format!("a directory is in the way: {e}");
+        FsError::io(
+            path,
+            "remove the leftover",
+            io::Error::new(e.kind(), detail),
+        )
+    })
+}
+
 /// Gives the new file `file` exactly `mode`, writes `bytes` and syncs it; closing it is left to the drop.
 fn fill(mut file: File, path: &Path, bytes: &[u8], mode: u32) -> Result<(), FsError> {
     // the mode given at creation is masked by the umask
@@ -356,13 +380,7 @@ impl StateDir {
     pub fn write_atomic(&self, name: &str, bytes: &[u8], mode: u32) -> Result<(), FsError> {
         let target = self.file(name)?;
         let temp = self.file(&format!(".{name}.new"))?;
-        // a run that died between create and rename left this behind; unlinking a symlink
-        // removes the link, never its target
-        match fs::remove_file(&temp) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(FsError::io(&temp, "remove the leftover", e)),
-        }
+        remove_leftover(&temp)?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -630,6 +648,39 @@ mod tests {
         dir.write_atomic("state.json", b"{}\n", 0o600)?;
         assert_eq!(fs::read(temp.join("state.json"))?, b"{}\n");
         assert!(!temp.join(".state.json.new").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn write_atomic_removes_an_empty_directory_at_the_temporary_name() -> TestResult {
+        let (temp, dir) = state_dir("leftover-dir")?;
+        fs::create_dir(temp.join(".status.new"))?;
+        dir.write_atomic("status", b"RESULT=applied\n", 0o600)?;
+        assert_eq!(fs::read(temp.join("status"))?, b"RESULT=applied\n");
+        assert!(fs::symlink_metadata(temp.join(".status.new")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_full_directory_at_the_temporary_name_is_kept_and_named() -> TestResult {
+        let (temp, dir) = state_dir("leftover-full")?;
+        let leftover = temp.join(".status.new");
+        fs::create_dir(&leftover)?;
+        fs::write(leftover.join("kept"), b"kept")?;
+        let error = match dir.write_atomic("status", b"RESULT=applied\n", 0o600) {
+            Err(e @ FsError::Io { .. }) => e,
+            other => return Err(format!("expected state-io-failed, got {other:?}").into()),
+        };
+        assert_eq!(error.token(), "state-io-failed");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "{leftover:?}: cannot remove the leftover: a directory is in the way: "
+            )),
+            "{message}"
+        );
+        assert_eq!(fs::read(leftover.join("kept"))?, b"kept");
+        assert!(!temp.join("status").exists());
         Ok(())
     }
 
