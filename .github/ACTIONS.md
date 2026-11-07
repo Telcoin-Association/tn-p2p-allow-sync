@@ -2,7 +2,7 @@
 
 The binary runs as root on every validator, so every pull request passes the same gates before it merges, and every push to `main` runs them again: the seven jobs of `ci.yaml` (`fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`) and the three legs of `nft-real.yaml` (`nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`), the ten checks of "Required checks".
 They run on GitHub's hosted runners and on a maintainer's machine with the same commands; nothing here depends on a cache, a secret or a write token.
-`scheduled.yaml` adds weekly mutation testing and fuzzing on `main`, which report and gate nothing.
+`scheduled.yaml` adds weekly mutation testing, fuzzing, `cargo deny` and `cargo audit` on `main`, which report and gate nothing.
 
 ## Workflows
 
@@ -28,13 +28,12 @@ The job uploads `target/coverage.json` (the summary the gate reads) and `target/
 The source never says `#![deny(warnings)]`: a new compiler release must not break a plain local build.
 `--locked` everywhere means `Cargo.lock` is the dependency set; a change to it is a reviewed change in the pull request.
 `deny` and `audit` fetch their advisory databases when they run, by design, so a newly published advisory turns them red on the next run with no change in this repository.
-That next run comes within a week even with no pull request open: both also run every Monday at 05:23 UTC on `main` (`schedule`), and every other job of `ci.yaml` skips that event.
-GitHub runs a schedule only on the default branch and disables it after 60 days without activity in the repository.
-A disabled schedule shows under *Actions* -> *CI* as disabled, and *Enable workflow* there turns it back on; check it after a quiet stretch, since nothing else reports it.
+That next run comes within a week even with no pull request open: `scheduled.yaml` runs the same two commands every Monday on `main` as `deny-weekly` and `audit-weekly` (see "`scheduled.yaml`").
+`ci.yaml` itself has no schedule and no job-level `if:`, so every job runs on every event and none leaves a `skipped` check run on a commit under a required check's name, where it would become the newest run of that name for branch protection and for the release gate of `release.conf`.
 A dispatch (*Actions* -> *CI* -> *Run workflow*) runs every job on the branch it is started on.
 
 A new push to a pull request cancels the runs of `ci.yaml` and `nft-real.yaml` for its previous head (`concurrency`, with `cancel-in-progress` on `pull_request` only).
-Every other run is a concurrency group of its own, because GitHub cancels a waiting run when a newer one joins its group: a push to `main`, the schedule and a dispatch never wait for, cancel or displace another run, so every push to `main` reports.
+Every other run is a concurrency group of its own, because GitHub cancels a waiting run when a newer one joins its group: a push to `main` and a dispatch never wait for, cancel or displace another run, so every push to `main` reports.
 
 The cargo jobs install the toolchain of `rust-toolchain.toml` first (`rustup show active-toolchain || rustup toolchain install`), so the runner image's own Rust is never used.
 `release-dry-run` installs none: its build runs in `BUILD_IMAGE` (see "Release workflow"), and it needs only docker with buildx, gpg and the network for the images and crates.io.
@@ -126,14 +125,20 @@ Build with `--target x86_64-unknown-linux-musl` there, so the static binary also
 
 ### `scheduled.yaml`
 
-Two report-only jobs, every Saturday at 03:41 UTC on `main` and on dispatch (*Actions* -> *Scheduled* -> *Run workflow*), never on a pull request.
-Neither is a required check, and neither may become one: they take hours or depend on a nightly compiler, and what they find is work for a maintainer, not a reason to hold a pull request.
-The 60-day rule for schedules in `ci.yaml` applies here too.
+Four report-only jobs on `main`, never on a pull request: `mutants` and `fuzz` every Saturday at 03:41 UTC, `deny-weekly` and `audit-weekly` every Monday at 05:23 UTC, and all four on dispatch (*Actions* -> *Scheduled* -> *Run workflow*), on the branch it is started on.
+None is a required check, and none may become one: `mutants` and `fuzz` take hours or depend on a nightly compiler, and what they find is work for a maintainer, not a reason to hold a pull request; `deny-weekly` and `audit-weekly` repeat `ci.yaml`'s `deny` and `audit`, which are the gates, under names of their own.
+Each job's `if:` names the cron it does not run on, so every scheduled run also shows the other two jobs as skipped; no gate reads those runs, because no name here is a required check.
+GitHub runs a schedule only on the default branch and disables it after 60 days without activity in the repository.
+A disabled schedule shows under *Actions* -> *Scheduled* as disabled, and *Enable workflow* there turns it back on; check it after a quiet stretch, since nothing else reports it.
 
 | Job | Command | What it reports |
 |---|---|---|
 | `mutants (<k>/4)`, for `k` 0 to 3 | `cargo mutants --cargo-arg=--locked --jobs 2 --shard <k>/4 --output target/mutants` | each change to the code (a mutant) that no test notices, in the step summary and the artifact `mutants-<k>` |
 | `fuzz` | `cargo +nightly-2026-10-15 fuzz run <target> -- -max_total_time=300` in `fuzz/`, for `multiaddr`, `cidr_or_host`, `config`, `snapshot`, `nft_listing` and `http_response`, then `cargo deny --config deny.toml check` in `fuzz/` | an input that crashes a target, as the artifact `fuzz-artifacts`, and a dependency of the fuzz crate that `fuzz/deny.toml` refuses |
+| `deny-weekly` | `cargo deny check` | what `ci.yaml`'s `deny` stops, here an advisory published since the last run on `main` |
+| `audit-weekly` | `cargo audit` | a RustSec advisory against `Cargo.lock` published since the last run on `main` |
+
+A red `deny-weekly` or `audit-weekly` holds nothing back by itself, but every later run of `ci.yaml`'s `deny` or `audit`, on a pull request or as a re-run on the commit of a release tag, fails the same way, so update the dependency on `main` before the next release.
 
 The mutants are split into four shards, one runner each, because the whole set on one runner could take longer than a job may run.
 Each shard stays green whatever it finds: cargo-mutants exits non-zero for a missed or timed-out mutant, and the step has `continue-on-error`.
@@ -141,7 +146,7 @@ Read each shard's step summary, which counts caught, missed, timed-out and unvia
 The step stops after 300 minutes so that the summary and the upload still run; a shard cut short reports what it reached.
 `fuzz` runs every target even after one fails, then fails if any did, and uploads `fuzz/artifacts/<target>/` with the crashing inputs.
 The fuzz crate is not a dependency of the program, so nothing of it reaches a release; its dependencies get their own `cargo deny` run because `ci.yaml`'s `deny` sees only the program's.
-Neither job sets `RUSTFLAGS=-D warnings`: a mutant that leaves a value unused has to build and be tested, not be counted as unviable.
+No job of `scheduled.yaml` sets `RUSTFLAGS=-D warnings`: a mutant that leaves a value unused has to build and be tested, not be counted as unviable.
 
 To run them locally, from the repository root:
 
@@ -161,7 +166,7 @@ cargo +nightly-2026-10-15 fuzz run <target> artifacts/<target>/<crash-file>   # 
 Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`, and the three checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`.
 `coverage` and `nft-real (debian:13)` are new in v0.1.1 and have to be added to the list by hand; `coverage` belongs there, because a gate that is not required lets a pull request merge while it is red.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
-No job of `release.yaml` or `scheduled.yaml` may share its name with one of these checks (today: `validate-tag`, `draft-release`, `rebuild`, `verify-release`, `mutants (<k>/4)` and `fuzz`): GitHub matches a required check by name on a commit, whatever workflow reported it.
+No job of `release.yaml` or `scheduled.yaml` may share its name with one of these checks (today: `validate-tag`, `draft-release`, `rebuild`, `verify-release`, `mutants (<k>/4)`, `fuzz`, `deny-weekly` and `audit-weekly`): GitHub matches a required check by name on a commit, whatever workflow reported it.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
 ## Action pins
@@ -173,7 +178,7 @@ A SHA cannot move, so the code that runs is the code that was reviewed when the 
 | Action | Release | Commit | Runtime | Used by |
 |---|---|---|---|---|
 | `actions/checkout` | `v7.0.1` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | node24 | every job |
-| `taiki-e/install-action` | `v2.87.22` | `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` | composite (shell steps only) | `deny`, `audit`, `coverage`, `mutants`, `fuzz` |
+| `taiki-e/install-action` | `v2.87.22` | `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` | composite (shell steps only) | `deny`, `audit`, `coverage`, `mutants`, `fuzz`, `deny-weekly`, `audit-weekly` |
 | `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real`, `coverage`, `mutants`, `fuzz` |
 
 These are the releases `telcoin-network` pins, so one review of an upstream release covers both repositories.
@@ -230,7 +235,7 @@ The nightly of `fuzz` moves by an edit of `FUZZ_TOOLCHAIN` in `scheduled.yaml` a
 The runner image is a label (`ubuntu-24.04`, `ubuntu-22.04`), not a digest, so everything preinstalled on it, `rustup` included, is trusted and not pinned.
 `nft-real` installs `nftables` and `iproute2` from the runner release's own archive, unpinned on purpose: the job tests the versions a validator on that release gets.
 `rustup` downloads the toolchain of `rust-toolchain.toml` and checks it against the Rust release manifest; that pin is the channel `1.94.1`, not a digest.
-The advisory databases `deny` and `audit` read are fetched fresh on every run, on purpose.
+The advisory databases `deny`, `audit`, `deny-weekly` and `audit-weekly` read are fetched fresh on every run, on purpose.
 
 ## Release workflow
 
@@ -264,10 +269,10 @@ The job definitions are the exception: GitHub reads `release.yaml` from the tagg
 No attestation stands behind a release here, unlike telcoin-network: the full suite, the real-kernel job included, is a required pull request check, and the program is reproducible.
 `make release-build` builds the program twice from a pristine worktree of the tag, with `etc/Dockerfile` in `BUILD_IMAGE`, `--pull` and `--no-cache`, and uploads nothing unless both builds are the same file.
 `make release-verify` (where `TN_P2P_ALLOW_REBUILD` defaults to 1) and `verify-release` rebuild it from the tagged commit and require the same file again; `make release-sign` rebuilds only with `TN_P2P_ALLOW_REBUILD=1`, since an amd64 build under emulation on a Mac is slow.
-Those builds before publish all run on the build server, so `rebuild` adds one the server does not control: on the push of the tag, before anything is signed, a GitHub runner builds the tagged commit the same way with `etc/ci-rebuild.sh`.
+The builds before publish run on the build server (`build`'s two and `verify`'s rebuild) and in the CI `rebuild` job, the one the server does not control: on the push of the tag, before anything is signed, a GitHub runner builds the tagged commit the same way with `etc/ci-rebuild.sh`.
 It writes `program.sha256`, one line `<sha256>  tn-p2p-allow-sync`, to the step summary and uploads it as the artifact `rebuild-<tag>` (for v0.1.1, `rebuild-v0.1.1`).
 Only the push of the tag runs `rebuild`, never a dispatch or a published release, so the run that holds `rebuild-<tag>` is the `push` run of that tag (`gh run list --workflow release.yaml --event push`, then `gh run download <run-id> -n rebuild-<tag>`).
-The maintainer's sign step compares the draft's program with that sha256.
+While the release is a draft, `sign`, `verify` and `publish` each compare the draft's program with that sha256 and stop on a difference; `build`'s own check and a published release skip the comparison ([`docs/releasing.md`](../docs/releasing.md#the-ci-rebuild)).
 A rebuild takes `etc/Dockerfile` and the `BUILD_IMAGE` line of `release.conf` from the tagged commit, so an older release stays reproducible after `main` moves the image.
 Every check also runs the program's `--version` in `BUILD_IMAGE`, with no network, and requires the five lines of the release: version, the tag's commit, the triple, a `snapshot-versions` list holding 1, and `config-version 1`.
 The one job with a write token, `draft-release`, compiles nothing; the builds in `rebuild` and `verify-release` run the build code of every dependency, inside a container that receives no token, in jobs whose token can only read.

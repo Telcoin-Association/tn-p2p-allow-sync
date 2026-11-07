@@ -1,22 +1,31 @@
-# Weekly reports on main: mutation testing with cargo-mutants and fuzzing with cargo-fuzz.
+# Weekly reports on main: mutation testing with cargo-mutants and fuzzing with cargo-fuzz on
+# Saturdays, cargo deny and cargo audit on Mondays.
 #
-# Neither job is a gate. They run on main once a week and on dispatch, never on a pull
-# request, and neither is or may become a required check; no job here may share its name
-# with one either, because GitHub matches a required check by name on a commit, whatever
-# workflow reported it. What they report is the run and its artifacts: each `mutants`
-# shard uploads cargo-mutants' output, with the mutants no test caught, and stays green;
-# `fuzz` turns red when a target finds an input that crashes it and uploads that input.
-# .github/ACTIONS.md says how to read both and how to reproduce them locally.
+# No job here is a gate. They run on main once a week and on dispatch, never on a pull
+# request, and none is or may become a required check; no job here may share its name with
+# one either, because GitHub matches a required check by name on a commit, whatever workflow
+# reported it, and the release gate of release.conf reads the newest run of each name. Hence
+# `deny-weekly` and `audit-weekly`, not ci.yaml's `deny` and `audit`. What they report is the
+# run and its artifacts: each `mutants` shard uploads cargo-mutants' output, with the mutants
+# no test caught, and stays green; `fuzz` turns red when a target finds an input that crashes
+# it and uploads that input; `deny-weekly` and `audit-weekly` turn red when an advisory has
+# been published against a dependency of the program since the last pull request.
+# .github/ACTIONS.md says how to read them and how to reproduce them locally.
 #
 # A schedule runs only on the default branch, and GitHub disables it after 60 days without
-# activity in the repository. A dispatch runs both jobs on the branch it is started on.
+# activity in the repository. Each job runs on one of the two crons: its `if:` leaves it out
+# of the other, where it reports a skipped run that no gate reads, since no name here is a
+# required check. A dispatch runs every job on the branch it is started on.
 #
 # Every action is pinned to a full commit SHA, as in ci.yaml (.github/ACTIONS.md, "Action pins").
 name: Scheduled
 
 on:
   schedule:
+    # mutants and fuzz
     - cron: "41 3 * * 6"
+    # deny-weekly and audit-weekly
+    - cron: "23 5 * * 1"
   workflow_dispatch:
 
 # nothing here writes; each job asks for read access to the repository and no more
@@ -40,6 +49,7 @@ jobs:
   # run; the step's own timeout ends a slow shard early enough for the summary and the upload.
   mutants:
     name: mutants (${{ matrix.shard }}/4)
+    if: github.event.schedule != '23 5 * * 1'
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +117,7 @@ jobs:
   # then cargo deny over the fuzz crate's own dependencies with fuzz/deny.toml. The fuzz crate
   # is not a dependency of the program and is never built by ci.yaml or the release build.
   fuzz:
+    if: github.event.schedule != '23 5 * * 1'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:
@@ -167,3 +178,55 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: fuzz
         run: cargo "+$FUZZ_TOOLCHAIN" deny --config deny.toml check
+
+  # ci.yaml's deny and audit, step for step, on main's tip once a week: both fetch their
+  # advisory database when they run, so an advisory published against a dependency of the
+  # program turns them red with no pull request open. Red here holds nothing back; it says to
+  # update the dependency on main, whose own deny and audit then fail until it is fixed.
+  deny-weekly:
+    if: github.event.schedule != '41 3 * * 6'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # the pin and the fallback rule of ci.yaml's cargo-deny
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - name: cargo deny
+        run: cargo deny check
+
+  audit-weekly:
+    if: github.event.schedule != '41 3 * * 6'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # the pin and the fallback rule of ci.yaml's cargo-deny
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
+      - name: cargo audit
+        run: cargo audit

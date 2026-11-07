@@ -93,19 +93,20 @@ After publishing, the deployment scripts pick the release up only when a `chore`
 
 ### The required checks
 
-`TN_REQUIRED_CHECKS` in `release.conf` names the checks a tag's commit must have passed: `fmt`, `clippy`, `test`, `deny`, `audit`, `release-dry-run`, `nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`.
+`TN_REQUIRED_CHECKS` in `release.conf` names the ten checks a tag's commit must have passed, the required checks of `main` ([`.github/ACTIONS.md`](../.github/ACTIONS.md#required-checks)): `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit`, `release-dry-run`, `nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`.
 For each name the newest check run on the commit counts, whatever started it, and it must have concluded `success`.
-A name with no run, a run still queued or in progress, and a failed, cancelled or skipped run all stop the step with exit 1, and the error lists each one with its state.
+A run concluded `skipped` or `neutral` checked nothing, so it is passed over, and a name with only such runs counts as having none.
+A name with no run, a run still queued or in progress, and a failed, cancelled or timed-out run all stop the step with exit 1, and the error lists each one with its state.
 Branch protection does not ensure this alone: a pull request's checks ran on its head, not on the commit its merge leaves on `main`, an admin can merge past them, and a red run on a push to `main` gates nothing.
 
 That makes the order matter on a release day.
 `tag` signs `main`'s tip, and that commit has check runs only once its push to `main` has run `ci.yaml` and `nft-real.yaml`, which takes several minutes; `gh run list --commit "$(git rev-parse origin/main)"` shows those runs.
-`tag` asks GitHub before it creates the tag and refuses while any of the nine is missing or unfinished, so wait until the push runs are done and green, then run it again.
+`tag` asks GitHub before it creates the tag and refuses while any of the ten is missing or unfinished, so wait until the push runs are done and green, then run it again.
 On a host without `gh`, `tag` leaves the question to `validate-tag`, which then fails and drafts nothing, so wait in either case.
 Merge nothing else between the release PR and the tag, since a new tip starts its checks over.
 A job that failed for a transient cause, such as a download, is re-run on GitHub (`gh run rerun <run-id> --failed`), and its new run becomes the newest of its name.
-The weekly `schedule` of `ci.yaml` also runs on `main`'s tip: when its `deny` or `audit` turns red on the tagged commit, the steps that follow stop until a re-run passes, and an advisory that stays needs a fix on `main` and the next patch version.
-When an error names a check as `skipped`, that is the schedule's run, which skips every job but `deny` and `audit`; re-run the push run's jobs (`gh run rerun <run-id>`) so the newest run of each name is a real one again.
+`scheduled.yaml` runs `cargo deny` and `cargo audit` on `main`'s tip every Monday as `deny-weekly` and `audit-weekly`, names that are not required checks, so their runs neither pass nor stop a release step.
+When one turns red, an advisory has been published against a dependency since the push run: a re-run of the tagged commit's `deny` or `audit` would fail as well and stop the steps that follow, and an advisory that stays needs a fix on `main` and the next patch version.
 
 ### The CI rebuild
 

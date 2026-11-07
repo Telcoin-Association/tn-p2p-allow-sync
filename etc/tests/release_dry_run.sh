@@ -665,19 +665,36 @@ check_runs() {
     } >"$GHFX/check-runs.json"
 }
 
-# the required checks on the tag's commit (hook_check_tag_extra, as check-tag runs it)
-check_runs 10=test=failure 11=fmt=success 12=clippy=success 13=test=success 14=deny=success 15=audit=success \
-    16=release-dry-run=success '17=nft-real (ubuntu-24.04)=success' '18=nft-real (ubuntu-22.04)=success' \
-    '19=nft-real (debian:13)=success' 20=validate-tag=pending
+# the required checks on the tag's commit (hook_check_tag_extra, as check-tag runs it): the
+# ten names of TN_REQUIRED_CHECKS, each with one successful run
+green=('11=fmt=success' '12=clippy=success' '13=test=success' '14=coverage=success' '15=deny=success'
+    '16=audit=success' '17=release-dry-run=success' '18=nft-real (ubuntu-24.04)=success'
+    '19=nft-real (ubuntu-22.04)=success' '20=nft-real (debian:13)=success')
+check_runs 10=test=failure "${green[@]}" 21=validate-tag=pending
 gated '' hook_check_tag_extra "$r1" always
 expect_rc 0 "check-tag accepts a commit on which every required check passed"
-expect_err "CI passed on $r1: fmt, clippy, test, deny, audit, release-dry-run, nft-real (ubuntu-24.04), nft-real (ubuntu-22.04), nft-real (debian:13)" \
-    "it lists the required checks, of which the newest run counts"
+expect_err "CI passed on $r1: fmt, clippy, test, coverage, deny, audit, release-dry-run, nft-real (ubuntu-24.04), nft-real (ubuntu-22.04), nft-real (debian:13)" \
+    "it lists the ten required checks, of which the newest run counts"
 check "it reads the check runs of the release commit" \
     grep -q -F -e "api repos/Telcoin-Association/tn-p2p-allow-sync/commits/$r1/check-runs" "$GHFX/gh.log"
 
-check_runs 11=fmt=success 12=clippy=success 21=clippy=failure 13=test=success 14=deny=success 15=audit=success \
-    16=release-dry-run=success '17=nft-real (ubuntu-24.04)=success' '18=nft-real (ubuntu-22.04)=pending'
+# newer skipped runs, as a job skipped by its `if:` leaves, and a neutral one
+check_runs "${green[@]}" 30=fmt=skipped 31=clippy=skipped 32=test=skipped 33=coverage=skipped \
+    34=release-dry-run=skipped 35=deny=neutral
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 0 "check-tag passes over skipped and neutral runs newer than the successful ones"
+expect_err "CI passed on $r1: fmt, clippy, test, coverage," "it reports the required checks as passed"
+
+check_runs 11=fmt=success 12=clippy=success 13=test=success 33=coverage=skipped 36=coverage=neutral \
+    15=deny=success 16=audit=failure 37=audit=skipped 17=release-dry-run=success \
+    '18=nft-real (ubuntu-24.04)=success' '19=nft-real (ubuntu-22.04)=success' '20=nft-real (debian:13)=success'
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 1 "check-tag refuses a check with only skipped and neutral runs, and a failure under a newer skipped run"
+expect_err "CI has not passed on $r1: coverage (no check run, only skipped or neutral ones), audit (failure)" \
+    "it counts the first as missing and still sees the failure"
+
+check_runs 11=fmt=success 12=clippy=success 21=clippy=failure 13=test=success 14=coverage=success 15=deny=success \
+    16=audit=success 17=release-dry-run=success '18=nft-real (ubuntu-24.04)=success' '19=nft-real (ubuntu-22.04)=pending'
 gated '' hook_check_tag_extra "$r1" always
 expect_rc 1 "check-tag refuses a commit with a failed, a running and a missing required check"
 expect_err "CI has not passed on $r1: clippy (failure), nft-real (ubuntu-22.04) (in_progress), nft-real (debian:13) (no check run)" \
