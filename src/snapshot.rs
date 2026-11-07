@@ -1304,6 +1304,117 @@ mod tests {
         Ok(())
     }
 
+    /// `count` IPv4 quic multiaddrs, `192.0.2.1` upwards.
+    fn quic_addrs(count: u8) -> Value {
+        (1..=count)
+            .map(|d| Value::from(format!("/ip4/192.0.2.{d}/udp/49590/quic-v1")))
+            .collect()
+    }
+
+    #[test]
+    fn record_multiaddrs_past_32_are_truncated_and_counted_per_list() -> TestResult {
+        assert_eq!(MAX_MULTIADDRS_PER_LIST, 32);
+        // record_multiaddrs length, multiaddrs length, truncated lists
+        for (record, listed, truncated) in [(32, 1, 0), (33, 1, 1), (33, 33, 2)] {
+            let mut result = value(GOOD)?;
+            *at(&mut result, "/swarms/0/entries/0/source")? = "stub".into();
+            if listed > 1 {
+                *at(&mut result, "/swarms/0/entries/0/multiaddrs")? = quic_addrs(listed);
+            }
+            set(
+                &mut result,
+                "/swarms/0/entries/0",
+                "record_multiaddrs",
+                quic_addrs(record),
+            )?;
+            let case = format!("record {record} listed {listed}");
+            let snapshot = parse(result)?;
+            assert_eq!(
+                snapshot.warnings,
+                Warnings {
+                    truncated_lists: truncated,
+                    ..Warnings::default()
+                },
+                "{case}"
+            );
+            // the first 32 record addresses are read, and the listed address beside them
+            let mut expected = (1..=32).map(|d| v4(192, 0, 2, d)).collect::<BTreeSet<_>>();
+            if listed == 1 {
+                expected.insert(v4(203, 0, 113, 10));
+            }
+            let stub = entry(
+                swarm(&snapshot, PRIMARY_SWARM)?,
+                &example_key("8f3a", "c21d"),
+            )?;
+            assert_eq!(stub.ips, expected, "{case}");
+            assert!(!stub.ips.contains(&v4(192, 0, 2, 33)), "{case}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn absorbed_faults_are_counted_over_every_swarm() -> TestResult {
+        let mut result = value(GOOD)?;
+        let mut worker = at(&mut result, "/swarms/0")?.clone();
+        set(&mut worker, "", "network", "worker-1".into())?;
+        set(&mut worker, "", "worker_id", 1.into())?;
+        // each kind of fault in the worker: an uppercase key with an unknown slot, a dns and an
+        // unparsed multiaddr, and a second listing of a key with 33 addresses
+        *at(&mut worker, "/entries/0/bls_pubkey")? = example_key("8F3A", "C21D").into();
+        *at(&mut worker, "/entries/0/slots")? = value(r#"["current", "observer"]"#)?;
+        *at(&mut worker, "/entries/1/multiaddrs")? = value(
+            r#"["/dns4/validator.example/udp/49590/quic-v1", "not-a-multiaddr",
+                "/ip4/198.51.100.7/udp/49590/quic-v1"]"#,
+        )?;
+        let mut second = at(&mut worker, "/entries/1")?.clone();
+        *at(&mut second, "/multiaddrs")? = quic_addrs(33);
+        at(&mut worker, "/entries")?
+            .as_array_mut()
+            .ok_or("entries is not an array")?
+            .push(second);
+        push_swarm(&mut result, &worker.to_string())?;
+        // and one fault in the primary too, so the dns count is a sum over the swarms
+        at(&mut result, "/swarms/0/entries/1/multiaddrs")?
+            .as_array_mut()
+            .ok_or("multiaddrs is not an array")?
+            .push("/dns6/validator.example/udp/49590/quic-v1".into());
+
+        let snapshot = parse(result)?;
+        // the same keys in the primary and the worker are not duplicates: those are per swarm
+        assert_eq!(
+            snapshot.warnings,
+            Warnings {
+                unknown_slots: 1,
+                uppercase_keys: 1,
+                duplicate_keys: 1,
+                dns_skipped: 2,
+                unparsed: 1,
+                truncated_lists: 1,
+                pool_ahead: 0,
+            }
+        );
+        // the skipped dns address leaves the primary as good.json reads it
+        let good = parse(value(GOOD)?)?;
+        assert_eq!(
+            swarm(&snapshot, PRIMARY_SWARM)?,
+            swarm(&good, PRIMARY_SWARM)?
+        );
+        let worker = swarm(&snapshot, "worker-1")?;
+        assert!(worker.authoritative);
+        assert_eq!(
+            entry(worker, &example_key("8f3a", "c21d"))?.slots,
+            BTreeSet::from([Slot::Current, Slot::Unknown])
+        );
+        assert_eq!(
+            entry(worker, &example_key("a71e", "09b4"))?.ips,
+            (1..=32)
+                .map(|d| v4(192, 0, 2, d))
+                .chain([v4(198, 51, 100, 7)])
+                .collect::<BTreeSet<_>>()
+        );
+        Ok(())
+    }
+
     #[test]
     fn faults_report_in_table_order() -> TestResult {
         // a bad key in a worker outranks an unavailable primary
