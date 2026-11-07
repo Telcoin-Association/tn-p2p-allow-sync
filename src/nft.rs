@@ -25,6 +25,9 @@ const FAMILY: &str = "inet";
 const TABLE: &str = "tn_p2p_allow";
 const CHAIN: &str = "input";
 
+/// The sets the program declares, the only ones whose elements the listing reads.
+const SETS: [&str; 4] = ["allow_v4", "allow_v6", "static_v4", "static_v6"];
+
 /// Why a call to nft did not succeed.
 ///
 /// Every variant is exit 2 for the caller, which picks the token by what it was doing: `nft-unavailable`, `nft-apply-failed` or `reload-failed`.
@@ -139,7 +142,9 @@ pub enum Expr {
 /// What `nft -j list table inet tn_p2p_allow` says about the table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Listing {
-    /// Every set of the table by name, its elements sorted; a set without elements maps to an empty list.
+    /// The program's sets `allow_v4`, `allow_v6`, `static_v4` and `static_v6` that the table holds, by name, their elements sorted; a set without elements maps to an empty list.
+    ///
+    /// Any other set of the table, like a map, is not read: its elements need not be addresses.
     pub sets: BTreeMap<String, Vec<Element>>,
     /// Every named counter of the table by name.
     pub counters: BTreeMap<String, Counter>,
@@ -287,9 +292,10 @@ struct SetObject {
     family: String,
     table: String,
     name: String,
-    // nft leaves the key out when the set is empty
+    // nft leaves the key out when the set is empty; read only for the program's sets, so
+    // another set's elements may take any form
     #[serde(default)]
-    elem: Vec<Value>,
+    elem: Value,
 }
 
 #[derive(Deserialize)]
@@ -403,21 +409,16 @@ fn parse_tables(json: &[u8]) -> Result<bool, NftError> {
     Ok(present)
 }
 
-/// Reads `nft -j list table inet tn_p2p_allow` output; objects of other kinds, or of other tables, are skipped.
+/// Reads `nft -j list table inet tn_p2p_allow` output; objects of other kinds, or of other tables, and sets the program does not declare are skipped.
 fn parse_listing(json: &[u8]) -> Result<Listing, NftError> {
     let mut listing = Listing::default();
     for (kind, body) in objects(json)? {
         match kind.as_str() {
             "set" => {
                 let set: SetObject = typed(&kind, body)?;
-                if ours(&set.family, &set.table) {
-                    let mut elements = set
-                        .elem
-                        .into_iter()
-                        .map(parse_element)
-                        .collect::<Result<Vec<_>, _>>()
+                if ours(&set.family, &set.table) && SETS.contains(&set.name.as_str()) {
+                    let elements = parse_elements(set.elem)
                         .map_err(|why| NftError::Parse(format!("set {}: {why}", set.name)))?;
-                    elements.sort_unstable();
                     listing.sets.insert(set.name, elements);
                 }
             }
@@ -510,6 +511,21 @@ fn parse_match(found: MatchObject) -> Expr {
         },
         _ => Expr::Other,
     }
+}
+
+/// A set's `elem` array, sorted; `null`, for a key nft left out, is an empty set.
+fn parse_elements(elem: Value) -> Result<Vec<Element>, String> {
+    let entries = match elem {
+        Value::Null => Vec::new(),
+        Value::Array(entries) => entries,
+        other => return Err(format!("elem is not an array: {other}")),
+    };
+    let mut elements = entries
+        .into_iter()
+        .map(parse_element)
+        .collect::<Result<Vec<_>, _>>()?;
+    elements.sort_unstable();
+    Ok(elements)
 }
 
 /// One entry of a set's `elem` array: a value, or an `elem` object wrapping one with extras such as a comment or a counter.
@@ -953,6 +969,26 @@ mod tests {
     }
 
     #[test]
+    fn sets_the_program_does_not_declare_are_skipped_whatever_they_hold() -> TestResult {
+        // what nft prints for `set ports { type inet_service; elements = { 80 } }`, an ifname
+        // set, a concat set and others an operator could add to the table by hand
+        let json = br#"{"nftables": [
+            {"set": {"family": "inet", "name": "allow_v4", "table": "tn_p2p_allow", "type": "ipv4_addr", "handle": 3, "elem": ["192.0.2.10"]}},
+            {"set": {"family": "inet", "name": "ports", "table": "tn_p2p_allow", "type": "inet_service", "handle": 9, "elem": [80]}},
+            {"set": {"family": "inet", "name": "links", "table": "tn_p2p_allow", "type": "ifname", "handle": 10, "elem": ["eth0", "lo"]}},
+            {"set": {"family": "inet", "name": "pairs", "table": "tn_p2p_allow", "type": ["ipv4_addr", "inet_service"], "handle": 11, "elem": [{"concat": ["192.0.2.1", 80]}]}},
+            {"set": {"family": "inet", "name": "odd", "table": "tn_p2p_allow", "type": "mark", "handle": 12, "elem": "not an array"}},
+            {"set": {"family": "inet", "name": "allow_v4_old", "table": "tn_p2p_allow", "type": "ipv4_addr", "handle": 13, "elem": [null]}}
+        ]}"#;
+        let mut expected = Listing::default();
+        expected
+            .sets
+            .insert("allow_v4".to_owned(), vec![ip4(192, 0, 2, 10)]);
+        assert_eq!(parse_listing(json)?, expected);
+        Ok(())
+    }
+
+    #[test]
     fn rule_expressions_parse_to_the_forms_of_the_program() -> TestResult {
         let dport = |right: &str| {
             format!(
@@ -1054,7 +1090,8 @@ mod tests {
     fn a_malformed_known_object_is_a_parse_error() {
         for body in [
             r#"{"set": {"family": "inet", "table": "tn_p2p_allow"}}"#,
-            r#"{"set": {"family": "inet", "table": "tn_p2p_allow", "name": "s", "elem": "192.0.2.10"}}"#,
+            r#"{"set": {"family": "inet", "table": "tn_p2p_allow", "name": "allow_v4", "elem": "192.0.2.10"}}"#,
+            r#"{"set": {"family": "inet", "table": "tn_p2p_allow", "name": "static_v6", "elem": {}}}"#,
             r#"{"counter": {"family": "inet", "table": "tn_p2p_allow", "name": "c", "packets": -1, "bytes": 0}}"#,
             r#"{"counter": {"family": "inet", "table": "tn_p2p_allow", "name": "c", "bytes": 0}}"#,
             r#"{"chain": {"family": "inet", "name": "input"}}"#,
@@ -1088,14 +1125,17 @@ mod tests {
             r#"{"range": ["192.0.2.1", "192.0.2.2", "192.0.2.3"]}"#,
             r#"{"range": ["192.0.2.1"]}"#,
         ] {
-            let json = format!(
-                r#"{{"nftables": [{{"set": {{"family": "inet", "table": "tn_p2p_allow", "name": "allow_v4", "elem": [{element}]}}}}]}}"#
-            );
-            let result = parse_listing(json.as_bytes());
-            assert!(
-                matches!(&result, Err(NftError::Parse(why)) if why.starts_with("set allow_v4: ")),
-                "{element}: {result:?}"
-            );
+            // the program's sets stay strict: a form the comparison cannot read fails the listing
+            for set in SETS {
+                let json = format!(
+                    r#"{{"nftables": [{{"set": {{"family": "inet", "table": "tn_p2p_allow", "name": "{set}", "elem": ["192.0.2.10", {element}]}}}}]}}"#
+                );
+                let result = parse_listing(json.as_bytes());
+                assert!(
+                    matches!(&result, Err(NftError::Parse(why)) if why.starts_with(&format!("set {set}: "))),
+                    "{set} {element}: {result:?}"
+                );
+            }
         }
     }
 
