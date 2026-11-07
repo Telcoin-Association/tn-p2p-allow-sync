@@ -72,6 +72,11 @@ const O_DIRECTORY: i32 = 0o40_000;
 pub(crate) const O_NOFOLLOW: i32 = 0x0100;
 #[cfg(target_vendor = "apple")]
 const O_DIRECTORY: i32 = 0x0010_0000;
+// the same on every Linux target above; the compile_error below covers the others
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4_000;
+#[cfg(target_vendor = "apple")]
+const O_NONBLOCK: i32 = 0x0004;
 #[cfg(not(any(
     all(
         target_os = "linux",
@@ -88,7 +93,9 @@ const O_DIRECTORY: i32 = 0x0010_0000;
     ),
     target_vendor = "apple"
 )))]
-compile_error!("the values of O_NOFOLLOW and O_DIRECTORY are not known for this target");
+compile_error!(
+    "the values of O_NOFOLLOW, O_DIRECTORY and O_NONBLOCK are not known for this target"
+);
 
 /// Why an operation on the state dir failed.
 #[derive(Debug)]
@@ -205,16 +212,25 @@ fn parse_effective_uid(status: &str) -> Option<u32> {
 
 /// Reads the regular file at `path` without following a symlink, or `None` when nothing is there.
 ///
-/// A symlink, a directory or any other non-regular file is an error, checked before the open so that a FIFO cannot block the run.
+/// A symlink, a directory or any other non-regular file is an error, checked before the open and again on the open file.
+/// The open is `O_NONBLOCK`, so a FIFO swapped in between the check and the open cannot block the run either.
+/// The read has no size cap: every caller reads a file in the euid-owned 0700 state dir.
 pub fn read_nofollow(path: &Path) -> io::Result<Option<Vec<u8>>> {
     match fs::symlink_metadata(path) {
         Ok(meta) => regular_file(&meta)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     }
+    read_opened(path)
+}
+
+/// The open and read of [`read_nofollow`], after its check: `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, then the open file must be a regular file.
+fn read_opened(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    // O_NONBLOCK changes nothing for a regular file; for a FIFO it makes the open return at
+    // once instead of waiting for a writer, and the check below then refuses it
     let mut file = match OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -687,6 +703,58 @@ mod tests {
             message.ends_with("config\": cannot read: is a symlink"),
             "{message}"
         );
+        Ok(())
+    }
+
+    /// Makes a FIFO at `path` with mkfifo(1); `false` when the host has no mkfifo.
+    fn mkfifo(path: &Path) -> Result<bool, Box<dyn Error>> {
+        // std cannot make a FIFO, so this test starts mkfifo; the tool itself never does
+        #[allow(clippy::disallowed_methods)]
+        let status = match std::process::Command::new("mkfifo").arg(path).status() {
+            Ok(status) => status,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if status.success() {
+            Ok(true)
+        } else {
+            Err(format!("mkfifo {path:?}: {status}").into())
+        }
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_blocking() -> TestResult {
+        let (temp, dir) = state_dir("fifo")?;
+        let fifo = temp.join("status");
+        if !mkfifo(&fifo)? {
+            println!("a_fifo_is_refused_without_blocking skipped: no mkfifo");
+            return Ok(());
+        }
+        // refused by the check before the open
+        let message = dir
+            .read("status")
+            .map_or_else(|e| e.to_string(), |_| String::new());
+        assert!(
+            message.ends_with("status\": cannot read: is not a regular file"),
+            "{message}"
+        );
+        // a FIFO swapped in after that check: the open returns at once, and the open file is refused
+        let (done, finished) = mpsc::channel();
+        let opener = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            // the receiver outlives this thread; a send error cannot happen
+            let _ = done.send(read_opened(&opener).map(drop).map_err(|e| e.to_string()));
+        });
+        let result = finished.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            // a blocked open waits for a writer; a non-blocking one releases it, so the thread ends
+            let _ = OpenOptions::new()
+                .write(true)
+                .custom_flags(O_NONBLOCK)
+                .open(&fifo);
+        }
+        reader.join().map_err(|_| "the reader thread panicked")?;
+        assert_eq!(result?, Err("is not a regular file".to_owned()));
         Ok(())
     }
 
