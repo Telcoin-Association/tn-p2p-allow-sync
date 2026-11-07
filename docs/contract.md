@@ -412,12 +412,14 @@ In the order that decides what a run may touch:
 Every stale reason and every local error after step 1 takes the stale path; `nft-unavailable` does not: it exits 2 with nothing touched.
 
 - The tables are listed again first, unless the run has just loaded the program, so a table deleted while the node was being asked counts as absent.
-- A present table is kept as it is and never re-applied.
+  When that listing fails, the run logs one `nft-unavailable detail=…` warning, takes action `none` and goes on: it writes `status` and exits 3, or 2 for a local error.
+- A present table is kept as it is and never re-applied, since it may be newer than `current.nft`.
+  A table damaged or made dormant by hand therefore stays so until the next fresh run; `check` reports a dormant one as `dormant` meanwhile.
 - An absent table is reloaded with `nft -f current.nft` when `current.nft` exists; with no `current.nft` nothing is loaded.
   The sets are never flushed and a floor-only table is never built.
 - `state.json`, `current.nft` and `LAST_GOOD` are left untouched.
 - `status` gets `RESULT=stale` (exit 3) or `RESULT=error` (exit 2), `STALE_REASON` the token, and `STALE_SINCE` only when it was empty.
-- One log line `stale reason=<token> action=<action>` (warning) or `error reason=<token> action=<action> detail=…` (error), with action `kept`, `reloaded`, `none` or `reload-failed`.
+- One log line `stale reason=<token> action=<action>` (warning) or `error reason=<token> action=<action> detail=…` (error), with action `kept`, `reloaded`, `none` (no `current.nft`, or the tables listing failed) or `reload-failed`.
 - A failed reload overrides the run's reason: `STALE_REASON=reload-failed`, `RESULT=error`, exit 2, and the original reason stays in the first log line.
 
 With `--require-authoritative` every exit-3 reason is refused instead: exit 1, nothing written (not `status`, `state.json`, `current.nft` or the table), and no reload.
@@ -596,7 +598,7 @@ The scripts own those facts and splice them in front with `printf` (`"${json#\{}
 ### `render`
 
 `render [--snapshot FILE] [--check]` prints the program `sync` would load on stdout and one summary line on stderr, and writes nothing.
-The summary goes through the log's 8-line cap like any log line, so a run with many warnings can lose it to `log-capped`.
+The summary is the run's closing line, so the log's cap never drops it.
 
 - Memory comes from `state.json` and is updated in memory only; no lock is taken.
 - `--snapshot FILE` reads a regular file of at most 8 MiB holding either the `result` object or a whole JSON-RPC response; without it the node is asked.
@@ -612,12 +614,18 @@ Every log line goes to stderr, one event per line: the event name, then `key=val
 - Under systemd a line starts with `<3>` (error) or `<4>` (warning), which journald reads as its priority.
   The prefix appears only when `JOURNAL_STREAM` names the device and inode of fd 2, systemd's documented check, so interactive output stays plain.
 - A value that is not plain printable ASCII is written quoted and escaped, so an event always stays on one line.
-- A run writes at most 8 lines; past that, the eighth is replaced by `log-capped dropped=N`.
+- A run writes at most 8 lines to stderr.
+  Its closing line, the one that says how it ended (`error`, `stale`, `refused`, check's `behind`, `stale` or `error`, render's `result=` summary), is never dropped and is always the last line.
+  The lines before it share the other 7 slots; when more than 7 arrive, 6 are written and the 7th slot becomes `log-capped dropped=N`, N counting every line before the closing line that was not written.
+  A run with no closing line (a fresh or busy `sync`, a `check` that ends `ok`, `missing`, `absent` or `dormant`, or `status`) writes at most 7 lines.
+- On the stale path, a failed reload closes the run with `error reason=reload-failed`, and a failed write of `status` with `error reason=state-io-failed`; the stale path's own line comes before it.
+- The closing line is written when the run ends, after its stdout line.
 - The events: `error`, `stale`, `refused`, `busy`, `behind`, `nft-path`, `nft-unavailable`, `listing-unreadable`, `static-catch-all`, `static-covered`, `floor-missing`, `absorbed kind=<kind> count=N`, `epoch-info-failed`, `status-unreadable`, `status-value-invalid` and `log-capped`.
 - `capture-floor` writes its single failure line without a prefix: `capture-floor: <token>: <detail>`.
 
 The deployment reads exit codes, stdout lines and the status file, never the log lines.
 One exception: the `result=` line of `check` carries no reason, so the deployment reads the `reason=` word of the `<3>error reason=…` and `<4>stale reason=…` lines `check` writes, and that word on those two events of `check` is part of this contract.
+Either line is `check`'s closing line, so the cap never drops it; it reaches stderr after the stdout `result=` line, which matters only to a reader that merges the two streams.
 
 ## What the tool never does
 
