@@ -481,11 +481,7 @@ fn stage(dir: &StateDir, program: &[u8]) -> Result<PathBuf, FsError> {
         action,
         source,
     };
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io_error("remove the leftover", e)),
-    }
+    fsutil::remove_leftover(&path)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1512,6 +1508,37 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn staging_removes_an_empty_directory_in_the_way_and_names_a_full_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::support::TempDir;
+
+        let temp = TempDir::new("sync-stage-dir")?;
+        let dir = StateDir::open(temp.path())?;
+        let leftover = temp.join(STAGED_FILE);
+        std::fs::create_dir(&leftover)?;
+        assert_eq!(stage(&dir, b"program\n")?, leftover);
+        assert_eq!(std::fs::read(&leftover)?, b"program\n");
+
+        std::fs::remove_file(&leftover)?;
+        std::fs::create_dir(&leftover)?;
+        std::fs::write(leftover.join("kept"), "kept")?;
+        let error = match stage(&dir, b"program\n") {
+            Err(e) => e,
+            Ok(path) => return Err(format!("staged {path:?} past a full directory").into()),
+        };
+        assert_eq!(error.token(), "state-io-failed");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "{leftover:?}: cannot remove the leftover: a directory is in the way: "
+            )),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(leftover.join("kept"))?, b"kept");
         Ok(())
     }
 }

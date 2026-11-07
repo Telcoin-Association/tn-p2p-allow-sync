@@ -1,13 +1,14 @@
 //! The state dir: its safety checks, reads that never follow a symlink, atomic writes, the run lock and the effective uid.
 //!
 //! Every file the tool reads or writes at run time lives in the state dir, so no temporary file ever lands in `/tmp`.
-//! The tool never creates the dir: the scripts create it as root with mode 0700, and [`StateDir::open`] refuses one that is a symlink, is not a directory, is owned by another uid or has any mode other than 0700.
+//! The tool never creates the dir: the scripts create it as root with mode 0700, and [`StateDir::open`] refuses one that is a symlink, is not a directory, is owned by another uid or has any mode other than 0700, and a path whose last component is empty (a trailing `/`), `.` or `..`, behind which the kernel would follow a symlink.
 //!
 //! Files are opened with `O_NOFOLLOW` through [`OpenOptionsExt::custom_flags`], a safe API, so a symlink planted in the dir is refused rather than followed; the dir itself is opened for its fsync with `O_NOFOLLOW|O_DIRECTORY`.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -72,6 +73,11 @@ const O_DIRECTORY: i32 = 0o40_000;
 pub(crate) const O_NOFOLLOW: i32 = 0x0100;
 #[cfg(target_vendor = "apple")]
 const O_DIRECTORY: i32 = 0x0010_0000;
+// the same on every Linux target above; the compile_error below covers the others
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4_000;
+#[cfg(target_vendor = "apple")]
+const O_NONBLOCK: i32 = 0x0004;
 #[cfg(not(any(
     all(
         target_os = "linux",
@@ -88,7 +94,9 @@ const O_DIRECTORY: i32 = 0x0010_0000;
     ),
     target_vendor = "apple"
 )))]
-compile_error!("the values of O_NOFOLLOW and O_DIRECTORY are not known for this target");
+compile_error!(
+    "the values of O_NOFOLLOW, O_DIRECTORY and O_NONBLOCK are not known for this target"
+);
 
 /// Why an operation on the state dir failed.
 #[derive(Debug)]
@@ -205,16 +213,25 @@ fn parse_effective_uid(status: &str) -> Option<u32> {
 
 /// Reads the regular file at `path` without following a symlink, or `None` when nothing is there.
 ///
-/// A symlink, a directory or any other non-regular file is an error, checked before the open so that a FIFO cannot block the run.
+/// A symlink, a directory or any other non-regular file is an error, checked before the open and again on the open file.
+/// The open is `O_NONBLOCK`, so a FIFO swapped in between the check and the open cannot block the run either.
+/// The read has no size cap: every caller reads a file in the euid-owned 0700 state dir.
 pub fn read_nofollow(path: &Path) -> io::Result<Option<Vec<u8>>> {
     match fs::symlink_metadata(path) {
         Ok(meta) => regular_file(&meta)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     }
+    read_opened(path)
+}
+
+/// The open and read of [`read_nofollow`], after its check: `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, then the open file must be a regular file.
+fn read_opened(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    // O_NONBLOCK changes nothing for a regular file; for a FIFO it makes the open return at
+    // once instead of waiting for a writer, and the check below then refuses it
     let mut file = match OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -244,6 +261,45 @@ fn regular_file(meta: &fs::Metadata) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, what))
 }
 
+/// Removes what a run that died between create and rename left at the temporary name `path`, if anything.
+///
+/// Unlinking a symlink removes the link, never its target.
+/// An empty directory in the way is removed too; one with anything in it is an error, never emptied.
+/// The caller holds the [`Lock`]: that is what makes the removal safe.
+pub(crate) fn remove_leftover(path: &Path) -> Result<(), FsError> {
+    let error = match fs::remove_file(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => e,
+    };
+    if error.kind() != io::ErrorKind::IsADirectory {
+        return Err(FsError::io(path, "remove the leftover", error));
+    }
+    fs::remove_dir(path).map_err(|e| {
+        let detail = format!("a directory is in the way: {e}");
+        FsError::io(
+            path,
+            "remove the leftover",
+            io::Error::new(e.kind(), detail),
+        )
+    })
+}
+
+/// Why [`StateDir::open`] refused a path that does not [end in a name](ends_in_a_name).
+const NOT_A_NAME: &str = "does not end in a name; a trailing /, . or .. would follow a symlink";
+
+/// Whether the last component of `path`, byte for byte, is a name: not empty, as after a trailing `/`, and not `.` or `..`.
+///
+/// Only then do `lstat` and `O_NOFOLLOW` see the entry itself: the kernel follows a symlink before a trailing `/` or `/.`, and `..` is a parent.
+/// [`Path::components`] cannot tell, since it drops a trailing `/` and `.`; a path that ends in a name also has a [`std::path::Component::Normal`] last.
+pub fn ends_in_a_name(path: &Path) -> bool {
+    path.as_os_str()
+        .as_bytes()
+        .rsplit(|&b| b == b'/')
+        .next()
+        .is_some_and(|last| !matches!(last, b"" | b"." | b".."))
+}
+
 /// Gives the new file `file` exactly `mode`, writes `bytes` and syncs it; closing it is left to the drop.
 fn fill(mut file: File, path: &Path, bytes: &[u8], mode: u32) -> Result<(), FsError> {
     // the mode given at creation is masked by the umask
@@ -265,8 +321,11 @@ pub struct StateDir {
 impl StateDir {
     /// Checks the state dir at `path` and returns it.
     ///
-    /// Refused with [`FsError::StateDirInvalid`]: nothing at `path`, a symlink (checked with `symlink_metadata`, never followed), anything but a directory, an owner other than the effective uid, a mode other than exactly 0700, or an effective uid that cannot be read.
+    /// Refused with [`FsError::StateDirInvalid`]: a path that does not [end in a name](ends_in_a_name), nothing at `path`, a symlink (checked with `symlink_metadata`, never followed), anything but a directory, an owner other than the effective uid, a mode other than exactly 0700, or an effective uid that cannot be read.
     pub fn open(path: &Path) -> Result<Self, FsError> {
+        if !ends_in_a_name(path) {
+            return Err(FsError::state_dir(path, NOT_A_NAME.to_owned()));
+        }
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -340,13 +399,7 @@ impl StateDir {
     pub fn write_atomic(&self, name: &str, bytes: &[u8], mode: u32) -> Result<(), FsError> {
         let target = self.file(name)?;
         let temp = self.file(&format!(".{name}.new"))?;
-        // a run that died between create and rename left this behind; unlinking a symlink
-        // removes the link, never its target
-        match fs::remove_file(&temp) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(FsError::io(&temp, "remove the leftover", e)),
-        }
+        remove_leftover(&temp)?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -533,6 +586,33 @@ mod tests {
     }
 
     #[test]
+    fn a_symlinked_dir_behind_a_trailing_slash_or_dot_is_refused() -> TestResult {
+        let temp = TempDir::new("symlink-slash")?;
+        let real = temp.join("real");
+        fs::create_dir(&real)?;
+        fs::set_permissions(&real, Permissions::from_mode(0o700))?;
+        symlink(&real, temp.join("link"))?;
+        // the kernel follows `link` before a trailing `/` or `/.`, so lstat would see `real`
+        for entry in ["link", "real"] {
+            for suffix in ["/", "//", "/.", "/./", "/..", "/../"] {
+                let path = PathBuf::from(format!("{}{suffix}", temp.join(entry).display()));
+                let message = reason(StateDir::open(&path))?;
+                assert!(message.ends_with(&format!(": {NOT_A_NAME}")), "{message}");
+            }
+        }
+        for path in ["", ".", "..", "/", "//", "a/.", "./.."] {
+            let message = reason(StateDir::open(Path::new(path)))?;
+            assert!(message.ends_with(&format!(": {NOT_A_NAME}")), "{message}");
+        }
+        assert!(ends_in_a_name(Path::new("a")));
+        assert!(ends_in_a_name(Path::new("/var/lib/telcoin-p2p-allow")));
+        assert!(ends_in_a_name(Path::new("./.state")));
+        assert!(ends_in_a_name(Path::new("a/...")));
+        StateDir::open(&real)?;
+        Ok(())
+    }
+
+    #[test]
     fn a_file_is_refused() -> TestResult {
         let temp = TempDir::new("file")?;
         let file = temp.join("file");
@@ -564,8 +644,8 @@ mod tests {
 
     #[test]
     fn a_dir_of_another_uid_is_refused() -> TestResult {
-        // `/` belongs to root and is not 0700, so it fails whichever check comes first
-        let message = reason(StateDir::open(Path::new("/")))?;
+        // `/proc` belongs to root and is not 0700, so it fails whichever check comes first
+        let message = reason(StateDir::open(Path::new("/proc")))?;
         if effective_uid()? != 0 {
             assert!(
                 message.contains(": is owned by uid 0, not the effective uid "),
@@ -614,6 +694,39 @@ mod tests {
         dir.write_atomic("state.json", b"{}\n", 0o600)?;
         assert_eq!(fs::read(temp.join("state.json"))?, b"{}\n");
         assert!(!temp.join(".state.json.new").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn write_atomic_removes_an_empty_directory_at_the_temporary_name() -> TestResult {
+        let (temp, dir) = state_dir("leftover-dir")?;
+        fs::create_dir(temp.join(".status.new"))?;
+        dir.write_atomic("status", b"RESULT=applied\n", 0o600)?;
+        assert_eq!(fs::read(temp.join("status"))?, b"RESULT=applied\n");
+        assert!(fs::symlink_metadata(temp.join(".status.new")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_full_directory_at_the_temporary_name_is_kept_and_named() -> TestResult {
+        let (temp, dir) = state_dir("leftover-full")?;
+        let leftover = temp.join(".status.new");
+        fs::create_dir(&leftover)?;
+        fs::write(leftover.join("kept"), b"kept")?;
+        let error = match dir.write_atomic("status", b"RESULT=applied\n", 0o600) {
+            Err(e @ FsError::Io { .. }) => e,
+            other => return Err(format!("expected state-io-failed, got {other:?}").into()),
+        };
+        assert_eq!(error.token(), "state-io-failed");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "{leftover:?}: cannot remove the leftover: a directory is in the way: "
+            )),
+            "{message}"
+        );
+        assert_eq!(fs::read(leftover.join("kept"))?, b"kept");
+        assert!(!temp.join("status").exists());
         Ok(())
     }
 
@@ -687,6 +800,58 @@ mod tests {
             message.ends_with("config\": cannot read: is a symlink"),
             "{message}"
         );
+        Ok(())
+    }
+
+    /// Makes a FIFO at `path` with mkfifo(1); `false` when the host has no mkfifo.
+    fn mkfifo(path: &Path) -> Result<bool, Box<dyn Error>> {
+        // std cannot make a FIFO, so this test starts mkfifo; the tool itself never does
+        #[allow(clippy::disallowed_methods)]
+        let status = match std::process::Command::new("mkfifo").arg(path).status() {
+            Ok(status) => status,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if status.success() {
+            Ok(true)
+        } else {
+            Err(format!("mkfifo {path:?}: {status}").into())
+        }
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_blocking() -> TestResult {
+        let (temp, dir) = state_dir("fifo")?;
+        let fifo = temp.join("status");
+        if !mkfifo(&fifo)? {
+            println!("a_fifo_is_refused_without_blocking skipped: no mkfifo");
+            return Ok(());
+        }
+        // refused by the check before the open
+        let message = dir
+            .read("status")
+            .map_or_else(|e| e.to_string(), |_| String::new());
+        assert!(
+            message.ends_with("status\": cannot read: is not a regular file"),
+            "{message}"
+        );
+        // a FIFO swapped in after that check: the open returns at once, and the open file is refused
+        let (done, finished) = mpsc::channel();
+        let opener = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            // the receiver outlives this thread; a send error cannot happen
+            let _ = done.send(read_opened(&opener).map(drop).map_err(|e| e.to_string()));
+        });
+        let result = finished.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            // a blocked open waits for a writer; a non-blocking one releases it, so the thread ends
+            let _ = OpenOptions::new()
+                .write(true)
+                .custom_flags(O_NONBLOCK)
+                .open(&fifo);
+        }
+        reader.join().map_err(|_| "the reader thread panicked")?;
+        assert_eq!(result?, Err("is not a regular file".to_owned()));
         Ok(())
     }
 
