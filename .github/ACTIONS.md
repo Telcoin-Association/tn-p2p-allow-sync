@@ -58,9 +58,19 @@ The last line is not a CI job; it shows that the release triple still links stat
 
 ### `nft-real.yaml`
 
-One job, `nft-real`, on a matrix of `ubuntu-24.04` and `ubuntu-22.04`, on `pull_request` and on every push to `main`.
-The runners are pinned by release rather than `ubuntu-latest` because the question the job answers is about kernels and nft versions: 22.04 ships nft 1.0.2 and 24.04 ships nft 1.0.9.
-It installs `nftables` and `iproute2`, builds the test binary as the runner user (`cargo test --locked --no-run --test real_nft`), runs only that binary under `sudo -E` with `--ignored`, and uploads `target/real-nft/` (the raw `nft -j` listing after each step and `summary.txt`) as the artifact `real-nft-<runner>`.
+One job, `nft-real`, on `pull_request` and on every push to `main`, in three legs, each its own check:
+
+| Check | Runner | Where the test runs | Artifact |
+|---|---|---|---|
+| `nft-real (ubuntu-24.04)` | `ubuntu-24.04` | on the runner, nft 1.0.9 | `real-nft-ubuntu-24.04` |
+| `nft-real (ubuntu-22.04)` | `ubuntu-22.04` | on the runner, nft 1.0.2 | `real-nft-ubuntu-22.04` |
+| `nft-real (debian:13)` | `ubuntu-24.04` | in a privileged `debian:13` container, with Debian's nft | `real-nft-debian-13` |
+
+The runners are pinned by release rather than `ubuntu-latest` because the question the job answers is about kernels and nft versions.
+The two Ubuntu legs install `nftables` and `iproute2`, build the test binary as the runner user (`cargo test --locked --no-run --test real_nft`), and run only that binary under `sudo -E` with `--ignored`.
+The Debian leg runs `make nft-real-docker DISTRO=debian:13`: it builds the test binary for `x86_64-unknown-linux-musl` as the runner user, so it starts whatever the image's glibc, and runs it with `docker run --privileged` in that image, with its `nftables` and `iproute2` and with `TN_REAL_NFT_REQUIRED=1`.
+A container shares the runner's kernel, so that leg answers for Debian 13's nft and its JSON listing against Ubuntu 24.04's kernel, not for Debian's kernel.
+Every leg uploads `target/real-nft/` (the raw `nft -j` listing after each step and `summary.txt`) as its artifact; the Debian one is named `real-nft-debian-13` because an artifact name cannot hold a `:`.
 
 `tests/real_nft.rs` creates a network namespace and a veth pair, loads the rendered program into the runner's own namespace, and sends UDP from the far end of the pair:
 
@@ -75,27 +85,41 @@ It installs `nftables` and `iproute2`, builds the test binary as the runner user
 The test refuses to run where table `inet tn_p2p_allow` already exists, and deletes the table and the namespace when it ends.
 Without root, nft or ip it prints why and passes; the job sets `TN_REAL_NFT_REQUIRED=1`, which turns that skip into a failure.
 
-It is required on every pull request that touches `render`, `nft`, `sync` or `addr`: such a pull request does not merge without a green run on both runners.
+It is required on every pull request that touches one of the paths below: such a pull request does not merge without a green run of all three legs.
 A `paths:` filter alone cannot carry that rule, because GitHub treats a required check that never reported as pending and the pull request waits for it forever.
 The workflow therefore reports on every pull request, and its first step decides from `git diff --name-only HEAD^1 HEAD`, the merge commit against the base branch tip, whether the suite runs.
 It runs when the pull request touches any of these:
 
 - `src/render.rs`, `src/nft.rs`, `src/sync.rs`, and `src/addr.rs`, which parses and masks the networks the program and the compare are built from;
-- `tests/golden/`, `tests/fixtures/nft/`, `tests/support/`, `tests/real_nft.rs`;
-- `.github/workflows/nft-real.yaml`;
-- `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, since a dependency or a compiler changes the code of the four modules too.
+- `src/config.rs` (the ports, the family split and the removal of covered networks that nft would refuse as overlapping), `src/status.rs` (the counters read from the listing), `src/check.rs` (the compare of `check`), `src/cli.rs` (the `--nft` path) and `src/fsutil.rs` (the staged file `nft -f` reads);
+- `tests/golden/`, `tests/fixtures/nft/`, `tests/fixtures/state/`, `tests/support/`, `tests/real_nft.rs`;
+- `.github/workflows/nft-real.yaml`, and `Makefile`, whose `nft-real-docker` target is the Debian leg;
+- `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, since a dependency or a compiler changes the code of these modules too.
 
 Otherwise the job ends green with a notice.
 A push to `main` always runs the suite, and so does a pull request whose diff cannot be computed.
 The list lives in the `watched` pattern of the workflow's first step; change both together.
 
-To run the test locally, as root on a Linux host:
+To run the test locally on a Linux host, as the Ubuntu legs do (the target builds as you and runs only the test binary under sudo):
+
+```sh
+make nft-real
+```
+
+or by hand:
 
 ```sh
 cargo test --locked --no-run --test real_nft
 sudo target/debug/deps/real_nft-<hash> --ignored --exact real_kernel_nft --nocapture
 ```
 
+To run it in a container of another release, as the Debian leg does, with docker on the host:
+
+```sh
+make nft-real-docker DISTRO=debian:13
+```
+
+`DISTRO` names the image the test runs in (the `Makefile` target documents which it supports); the kernel is still the host's.
 In a container, `ip netns add` has to mount `/run/netns`, so the container needs `--cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN --security-opt apparmor=unconfined`.
 Build with `--target x86_64-unknown-linux-musl` there, so the static binary also starts in an image whose glibc is older than the host's, and mount the checkout at its own path, because the test writes to `target/real-nft/` under the path it was built in.
 
@@ -132,8 +156,8 @@ cargo +nightly-2026-10-15 fuzz run <target> artifacts/<target>/<crash-file>   # 
 
 ## Required checks
 
-Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`, and the two checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)` and `nft-real (ubuntu-22.04)`.
-`coverage` is new in v0.1.1 and has to be added to the list by hand; it belongs there, because a gate that is not required lets a pull request merge while it is red.
+Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`, and the three checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`.
+`coverage` and `nft-real (debian:13)` are new in v0.1.1 and have to be added to the list by hand; `coverage` belongs there, because a gate that is not required lets a pull request merge while it is red.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
