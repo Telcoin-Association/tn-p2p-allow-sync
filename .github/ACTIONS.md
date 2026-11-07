@@ -29,7 +29,7 @@ The source never says `#![deny(warnings)]`: a new compiler release must not brea
 `--locked` everywhere means `Cargo.lock` is the dependency set; a change to it is a reviewed change in the pull request.
 `deny` and `audit` fetch their advisory databases when they run, by design, so a newly published advisory turns them red on the next run with no change in this repository.
 That next run comes within a week even with no pull request open: `scheduled.yaml` runs the same two commands every Monday on `main` as `deny-weekly` and `audit-weekly` (see "`scheduled.yaml`").
-`ci.yaml` itself has no schedule and no job-level `if:`, so every job runs on every event and none leaves a `skipped` check run on a commit under a required check's name, where it would become the newest run of that name for branch protection and for the release gate of `release.conf`.
+`ci.yaml` itself has no schedule and no job-level `if:`, so every job runs on every event and none is skipped: a skipped job leaves a `skipped` check run under a required check's name, which branch protection would take as the newest run of that name, and the release gate of `release.conf` counts a skipped job as none.
 A dispatch (*Actions* -> *CI* -> *Run workflow*) runs every job on the branch it is started on.
 
 A new push to a pull request cancels the runs of `ci.yaml` and `nft-real.yaml` for its previous head (`concurrency`, with `cancel-in-progress` on `pull_request` only).
@@ -171,8 +171,11 @@ Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `d
 `coverage` and `nft-real (debian:13)` are new in v0.1.1 and have to be added to the list by hand; `coverage` belongs there, because a gate that is not required lets a pull request merge while it is red.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
 No job of `release.yaml` or `scheduled.yaml` may share its name with one of these checks (today: `validate-tag`, `draft-release`, `rebuild`, `verify-release`, `mutants (<k>/4)`, `fuzz`, `deny-weekly` and `audit-weekly`): GitHub matches a required check by name on a commit, whatever workflow reported it.
-It matches by name whatever app reported it, too, and any GitHub App installed on the repository with `checks: write` can post a check run under a required check's name.
-The release gate of `release.conf` (`tn_check_ci_green`) therefore counts only check runs of the GitHub Actions app (`app.slug` `github-actions`), and branch protection should pin each required check's source to GitHub Actions as well (the app chosen beside each check's name in the rule), so a pull request cannot merge on another app's run either.
+It matches by name whatever posted it, too: any GitHub App installed on the repository with `checks: write` can post a check run under a required check's name, and so can any workflow whose token has `checks: write`, run from any branch, and GitHub credits that run to GitHub Actions like a job's own.
+The release gate of `release.conf` (`tn_check_ci_green`) therefore reads no check runs.
+It reads the jobs of the push-to-main runs of `ci.yaml` and `nft-real.yaml` on the tagged commit (`TN_REQUIRED_WORKFLOWS`), the newest completed run of each, and requires each of the ten names to be one of those jobs, concluded `success`; a job concluded `skipped` or `neutral` counts as none ([`docs/releasing.md`](../docs/releasing.md#the-required-checks)).
+Those jobs are the ones the two files define at that commit, which the review of `main` covered, and a dispatch, a pull request or a push to another branch is not such a run, however green.
+Branch protection should pin each required check's source to GitHub Actions (the app chosen beside each check's name in the rule), so a pull request cannot merge on another app's run.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
 ## Action pins
@@ -258,7 +261,7 @@ The procedure is in [`release/docs/signing.md`](../release/docs/signing.md), and
 
 The tag filter is broader than the tag grammar on purpose: a malformed `v` tag fails visibly in `validate-tag` instead of being ignored, and `TAG_RE` in `release.conf` decides what a release tag is.
 A dispatch (*Release* -> *Run workflow*) takes a `tag` and a `mode` and is possible only once the workflow is on `main`; `verify` works on a published release only, because a read-only token cannot see drafts.
-`actions: read` lets `check-tag` read when GitHub created its run, and `checks: read` lets the tag gate of `release.conf` read the check runs of the tagged commit.
+`actions: read` lets `check-tag` read when GitHub created its run, and lets the tag gate of `release.conf` list the runs of `ci.yaml` and `nft-real.yaml` on the tagged commit and read their jobs; the gate reads no check runs, so the job's `checks: read` is unused.
 No job in `release.yaml` may share its name with a required check: GitHub matches a required check by name on a commit, whatever workflow reported it, and a tag can be pushed on any commit.
 
 ### Scripts and keys come from the pointer on `main`

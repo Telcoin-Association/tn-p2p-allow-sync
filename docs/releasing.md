@@ -45,7 +45,7 @@ Its hooks:
   With `TN_P2P_ALLOW_REBUILD=1` it also rebuilds the binary from the tag's commit, with that commit's `etc/Dockerfile` and `BUILD_IMAGE`, and requires the same file; `build`'s own check skips the rebuild, because `hook_build` has just built twice.
 - `hook_check_tag_extra` runs inside `check-tag`, and so in `tag` before it creates the tag and in `build`, `sign`, `verify` and `publish`, on the tag's commit.
   It refuses a commit whose `Cargo.toml`, `.cargo/config.toml`, `.cargo/config` or `etc/Dockerfile` has a line, outside a `#` comment, that names both `panic` and `abort` in any case: the release build keeps `panic = "unwind"`, so that a panic exits 101 and the deployment scripts read it as a bug.
-  It also requires the newest GitHub Actions check run of each name in `TN_REQUIRED_CHECKS` to have concluded `success` on that commit ([The required checks](#the-required-checks)); a dry run and a published release skip that, and `tag` and `sign` leave it to `check-tag` in CI on a host without `gh`.
+  It also requires each name in `TN_REQUIRED_CHECKS` to be a job that concluded `success` in the push-to-main runs of `ci.yaml` and `nft-real.yaml` on that commit ([The required checks](#the-required-checks)); a dry run and a published release skip that, and `tag` and `sign` leave it to `check-tag` in CI on a host without `gh`.
 - `hook_changelog` writes the new `CHANGELOG.md` section from `cliff.toml`.
 
 `release-dry-run` runs the static and unwind checks on every pull request, so a change that breaks either fails before it merges.
@@ -94,17 +94,25 @@ After publishing, the deployment scripts pick the release up only when a `chore`
 ### The required checks
 
 `TN_REQUIRED_CHECKS` in `release.conf` names the ten checks a tag's commit must have passed, the required checks of `main` ([`.github/ACTIONS.md`](../.github/ACTIONS.md#required-checks)): `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit`, `release-dry-run`, `nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`.
-For each name the newest check run of the GitHub Actions app on the commit counts, whatever started it, and it must have concluded `success`; a same-named run from another GitHub App, which any app installed on the repository with `checks: write` can post, is ignored.
-A run concluded `skipped` or `neutral` checked nothing, so it is passed over, and a name with only such runs counts as having none.
-A name with no run, a run still queued or in progress, and a failed, cancelled or timed-out run all stop the step with exit 1, and the error lists each one with its state.
+The gate reads the jobs of the push-to-main runs of `ci.yaml` and `nft-real.yaml` on the tagged commit, the workflows of `TN_REQUIRED_WORKFLOWS`.
+For each workflow it lists the runs GitHub started for the push of that commit to `main` (`gh run list --workflow <file> --commit <sha> --event push --branch main`), takes the newest completed one, and reads its jobs (`gh api repos/<owner>/<repo>/actions/runs/<run-id>/jobs`); each of the ten names must be one of those jobs and have concluded `success`.
+It reads no check runs, because a check run can be posted by any workflow whose token has `checks: write`, run from any branch, and GitHub credits it to GitHub Actions like a job's own; any GitHub App with `checks: write` can post one too.
+The jobs of a push-to-main run are the ones `ci.yaml` and `nft-real.yaml` define at the commit, which the review of `main` covered, and a dispatch, a pull request or a push to another branch is not such a run, however green.
+A job concluded `skipped` or `neutral` checked nothing, so it is passed over, and a name with only such jobs counts as having none.
+Each of these stops the step with exit 1:
+
+- `no push-to-main run of <file> on <sha>: wait for CI, or the commit is not on main`: GitHub has not started the workflow for the push yet, or the commit was never pushed to `main`.
+- `the push-to-main run <run-id> of <file> on <sha> is in_progress: wait for it to finish, then run this step again`, or `queued`: the workflow has not finished.
+- `CI has not passed on <sha>: ...`: a name with no job, or a failed, cancelled or timed-out job; the error lists each with its state and names the runs it read.
+
 Branch protection does not ensure this alone: a pull request's checks ran on its head, not on the commit its merge leaves on `main`, an admin can merge past them, and a red run on a push to `main` gates nothing.
 
 That makes the order matter on a release day.
-`tag` signs `main`'s tip, and that commit has check runs only once its push to `main` has run `ci.yaml` and `nft-real.yaml`, which takes several minutes; `gh run list --commit "$(git rev-parse origin/main)"` shows those runs.
+`tag` signs `main`'s tip, and that commit passes only once its push to `main` has run `ci.yaml` and `nft-real.yaml`, which takes several minutes; `gh run list --commit "$(git rev-parse origin/main)" --event push --branch main` shows those runs.
 `tag` asks GitHub before it creates the tag and refuses while any of the ten is missing or unfinished, so wait until the push runs are done and green, then run it again.
 On a host without `gh`, `tag` leaves the question to `validate-tag`, which then fails and drafts nothing, so wait in either case.
 Merge nothing else between the release PR and the tag, since a new tip starts its checks over.
-A job that failed for a transient cause, such as a download, is re-run on GitHub (`gh run rerun <run-id> --failed`), and its new run becomes the newest of its name.
+A job that failed for a transient cause, such as a download, is re-run on GitHub (`gh run rerun <run-id> --failed`); the run keeps its id, and once the re-run has finished, its jobs show the new result.
 `scheduled.yaml` runs `cargo deny` and `cargo audit` on `main`'s tip every Monday as `deny-weekly` and `audit-weekly`, names that are not required checks, so their runs neither pass nor stop a release step.
 When one turns red, an advisory has been published against a dependency since the push run: a re-run of the tagged commit's `deny` or `audit` would fail as well and stop the steps that follow, and an advisory that stays needs a fix on `main` and the next patch version.
 

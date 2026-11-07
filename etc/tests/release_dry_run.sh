@@ -627,9 +627,11 @@ expect_rc 1 "a commit whose Cargo.toml sets panic = \"abort\" is refused"
 expect_err "Cargo.toml at $abort sets the panic strategy to abort (line " "it names the file and the line"
 
 # gh for the gates: logs its arguments to GH_FIXTURE/gh.log, then answers from the files there,
-# applying --jq with jq as gh does: runs.json (run list), artifact-RUN-NAME/ (run download),
-# release.json (release view; without it the release does not exist), check-runs.json and
-# artifacts.json (api, a commit's check runs and a run's artifacts)
+# applying --jq with jq as gh does: runs-WORKFLOW.json (run list --workflow WORKFLOW; GitHub's
+# filters on --commit, --event and --branch applied, and each run cut to the --json fields as
+# gh does; without the file the workflow has no runs), jobs-RUN.json and artifacts.json (api, a
+# run's jobs and its artifacts), artifact-RUN-NAME/ (run download) and release.json (release
+# view; without it the release does not exist). Nothing answers for a commit's check runs.
 GHFX=$FX/gh-fixture
 mkdir -p "$GHFX" "$FX/gate-bin"
 cat >"$FX/gate-bin/gh" <<'EOF'
@@ -638,26 +640,40 @@ set -eu
 printf '%s\n' "$*" >>"$GH_FIXTURE/gh.log"
 cmd="$1 $2"
 shift 2
-jqx=. dest= name= arg=
+jqx=. dest= name= arg= wf= commit= event= branch= fields=
 while [ $# -gt 0 ]; do
     case $1 in
         --jq) jqx=$2; shift 2 ;;
         -D) dest=$2; shift 2 ;;
         -n) name=$2; shift 2 ;;
-        --repo | --workflow | --commit | --event | --json) shift 2 ;;
+        --workflow) wf=$2; shift 2 ;;
+        --commit) commit=$2; shift 2 ;;
+        --event) event=$2; shift 2 ;;
+        --branch) branch=$2; shift 2 ;;
+        --json) fields=$2; shift 2 ;;
+        --repo | --limit) shift 2 ;;
         --paginate) shift ;;
         *) arg=$1; shift ;;
     esac
 done
 case $cmd in
-    "run list") exec jq -r "$jqx" "$GH_FIXTURE/runs.json" ;;
+    "run list")
+        if [ -f "$GH_FIXTURE/runs-$wf.json" ]; then cat "$GH_FIXTURE/runs-$wf.json"; else echo '[]'; fi |
+            jq --arg c "$commit" --arg e "$event" --arg b "$branch" --arg f "$fields" '[.[]
+                | select(($c == "" or .headSha == $c) and ($e == "" or .event == $e) and ($b == "" or .headBranch == $b))
+                | with_entries(select(.key as $k | $f | split(",") | any(. == $k)))]' |
+            jq -r "$jqx" ;;
     "run download")
         if [ ! -d "$GH_FIXTURE/artifact-$arg-$name" ]; then echo "no valid artifacts found to download" >&2; exit 1; fi
         cp "$GH_FIXTURE/artifact-$arg-$name"/* "$dest/" ;;
     "release view")
         if [ ! -f "$GH_FIXTURE/release.json" ]; then echo "release not found" >&2; exit 1; fi
         exec jq -r "$jqx" "$GH_FIXTURE/release.json" ;;
-    api\ */check-runs*) exec jq -r "$jqx" "$GH_FIXTURE/check-runs.json" ;;
+    api\ */actions/runs/*/jobs*)
+        run=${cmd#api repos/*/actions/runs/}
+        run=${run%%/*}
+        if [ ! -f "$GH_FIXTURE/jobs-$run.json" ]; then echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
+        exec jq -r "$jqx" "$GH_FIXTURE/jobs-$run.json" ;;
     api\ */artifacts*) exec jq -r "$jqx" "$GH_FIXTURE/artifacts.json" ;;
     *) echo "fixture gh: no answer for gh $cmd" >&2; exit 1 ;;
 esac
@@ -679,82 +695,150 @@ gated() {
         _ "$tag" "$r1" "$FX/gate-work" "$draft" "$@"
 }
 
-# check_runs ID=NAME=CONCLUSION[@APP]...: check-runs.json, the check runs on the release commit,
-# each reported by the app whose slug is APP, github-actions without one; the conclusion
-# pending stands for a run in progress
-check_runs() {
-    local r id name concl state app sep=
+# wf_runs WORKFLOW ID=EVENT=BRANCH=STATE...: runs-WORKFLOW.json, the runs of WORKFLOW on the
+# release commit, newest first as gh lists them; STATE is the conclusion of a completed run, or
+# in_progress for a run that has not finished
+wf_runs() {
+    local wf=$1 r id event branch state concl sep=
+    shift
     {
-        printf '{"total_count": %d, "check_runs": [' "$#"
+        printf '['
         for r in "$@"; do
-            app=github-actions
-            case $r in *@*) app=${r##*@} r=${r%@*} ;; esac
             id=${r%%=*}
             r=${r#*=}
-            name=${r%=*}
-            concl="\"${r##*=}\""
+            event=${r%%=*}
+            r=${r#*=}
+            branch=${r%%=*}
+            concl="\"${r#*=}\""
             state=completed
-            if [ "$concl" = '"pending"' ]; then state=in_progress concl=null; fi
-            printf '%s{"id": %s, "name": "%s", "status": "%s", "conclusion": %s, "app": {"slug": "%s"}}' \
-                "$sep" "$id" "$name" "$state" "$concl" "$app"
+            if [ "$concl" = '"in_progress"' ]; then state=in_progress concl=null; fi
+            printf '%s{"databaseId": %s, "status": "%s", "conclusion": %s, "headSha": "%s", "headBranch": "%s", "event": "%s"}' \
+                "$sep" "$id" "$state" "$concl" "$r1" "$branch" "$event"
+            sep=', '
+        done
+        printf ']\n'
+    } >"$GHFX/runs-$wf.json"
+}
+
+# run_jobs RUN NAME=CONCLUSION...: jobs-RUN.json, the jobs of the run RUN, all completed
+run_jobs() {
+    local run=$1 j sep=
+    shift
+    {
+        printf '{"total_count": %d, "jobs": [' "$#"
+        for j in "$@"; do
+            printf '%s{"name": "%s", "status": "completed", "conclusion": "%s"}' "$sep" "${j%=*}" "${j##*=}"
             sep=', '
         done
         printf ']}\n'
-    } >"$GHFX/check-runs.json"
+    } >"$GHFX/jobs-$run.json"
 }
 
+# no_runs: no workflow has a run, and no run has jobs
+no_runs() { rm -f "$GHFX"/runs-*.json "$GHFX"/jobs-*.json; }
+
 # the required checks on the tag's commit (hook_check_tag_extra, as check-tag runs it): the
-# ten names of TN_REQUIRED_CHECKS, each with one successful run
-green=('11=fmt=success' '12=clippy=success' '13=test=success' '14=coverage=success' '15=deny=success'
-    '16=audit=success' '17=release-dry-run=success' '18=nft-real (ubuntu-24.04)=success'
-    '19=nft-real (ubuntu-22.04)=success' '20=nft-real (debian:13)=success')
-check_runs 10=test=failure "${green[@]}" 21=validate-tag=pending
+# ten names of TN_REQUIRED_CHECKS, the jobs of ci.yaml and nft-real.yaml, each successful in
+# the push-to-main run of its workflow. The other runs of ci.yaml on the commit, a dispatch, a
+# push to another branch and a pull request, are not read.
+ci_green=(fmt=success clippy=success test=success coverage=success deny=success audit=success release-dry-run=success)
+nft_green=('nft-real (ubuntu-24.04)=success' 'nft-real (ubuntu-22.04)=success' 'nft-real (debian:13)=success')
+api_runs=repos/Telcoin-Association/tn-p2p-allow-sync/actions/runs
+no_runs
+wf_runs ci.yaml 104=workflow_dispatch=main=failure 103=push=fix=failure 102=pull_request=main=failure 101=push=main=success
+run_jobs 101 "${ci_green[@]}"
+run_jobs 102 fmt=failure "${ci_green[@]:1}"
+run_jobs 103 fmt=failure "${ci_green[@]:1}"
+run_jobs 104 fmt=failure "${ci_green[@]:1}"
+wf_runs nft-real.yaml 201=push=main=success
+run_jobs 201 "${nft_green[@]}"
 gated '' hook_check_tag_extra "$r1" always
-expect_rc 0 "check-tag accepts a commit on which every required check passed"
-expect_err "CI passed on $r1: fmt, clippy, test, coverage, deny, audit, release-dry-run, nft-real (ubuntu-24.04), nft-real (ubuntu-22.04), nft-real (debian:13)" \
-    "it lists the ten required checks, of which the newest run counts"
-check "it reads the check runs of the release commit" \
-    grep -q -F -e "api repos/Telcoin-Association/tn-p2p-allow-sync/commits/$r1/check-runs" "$GHFX/gh.log"
+expect_rc 0 "check-tag accepts a commit whose push to main passed every required job"
+expect_err "CI passed on $r1: fmt, clippy, test, coverage, deny, audit, release-dry-run, nft-real (ubuntu-24.04), nft-real (ubuntu-22.04), nft-real (debian:13) (run 101 of ci.yaml, run 201 of nft-real.yaml)" \
+    "it lists the ten required checks and the two runs whose jobs they are"
+check "it lists the runs of ci.yaml and nft-real.yaml on the push of the release commit to main" \
+    test "$(awk -v r="$r1" '$1 == "run" && $2 == "list" && $5 == "--workflow" && index($0, " --commit " r " --event push --branch main ") { w[$6] = 1 }
+        END { print (w["ci.yaml"] && w["nft-real.yaml"]) }' "$GHFX/gh.log")" = 1
+check "it reads the jobs of those two runs alone, and never a commit's check runs" \
+    test "$(awk '$1 == "api" { printf "%s ", $2 }' "$GHFX/gh.log")" = "$api_runs/101/jobs?per_page=100 $api_runs/201/jobs?per_page=100 "
 
-# newer skipped runs, as a job skipped by its `if:` leaves, and a neutral one
-check_runs "${green[@]}" 30=fmt=skipped 31=clippy=skipped 32=test=skipped 33=coverage=skipped \
-    34=release-dry-run=skipped 35=deny=neutral
+# a newer run still in progress, and an older one with a failed job: the newest completed run
+# of each workflow counts. Skipped and neutral jobs, as a job skipped by its `if:` leaves, are
+# passed over.
+no_runs
+wf_runs ci.yaml 107=push=main=in_progress 105=push=main=success 101=push=main=failure
+run_jobs 101 "${ci_green[@]:0:2}" test=failure "${ci_green[@]:3}"
+run_jobs 105 "${ci_green[@]}"
+wf_runs nft-real.yaml 201=push=main=success
+run_jobs 201 "${nft_green[@]}" fmt=skipped test=neutral release-dry-run=skipped
 gated '' hook_check_tag_extra "$r1" always
-expect_rc 0 "check-tag passes over skipped and neutral runs newer than the successful ones"
-expect_err "CI passed on $r1: fmt, clippy, test, coverage," "it reports the required checks as passed"
+expect_rc 0 "check-tag takes the newest completed push run of each workflow, and passes over skipped and neutral jobs"
+expect_err "CI passed on $r1: fmt, clippy, test, coverage, deny, audit, release-dry-run, nft-real (ubuntu-24.04), nft-real (ubuntu-22.04), nft-real (debian:13) (run 105 of ci.yaml, run 201 of nft-real.yaml)" \
+    "it reports the required checks as passed in run 105"
 
-check_runs 11=fmt=success 12=clippy=success 13=test=success 33=coverage=skipped 36=coverage=neutral \
-    15=deny=success 16=audit=failure 37=audit=skipped 17=release-dry-run=success \
-    '18=nft-real (ubuntu-24.04)=success' '19=nft-real (ubuntu-22.04)=success' '20=nft-real (debian:13)=success'
+no_runs
+wf_runs ci.yaml 101=push=main=failure
+run_jobs 101 fmt=success clippy=success test=success coverage=skipped deny=neutral audit=failure release-dry-run=success
+wf_runs nft-real.yaml 201=push=main=success
+run_jobs 201 "${nft_green[@]}" audit=skipped
 gated '' hook_check_tag_extra "$r1" always
-expect_rc 1 "check-tag refuses a check with only skipped and neutral runs, and a failure under a newer skipped run"
-expect_err "CI has not passed on $r1: coverage (no check run, only skipped or neutral ones), audit (failure)" \
-    "it counts the first as missing and still sees the failure"
+expect_rc 1 "check-tag refuses a name with only skipped and neutral jobs, and a failed job beside a skipped one"
+expect_err "CI has not passed on $r1: coverage (no job, only skipped or neutral ones), deny (no job, only skipped or neutral ones), audit (failure); " \
+    "it counts the first two as missing and still sees the failure"
 
-check_runs 11=fmt=success 12=clippy=success 21=clippy=failure 13=test=success 14=coverage=success 15=deny=success \
-    16=audit=success 17=release-dry-run=success '18=nft-real (ubuntu-24.04)=success' '19=nft-real (ubuntu-22.04)=pending'
+no_runs
+wf_runs ci.yaml 101=push=main=failure
+run_jobs 101 fmt=success clippy=failure "${ci_green[@]:2}"
+wf_runs nft-real.yaml 201=push=main=cancelled
+run_jobs 201 'nft-real (ubuntu-24.04)=success' 'nft-real (ubuntu-22.04)=cancelled'
 gated '' hook_check_tag_extra "$r1" always
-expect_rc 1 "check-tag refuses a commit with a failed, a running and a missing required check"
-expect_err "CI has not passed on $r1: clippy (failure), nft-real (ubuntu-22.04) (in_progress), nft-real (debian:13) (no check run)" \
+expect_rc 1 "check-tag refuses a commit with a failed, a cancelled and a missing required job"
+expect_err "CI has not passed on $r1: clippy (failure), nft-real (ubuntu-22.04) (cancelled), nft-real (debian:13) (no job); " \
     "it names each of them and what it found"
+expect_err "(run 101 of ci.yaml, run 201 of nft-real.yaml)" "it names the runs it read"
 
-# another app posts same-named runs: a success newer than test's failure, and fmt's only run
-check_runs "${green[@]:1}" 41=fmt=success@other-app 42=test=failure 43=test=success@other-app
+no_runs
+wf_runs ci.yaml 101=push=main=success
+run_jobs 101 "${ci_green[@]}"
+wf_runs nft-real.yaml 202=push=main=in_progress
 gated '' hook_check_tag_extra "$r1" always
-expect_rc 1 "check-tag counts only the check runs of GitHub Actions"
-expect_err "CI has not passed on $r1: fmt (no check run), test (failure)" \
-    "another app's newer success masks no failure and stands in for no check"
+expect_rc 1 "check-tag refuses a commit whose push run of nft-real.yaml is still running"
+expect_err "the push-to-main run 202 of nft-real.yaml on $r1 is in_progress: wait for it to finish" "it names the run and its state"
+check "it reads no jobs of the running run" test -z "$(grep -F "$api_runs/202/" "$GHFX/gh.log")"
+
+# all green, but a dispatch on main and a push to another branch: no push-to-main run
+no_runs
+wf_runs ci.yaml 104=workflow_dispatch=main=success 103=push=fix=success
+run_jobs 103 "${ci_green[@]}"
+run_jobs 104 "${ci_green[@]}"
+wf_runs nft-real.yaml 201=push=main=success
+run_jobs 201 "${nft_green[@]}"
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 1 "check-tag refuses all-green runs of ci.yaml that are a dispatch and a push to another branch"
+expect_err "no push-to-main run of ci.yaml on $r1: wait for CI, or the commit is not on main" \
+    "it says ci.yaml has no run on the push to main"
+check "it reads the jobs of no run" test -z "$(awk '$1 == "api"' "$GHFX/gh.log")"
+
+# nft-real.yaml ran on a pull request whose head branch is a fork's main, not on the push
+no_runs
+wf_runs ci.yaml 101=push=main=success
+run_jobs 101 "${ci_green[@]}"
+wf_runs nft-real.yaml 200=pull_request=main=success
+run_jobs 200 "${nft_green[@]}"
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 1 "check-tag refuses a commit with no push-to-main run of nft-real.yaml"
+expect_err "no push-to-main run of nft-real.yaml on $r1: wait for CI, or the commit is not on main" "it names the workflow"
 
 printf '{"isDraft": false, "isPrerelease": false, "author": {"login": "github-actions[bot]"}, "assets": []}\n' >"$GHFX/release.json"
 gated '' hook_check_tag_extra "$r1" always
 expect_rc 0 "the required checks of a published release are not asked for again"
 expect_err "release $tag is published: not checking the CI results of $r1 again" "it says the release is published"
+check "it lists no workflow run" test -z "$(awk '$1 == "run"' "$GHFX/gh.log")"
 rm "$GHFX/release.json"
 
 # the CI rebuild: the draft's program against the artifact of the release workflow's run on
 # the push of the tag (hook_check_release_files, as sign, verify and publish run it)
-printf '[{"databaseId": 302, "status": "completed", "conclusion": "success", "headBranch": "%s"}, {"databaseId": 301, "status": "completed", "conclusion": "failure", "headBranch": "v0.0.1"}]\n' \
-    "$tag" >"$GHFX/runs.json"
+wf_runs release.yaml "302=push=$tag=success" 301=push=v0.0.1=failure
 mkdir -p "$GHFX/artifact-302-rebuild-$tag"
 printf '%s  tn-p2p-allow-sync\n' "$packed" >"$GHFX/artifact-302-rebuild-$tag/program.sha256"
 # artifacts NAME=EXPIRED...: artifacts.json, the artifacts of run 302
@@ -803,7 +887,7 @@ expect_rc 1 "sign stops when the run has no artifact rebuild-$tag"
 expect_err "run 302 of release.yaml for $tag has no artifact rebuild-$tag" "it says the artifact is missing"
 expect_err "re-run the release workflow's rebuild job of run 302" "it says to re-run the rebuild job"
 
-printf '[{"databaseId": 301, "status": "completed", "conclusion": "failure", "headBranch": "v0.0.1"}]\n' >"$GHFX/runs.json"
+wf_runs release.yaml 301=push=v0.0.1=failure
 gated true hook_check_release_files "$gate_rel"
 expect_rc 2 "sign stops while the push of $tag has no run of the release workflow"
 expect_err "wait for the CI rebuild of $tag, then run this step again" "it says to wait for the CI rebuild"
