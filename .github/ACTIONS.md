@@ -132,12 +132,13 @@ The 60-day rule for schedules in `ci.yaml` applies here too.
 
 | Job | Command | What it reports |
 |---|---|---|
-| `mutants` | `cargo mutants --cargo-arg=--locked --jobs 2 --output target/mutants` | each change to the code (a mutant) that no test notices, in the step summary and the artifact `mutants` |
+| `mutants (<k>/4)`, for `k` 0 to 3 | `cargo mutants --cargo-arg=--locked --jobs 2 --shard <k>/4 --output target/mutants` | each change to the code (a mutant) that no test notices, in the step summary and the artifact `mutants-<k>` |
 | `fuzz` | `cargo +nightly-2026-10-15 fuzz run <target> -- -max_total_time=300` in `fuzz/`, for `multiaddr`, `cidr_or_host`, `config`, `snapshot`, `nft_listing` and `http_response`, then `cargo deny --config deny.toml check` in `fuzz/` | an input that crashes a target, as the artifact `fuzz-artifacts`, and a dependency of the fuzz crate that `fuzz/deny.toml` refuses |
 
-`mutants` stays green whatever it finds: cargo-mutants exits non-zero for a missed or timed-out mutant, and the step has `continue-on-error`.
-Read the step summary, which counts caught, missed, timed-out and unviable mutants and lists the first 50 missed ones, and `mutants.out/` in the artifact, which has all of them with their diffs.
-The step stops after 300 minutes so that the summary and the upload still run; a run cut short reports what it reached.
+The mutants are split into four shards, one runner each, because the whole set on one runner could take longer than a job may run.
+Each shard stays green whatever it finds: cargo-mutants exits non-zero for a missed or timed-out mutant, and the step has `continue-on-error`.
+Read each shard's step summary, which counts caught, missed, timed-out and unviable mutants and lists the first 50 missed ones, and `mutants.out/` in its artifact, which has all of them with their diffs.
+The step stops after 300 minutes so that the summary and the upload still run; a shard cut short reports what it reached.
 `fuzz` runs every target even after one fails, then fails if any did, and uploads `fuzz/artifacts/<target>/` with the crashing inputs.
 The fuzz crate is not a dependency of the program, so nothing of it reaches a release; its dependencies get their own `cargo deny` run because `ci.yaml`'s `deny` sees only the program's.
 Neither job sets `RUSTFLAGS=-D warnings`: a mutant that leaves a value unused has to build and be tested, not be counted as unviable.
@@ -160,7 +161,7 @@ cargo +nightly-2026-10-15 fuzz run <target> artifacts/<target>/<crash-file>   # 
 Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`, and the three checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`.
 `coverage` and `nft-real (debian:13)` are new in v0.1.1 and have to be added to the list by hand; `coverage` belongs there, because a gate that is not required lets a pull request merge while it is red.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
-No job of `release.yaml` or `scheduled.yaml` may share its name with one of these checks (today: `validate-tag`, `draft-release`, `rebuild`, `verify-release`, `mutants`, `fuzz`): GitHub matches a required check by name on a commit, whatever workflow reported it.
+No job of `release.yaml` or `scheduled.yaml` may share its name with one of these checks (today: `validate-tag`, `draft-release`, `rebuild`, `verify-release`, `mutants (<k>/4)` and `fuzz`): GitHub matches a required check by name on a commit, whatever workflow reported it.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
 ## Action pins

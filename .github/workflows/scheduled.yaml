@@ -3,10 +3,10 @@
 # Neither job is a gate. They run on main once a week and on dispatch, never on a pull
 # request, and neither is or may become a required check; no job here may share its name
 # with one either, because GitHub matches a required check by name on a commit, whatever
-# workflow reported it. What they report is the run and its artifacts: `mutants` uploads
-# cargo-mutants' output, with the mutants no test caught, and stays green; `fuzz` turns red
-# when a target finds an input that crashes it and uploads that input. .github/ACTIONS.md
-# says how to read both and how to reproduce them locally.
+# workflow reported it. What they report is the run and its artifacts: each `mutants`
+# shard uploads cargo-mutants' output, with the mutants no test caught, and stays green;
+# `fuzz` turns red when a target finds an input that crashes it and uploads that input.
+# .github/ACTIONS.md says how to read both and how to reproduce them locally.
 #
 # A schedule runs only on the default branch, and GitHub disables it after 60 days without
 # activity in the repository. A dispatch runs both jobs on the branch it is started on.
@@ -35,9 +35,15 @@ env:
 
 jobs:
   # Every mutant cargo-mutants can make of the crate, each built and tested with the suite of
-  # `cargo test`. A missed mutant is a change to the code that no test notices. The step's own
-  # timeout ends a slow run early enough for the summary and the upload to run.
+  # `cargo test`. A missed mutant is a change to the code that no test notices. The mutants are
+  # split into four shards on four runners, since one runner could need longer than a job may
+  # run; the step's own timeout ends a slow shard early enough for the summary and the upload.
   mutants:
+    name: mutants (${{ matrix.shard }}/4)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     permissions:
@@ -62,14 +68,18 @@ jobs:
       - name: cargo mutants
         continue-on-error: true
         timeout-minutes: 300
-        run: cargo mutants --cargo-arg=--locked --jobs 2 --output target/mutants
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: cargo mutants --cargo-arg=--locked --jobs 2 --shard "$SHARD/4" --output target/mutants
 
       - name: Summary
         if: always()
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           out=target/mutants/mutants.out
           {
-            echo "### cargo mutants"
+            echo "### cargo mutants, shard $SHARD/4"
             for outcome in caught missed timeout unviable; do
               if [ -f "$out/$outcome.txt" ]; then
                 echo "- $outcome: $(wc -l < "$out/$outcome.txt")"
@@ -79,7 +89,7 @@ jobs:
             done
             if [ -s "$out/missed.txt" ]; then
               echo
-              echo "Missed (first 50; all of them are in the artifact \`mutants\`):"
+              echo "Missed (first 50; all of them are in the artifact \`mutants-$SHARD\`):"
               echo '```'
               head -n 50 "$out/missed.txt"
               echo '```'
@@ -90,7 +100,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutants
+          name: mutants-${{ matrix.shard }}
           path: target/mutants
 
   # Each target of the fuzz/ crate for 5 minutes, from its corpus in fuzz/corpus/<target>,
