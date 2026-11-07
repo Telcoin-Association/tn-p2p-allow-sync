@@ -2,13 +2,16 @@
 # Every target runs the command CI or the release procedure runs, so a local pass means a CI
 # pass (.github/ACTIONS.md) and a release step behaves the same from make or by hand.
 
-.PHONY: help ci nft-real release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
+.PHONY: help ci nft-real nft-real-docker release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
 
 .DEFAULT_GOAL := help
 
 help:
 	@echo "make ci                        the five gates of ci.yaml: fmt, clippy, test, deny, audit"
 	@echo "make nft-real                  the real-kernel nft test (tests/real_nft.rs) under sudo"
+	@echo "make nft-real-docker [DISTRO=ubuntu:24.04|ubuntu:22.04|debian:13]"
+	@echo "                               the same test without sudo, as root in a privileged container of"
+	@echo "                               DISTRO (default ubuntu:24.04): its nft and ip, this machine's kernel"
 	@echo "make release-<step> TAG=vX.Y.Z[-rcN]"
 	@echo "                               one step of release/release.sh: prep, tag, check-tag, notes,"
 	@echo "                               draft, build, sign, verify or publish (release/docs/signing.md)"
@@ -38,6 +41,26 @@ nft-real:
 		jq -r 'select(.reason == "compiler-artifact" and .target.name == "real_nft" and .profile.test) | .executable') && \
 	test -x "$$bin" && \
 	TN_REAL_NFT_REQUIRED=1 sudo -E "$$bin" --ignored --exact real_kernel_nft --nocapture --test-threads=1
+
+# the same test without sudo: the test binary is built as the invoking user for the musl target,
+# so it runs on any distro's libc, and only a throwaway container of DISTRO runs it as root, with
+# that distro's nftables and iproute2 against this machine's kernel; --privileged is for the
+# network namespace and the veth pair, and the table lives in the container's network namespace,
+# not the host's. Only the checkout is mounted, read-write and at its own path, because the
+# binary writes target/real-nft/ under the path it was compiled at; that directory is made first,
+# as the user, so the files root leaves in it can be removed. CI (nft-real.yaml) is the
+# authority, on each Ubuntu release's own kernel; this is the local, sudo-free way to run it
+nft-real-docker: DISTRO ?= ubuntu:24.04
+nft-real-docker:
+	cargo test --locked --no-run --test real_nft --target x86_64-unknown-linux-musl
+	bin=$$(cargo test --locked --no-run --test real_nft --target x86_64-unknown-linux-musl --message-format=json | \
+		jq -r 'select(.reason == "compiler-artifact" and .target.name == "real_nft" and .profile.test) | .executable') && \
+	test -x "$$bin" && \
+	case "$$bin" in "$(CURDIR)"/*) ;; *) echo "$$bin is outside $(CURDIR), all the container sees" >&2; exit 2;; esac && \
+	mkdir -p target/real-nft && \
+	docker run --rm --privileged -e DEBIAN_FRONTEND=noninteractive -e TN_REAL_NFT_REQUIRED=1 \
+		-v "$(CURDIR):$(CURDIR)" -w "$(CURDIR)" "$(DISTRO)" \
+		sh -c 'apt-get -qq update && apt-get -qq install -y --no-install-recommends nftables iproute2 >/dev/null && exec "$$0" --ignored --exact real_kernel_nft --nocapture --test-threads=1' "$$bin"
 
 # verify rebuilds the program from the tag and compares it with the release's, unless
 # TN_P2P_ALLOW_REBUILD=0 is given; sign rebuilds only with TN_P2P_ALLOW_REBUILD=1
