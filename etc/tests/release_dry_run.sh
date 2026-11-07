@@ -15,10 +15,11 @@
 # The build is real: hook_build builds the program twice with etc/Dockerfile in BUILD_IMAGE,
 # and verify rebuilds it, so the run also proves the build reproducible; it needs docker
 # with buildx and the network (the images, crates.io). RELEASE_BUILD_STUB=1 replaces the one
-# docker build (tn_build_program) with a script that prints the five --version lines, for a
-# quick run; it is refused in CI, which always builds for real. prep's git-cliff and the
-# --version checks run in docker either way. cargo (prep's cargo update) and gh are stubs
-# that log their calls; the run requires that gh never ran and that origin got no tag.
+# docker build (tn_build_program) with a small static ELF program that prints the five
+# --version lines (mkelf below), for a quick run; it is refused in CI, which always builds for
+# real. prep's git-cliff and the --version checks run in docker either way. cargo (prep's
+# cargo update) and gh are stubs that log their calls; the run requires that gh never ran and
+# that origin got no tag.
 #
 # The remote leg signs an unsigned copy of the release again the way the maintainer does it
 # from the laptop, with make release-sign-remote REMOTE=buildbox:<clone>, and verifies it with
@@ -204,6 +205,68 @@ stub gh 1
 PATH=$bin:$PATH
 export PATH
 
+# mkelf [-i INTERP] FILE LINE...: writes FILE, a static x86-64 ELF64 program (one PT_LOAD and
+# no PT_INTERP program header) that prints the LINEs and exits 0. With -i it also has a
+# PT_INTERP header naming INTERP, as a dynamically linked program has; that one is never run.
+cat >"$FX/mkelf" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+interp=
+if [ "$1" = -i ]; then
+    interp=$2
+    shift 2
+fi
+out=$1
+shift
+msg=
+for line in "$@"; do msg=$msg$line$'\n'; done
+# le VALUE N: VALUE as N little-endian bytes, in printf's octal escapes
+le() {
+    local v=$1 n=$2
+    while [ "$n" -gt 0 ]; do
+        printf '\\%03o' $((v & 255))
+        v=$((v >> 8))
+        n=$((n - 1))
+    done
+}
+base=4194304
+nph=1
+if [ -n "$interp" ]; then nph=2; fi
+code=$((64 + 56 * nph))
+len=${#msg}
+ioff=$((code + 33 + len))
+size=$ioff
+if [ -n "$interp" ]; then size=$((ioff + ${#interp} + 1)); fi
+{
+    # ELF header: \177ELF, ELFCLASS64, ELFDATA2LSB, EV_CURRENT, padding; ET_EXEC, EM_X86_64,
+    # e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, then no
+    # section headers
+    printf "\\177ELF$(le 2 1)$(le 1 1)$(le 1 1)$(le 0 9)$(le 2 2)$(le 62 2)$(le 1 4)$(le $((base + code)) 8)$(le 64 8)$(le 0 8)$(le 0 4)$(le 64 2)$(le 56 2)$(le "$nph" 2)$(le 64 2)$(le 0 2)$(le 0 2)"
+    if [ -n "$interp" ]; then
+        # PT_INTERP, PF_R, the path after the message
+        printf "$(le 3 4)$(le 4 4)$(le "$ioff" 8)$(le $((base + ioff)) 8)$(le $((base + ioff)) 8)$(le $((${#interp} + 1)) 8)$(le $((${#interp} + 1)) 8)$(le 1 8)"
+    fi
+    # PT_LOAD, PF_R|PF_X, the whole file at base
+    printf "$(le 1 4)$(le 5 4)$(le 0 8)$(le "$base" 8)$(le "$base" 8)$(le "$size" 8)$(le "$size" 8)$(le 4096 8)"
+    # write(1, msg, len); exit(0): mov eax,1; mov edi,1; lea rsi,[rip+16]; mov edx,len;
+    # syscall; mov eax,60; xor edi,edi; syscall, then the message
+    printf "$(le 184 1)$(le 1 4)$(le 191 1)$(le 1 4)$(le 72 1)$(le 141 1)$(le 53 1)$(le 16 4)$(le 186 1)$(le "$len" 4)$(le 15 1)$(le 5 1)$(le 184 1)$(le 60 4)$(le 49 1)$(le 255 1)$(le 15 1)$(le 5 1)"
+    printf '%s' "$msg"
+    if [ -n "$interp" ]; then printf '%s\000' "$interp"; fi
+} >"$out"
+chmod 0755 "$out"
+EOF
+chmod 0755 "$FX/mkelf"
+
+# the build stub: tn_build_program writes the program mkelf makes for the five --version lines
+build_stub="
+# dry-run fixture: a small static ELF program that prints the five --version lines stands in
+# for the docker build of the program
+tn_build_program() {
+    mkdir -p \"\$1\"
+    '$FX/mkelf' \"\$1/\$PROJECT\" \"\$PROJECT \$VERSION\" \"commit \$COMMIT\" \"target \$TRIPLE\" 'snapshot-versions 1' 'config-version 1'
+}"
+
 # the signing repository: the checked-out release/ tree with alice as the only key
 w=$FX/signing-work
 git -C "$FX" init -q "$w"
@@ -223,25 +286,7 @@ git -C "$FX" init -q "$w"
 git -C "$ROOT" ls-files -s | awk -F '\t' '{ split($1, m, " ") } m[1] != "160000" && $2 != ".gitmodules" { print $2 }' >"$FX/files"
 tar -cf - -C "$ROOT" -T "$FX/files" | tar -xf - -C "$w"
 fx_git -C "$w" submodule add -q "$FX/signing.git" release
-if [ "$STUB" = 1 ]; then
-    cat >>"$w/release.conf" <<'EOF'
-
-# dry-run fixture (RELEASE_BUILD_STUB=1): a script that prints the five --version lines
-# stands in for the docker build of the program
-tn_build_program() {
-    mkdir -p "$1"
-    cat >"$1/$PROJECT" <<STUB
-#!/bin/sh
-echo '$PROJECT $VERSION'
-echo 'commit $COMMIT'
-echo 'target $TRIPLE'
-echo 'snapshot-versions 1'
-echo 'config-version 1'
-STUB
-    chmod 0755 "$1/$PROJECT"
-}
-EOF
-fi
+if [ "$STUB" = 1 ]; then printf '%s\n' "$build_stub" >>"$w/release.conf"; fi
 git -C "$w" add -A
 git -C "$w" commit -q -m 'chore: the tree of tn-p2p-allow-sync for a release dry run' \
     -m "The tracked files of $ROOT, with tn-release-signing $signing_sha and a throwaway key."
@@ -467,17 +512,13 @@ sourced() {
         _ "$tag" "$r1" "$@"
 }
 
-# version_case WHAT RC TEXT LINE...: tn_check_version on a program printing LINE..., with $tag
-# and the release commit, exits RC with TEXT on stderr, so a failure is the check's own and
-# not, say, docker's.
+# version_case WHAT RC TEXT LINE...: tn_check_version on a static program printing LINE...,
+# with $tag and the release commit, exits RC with TEXT on stderr, so a failure is the check's
+# own and not, say, docker's.
 version_case() {
-    local what=$1 want=$2 text=$3 line
+    local what=$1 want=$2 text=$3
     shift 3
-    {
-        printf '#!/bin/sh\n'
-        for line in "$@"; do printf "echo '%s'\n" "$line"; done
-    } >"$FX/program"
-    chmod 0755 "$FX/program"
+    "$FX/mkelf" "$FX/program" "$@"
     sourced tn_check_version "$FX/program"
     if [ "$T_RC" = "$want" ] && grep -F -q -e "$text" "$T_ERR"; then
         t_ok "$what"
