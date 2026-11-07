@@ -645,20 +645,24 @@ gated() {
         _ "$tag" "$r1" "$FX/gate-work" "$draft" "$@"
 }
 
-# check_runs ID=NAME=CONCLUSION...: check-runs.json, the check runs on the release commit; the
-# conclusion pending stands for a run in progress
+# check_runs ID=NAME=CONCLUSION[@APP]...: check-runs.json, the check runs on the release commit,
+# each reported by the app whose slug is APP, github-actions without one; the conclusion
+# pending stands for a run in progress
 check_runs() {
-    local r id name concl state sep=
+    local r id name concl state app sep=
     {
         printf '{"total_count": %d, "check_runs": [' "$#"
         for r in "$@"; do
+            app=github-actions
+            case $r in *@*) app=${r##*@} r=${r%@*} ;; esac
             id=${r%%=*}
             r=${r#*=}
             name=${r%=*}
             concl="\"${r##*=}\""
             state=completed
             if [ "$concl" = '"pending"' ]; then state=in_progress concl=null; fi
-            printf '%s{"id": %s, "name": "%s", "status": "%s", "conclusion": %s}' "$sep" "$id" "$name" "$state" "$concl"
+            printf '%s{"id": %s, "name": "%s", "status": "%s", "conclusion": %s, "app": {"slug": "%s"}}' \
+                "$sep" "$id" "$name" "$state" "$concl" "$app"
             sep=', '
         done
         printf ']}\n'
@@ -699,6 +703,13 @@ gated '' hook_check_tag_extra "$r1" always
 expect_rc 1 "check-tag refuses a commit with a failed, a running and a missing required check"
 expect_err "CI has not passed on $r1: clippy (failure), nft-real (ubuntu-22.04) (in_progress), nft-real (debian:13) (no check run)" \
     "it names each of them and what it found"
+
+# another app posts same-named runs: a success newer than test's failure, and fmt's only run
+check_runs "${green[@]:1}" 41=fmt=success@other-app 42=test=failure 43=test=success@other-app
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 1 "check-tag counts only the check runs of GitHub Actions"
+expect_err "CI has not passed on $r1: fmt (no check run), test (failure)" \
+    "another app's newer success masks no failure and stands in for no check"
 
 printf '{"isDraft": false, "isPrerelease": false, "author": {"login": "github-actions[bot]"}, "assets": []}\n' >"$GHFX/release.json"
 gated '' hook_check_tag_extra "$r1" always

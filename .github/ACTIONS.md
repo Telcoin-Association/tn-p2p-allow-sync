@@ -167,6 +167,8 @@ Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `d
 `coverage` and `nft-real (debian:13)` are new in v0.1.1 and have to be added to the list by hand; `coverage` belongs there, because a gate that is not required lets a pull request merge while it is red.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
 No job of `release.yaml` or `scheduled.yaml` may share its name with one of these checks (today: `validate-tag`, `draft-release`, `rebuild`, `verify-release`, `mutants (<k>/4)`, `fuzz`, `deny-weekly` and `audit-weekly`): GitHub matches a required check by name on a commit, whatever workflow reported it.
+It matches by name whatever app reported it, too, and any GitHub App installed on the repository with `checks: write` can post a check run under a required check's name.
+The release gate of `release.conf` (`tn_check_ci_green`) therefore counts only check runs of the GitHub Actions app (`app.slug` `github-actions`), and branch protection should pin each required check's source to GitHub Actions as well (the app chosen beside each check's name in the rule), so a pull request cannot merge on another app's run either.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
 ## Action pins

@@ -45,7 +45,7 @@ Its hooks:
   With `TN_P2P_ALLOW_REBUILD=1` it also rebuilds the binary from the tag's commit, with that commit's `etc/Dockerfile` and `BUILD_IMAGE`, and requires the same file; `build`'s own check skips the rebuild, because `hook_build` has just built twice.
 - `hook_check_tag_extra` runs inside `check-tag`, and so in `tag` before it creates the tag and in `build`, `sign`, `verify` and `publish`, on the tag's commit.
   It refuses a commit whose `Cargo.toml`, `.cargo/config.toml`, `.cargo/config` or `etc/Dockerfile` has a line, outside a `#` comment, that names both `panic` and `abort` in any case: the release build keeps `panic = "unwind"`, so that a panic exits 101 and the deployment scripts read it as a bug.
-  It also requires the newest check run of each name in `TN_REQUIRED_CHECKS` to have concluded `success` on that commit ([The required checks](#the-required-checks)); a dry run and a published release skip that, and `tag` and `sign` leave it to `check-tag` in CI on a host without `gh`.
+  It also requires the newest GitHub Actions check run of each name in `TN_REQUIRED_CHECKS` to have concluded `success` on that commit ([The required checks](#the-required-checks)); a dry run and a published release skip that, and `tag` and `sign` leave it to `check-tag` in CI on a host without `gh`.
 - `hook_changelog` writes the new `CHANGELOG.md` section from `cliff.toml`.
 
 `release-dry-run` runs the static and unwind checks on every pull request, so a change that breaks either fails before it merges.
@@ -94,7 +94,7 @@ After publishing, the deployment scripts pick the release up only when a `chore`
 ### The required checks
 
 `TN_REQUIRED_CHECKS` in `release.conf` names the ten checks a tag's commit must have passed, the required checks of `main` ([`.github/ACTIONS.md`](../.github/ACTIONS.md#required-checks)): `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit`, `release-dry-run`, `nft-real (ubuntu-24.04)`, `nft-real (ubuntu-22.04)` and `nft-real (debian:13)`.
-For each name the newest check run on the commit counts, whatever started it, and it must have concluded `success`.
+For each name the newest check run of the GitHub Actions app on the commit counts, whatever started it, and it must have concluded `success`; a same-named run from another GitHub App, which any app installed on the repository with `checks: write` can post, is ignored.
 A run concluded `skipped` or `neutral` checked nothing, so it is passed over, and a name with only such runs counts as having none.
 A name with no run, a run still queued or in progress, and a failed, cancelled or timed-out run all stop the step with exit 1, and the error lists each one with its state.
 Branch protection does not ensure this alone: a pull request's checks ran on its head, not on the commit its merge leaves on `main`, an admin can merge past them, and a red run on a push to `main` gates nothing.
