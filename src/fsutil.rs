@@ -1,13 +1,14 @@
 //! The state dir: its safety checks, reads that never follow a symlink, atomic writes, the run lock and the effective uid.
 //!
 //! Every file the tool reads or writes at run time lives in the state dir, so no temporary file ever lands in `/tmp`.
-//! The tool never creates the dir: the scripts create it as root with mode 0700, and [`StateDir::open`] refuses one that is a symlink, is not a directory, is owned by another uid or has any mode other than 0700.
+//! The tool never creates the dir: the scripts create it as root with mode 0700, and [`StateDir::open`] refuses one that is a symlink, is not a directory, is owned by another uid or has any mode other than 0700, and a path whose last component is empty (a trailing `/`), `.` or `..`, behind which the kernel would follow a symlink.
 //!
 //! Files are opened with `O_NOFOLLOW` through [`OpenOptionsExt::custom_flags`], a safe API, so a symlink planted in the dir is refused rather than followed; the dir itself is opened for its fsync with `O_NOFOLLOW|O_DIRECTORY`.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -284,6 +285,21 @@ pub(crate) fn remove_leftover(path: &Path) -> Result<(), FsError> {
     })
 }
 
+/// Why [`StateDir::open`] refused a path that does not [end in a name](ends_in_a_name).
+const NOT_A_NAME: &str = "does not end in a name; a trailing /, . or .. would follow a symlink";
+
+/// Whether the last component of `path`, byte for byte, is a name: not empty, as after a trailing `/`, and not `.` or `..`.
+///
+/// Only then do `lstat` and `O_NOFOLLOW` see the entry itself: the kernel follows a symlink before a trailing `/` or `/.`, and `..` is a parent.
+/// [`Path::components`] cannot tell, since it drops a trailing `/` and `.`; a path that ends in a name also has a [`std::path::Component::Normal`] last.
+pub fn ends_in_a_name(path: &Path) -> bool {
+    path.as_os_str()
+        .as_bytes()
+        .rsplit(|&b| b == b'/')
+        .next()
+        .is_some_and(|last| !matches!(last, b"" | b"." | b".."))
+}
+
 /// Gives the new file `file` exactly `mode`, writes `bytes` and syncs it; closing it is left to the drop.
 fn fill(mut file: File, path: &Path, bytes: &[u8], mode: u32) -> Result<(), FsError> {
     // the mode given at creation is masked by the umask
@@ -305,8 +321,11 @@ pub struct StateDir {
 impl StateDir {
     /// Checks the state dir at `path` and returns it.
     ///
-    /// Refused with [`FsError::StateDirInvalid`]: nothing at `path`, a symlink (checked with `symlink_metadata`, never followed), anything but a directory, an owner other than the effective uid, a mode other than exactly 0700, or an effective uid that cannot be read.
+    /// Refused with [`FsError::StateDirInvalid`]: a path that does not [end in a name](ends_in_a_name), nothing at `path`, a symlink (checked with `symlink_metadata`, never followed), anything but a directory, an owner other than the effective uid, a mode other than exactly 0700, or an effective uid that cannot be read.
     pub fn open(path: &Path) -> Result<Self, FsError> {
+        if !ends_in_a_name(path) {
+            return Err(FsError::state_dir(path, NOT_A_NAME.to_owned()));
+        }
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -567,6 +586,33 @@ mod tests {
     }
 
     #[test]
+    fn a_symlinked_dir_behind_a_trailing_slash_or_dot_is_refused() -> TestResult {
+        let temp = TempDir::new("symlink-slash")?;
+        let real = temp.join("real");
+        fs::create_dir(&real)?;
+        fs::set_permissions(&real, Permissions::from_mode(0o700))?;
+        symlink(&real, temp.join("link"))?;
+        // the kernel follows `link` before a trailing `/` or `/.`, so lstat would see `real`
+        for entry in ["link", "real"] {
+            for suffix in ["/", "//", "/.", "/./", "/..", "/../"] {
+                let path = PathBuf::from(format!("{}{suffix}", temp.join(entry).display()));
+                let message = reason(StateDir::open(&path))?;
+                assert!(message.ends_with(&format!(": {NOT_A_NAME}")), "{message}");
+            }
+        }
+        for path in ["", ".", "..", "/", "//", "a/.", "./.."] {
+            let message = reason(StateDir::open(Path::new(path)))?;
+            assert!(message.ends_with(&format!(": {NOT_A_NAME}")), "{message}");
+        }
+        assert!(ends_in_a_name(Path::new("a")));
+        assert!(ends_in_a_name(Path::new("/var/lib/telcoin-p2p-allow")));
+        assert!(ends_in_a_name(Path::new("./.state")));
+        assert!(ends_in_a_name(Path::new("a/...")));
+        StateDir::open(&real)?;
+        Ok(())
+    }
+
+    #[test]
     fn a_file_is_refused() -> TestResult {
         let temp = TempDir::new("file")?;
         let file = temp.join("file");
@@ -598,8 +644,8 @@ mod tests {
 
     #[test]
     fn a_dir_of_another_uid_is_refused() -> TestResult {
-        // `/` belongs to root and is not 0700, so it fails whichever check comes first
-        let message = reason(StateDir::open(Path::new("/")))?;
+        // `/proc` belongs to root and is not 0700, so it fails whichever check comes first
+        let message = reason(StateDir::open(Path::new("/proc")))?;
         if effective_uid()? != 0 {
             assert!(
                 message.contains(": is owned by uid 0, not the effective uid "),
