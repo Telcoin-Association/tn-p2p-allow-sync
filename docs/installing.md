@@ -39,6 +39,11 @@ No version file is written: the installed binary's own `--version` is the record
 On exit 1 it refuses with nothing changed and removes the state dir again; otherwise it writes the units and enables them.
 [contract.md](contract.md) describes every input and output the scripts and the binary exchange.
 
+The keyring `tn_p2p_allow_install` checks the signatures against in step 2 is `tn-node-deployment`'s own copy of the maintainer keys, the set that signs the node's releases, and not `release/keys` of this repository, which `release.sh`, CI and the check by hand below read.
+Its policy differs as well: it refuses a bad, expired or revoked signature, but only warns on one by a key it does not hold (Co-signer policy in [release/KEYS.md](../release/KEYS.md#co-signer-policy)).
+So a key rotation, an expiry extension or a revocation has to update both: `release/keys` through this repository's submodule pointer, as [release/KEYS.md](../release/KEYS.md#changing-this-table) describes, and `lib/release-keys/` in a release of `tn-node-deployment`.
+Until the second lands, a release signed by a new key fails to install, an extended key still expires there on its old date, and a revoked key is still accepted.
+
 ## Units
 
 | Unit | Runs | Key settings |
