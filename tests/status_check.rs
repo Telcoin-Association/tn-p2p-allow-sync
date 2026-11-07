@@ -367,6 +367,38 @@ fn status_text_after_a_sync_is_the_file_then_the_live_table() -> TestResult {
     Ok(())
 }
 
+/// The top-level keys of the JSON object `text`, in the order the text lists them.
+///
+/// `serde_json::Map` sorts its keys (the crate is built without `preserve_order`), so the order is read with a visitor of its own.
+fn json_keys(text: &str) -> Res<Vec<String>> {
+    struct Keys;
+
+    impl<'de> serde::de::Visitor<'de> for Keys {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut keys = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                map.next_value::<serde::de::IgnoredAny>()?;
+                keys.push(key);
+            }
+            Ok(keys)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let keys = serde::Deserializer::deserialize_map(&mut deserializer, Keys)?;
+    deserializer.end()?;
+    Ok(keys)
+}
+
 #[test]
 fn status_json_is_one_line_with_every_key_and_none_of_the_script_keys() -> TestResult {
     let mut bed = Bed::new("status-json")?;
@@ -377,25 +409,24 @@ fn status_json_is_one_line_with_every_key_and_none_of_the_script_keys() -> TestR
     assert_eq!(ran.stdout.matches('\n').count(), 1, "{}", ran.stdout);
     assert!(ran.stdout.starts_with('{') && ran.stdout.ends_with("}\n"));
     let object = ran.json()?;
-    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
-    keys.sort_unstable();
+    // in the binary's order: the scripts splice their keys in front of the line as printed
     assert_eq!(
-        keys,
+        json_keys(&ran.stdout)?,
         [
-            "age_secs",
+            "loaded",
+            "epoch",
             "allowed_v4",
             "allowed_v6",
-            "counters",
-            "dns_skipped",
-            "epoch",
+            "static",
             "floor",
             "keys",
+            "dns_skipped",
             "last_good",
-            "loaded",
+            "age_secs",
             "stale",
-            "stale_reason",
             "stale_since",
-            "static",
+            "stale_reason",
+            "counters",
         ]
     );
     for key in SCRIPT_KEYS {
