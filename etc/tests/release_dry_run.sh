@@ -596,7 +596,8 @@ expect_err "Cargo.toml at $abort sets the panic strategy to abort (line " "it na
 
 # gh for the gates: logs its arguments to GH_FIXTURE/gh.log, then answers from the files there,
 # applying --jq with jq as gh does: runs.json (run list), artifact-RUN-NAME/ (run download),
-# release.json (release view; without it the release does not exist), check-runs.json (api)
+# release.json (release view; without it the release does not exist), check-runs.json and
+# artifacts.json (api, a commit's check runs and a run's artifacts)
 GHFX=$FX/gh-fixture
 mkdir -p "$GHFX" "$FX/gate-bin"
 cat >"$FX/gate-bin/gh" <<'EOF'
@@ -625,6 +626,7 @@ case $cmd in
         if [ ! -f "$GH_FIXTURE/release.json" ]; then echo "release not found" >&2; exit 1; fi
         exec jq -r "$jqx" "$GH_FIXTURE/release.json" ;;
     api\ */check-runs*) exec jq -r "$jqx" "$GH_FIXTURE/check-runs.json" ;;
+    api\ */artifacts*) exec jq -r "$jqx" "$GH_FIXTURE/artifacts.json" ;;
     *) echo "fixture gh: no answer for gh $cmd" >&2; exit 1 ;;
 esac
 EOF
@@ -723,12 +725,28 @@ printf '[{"databaseId": 302, "status": "completed", "conclusion": "success", "he
     "$tag" >"$GHFX/runs.json"
 mkdir -p "$GHFX/artifact-302-rebuild-$tag"
 printf '%s  tn-p2p-allow-sync\n' "$packed" >"$GHFX/artifact-302-rebuild-$tag/program.sha256"
+# artifacts NAME=EXPIRED...: artifacts.json, the artifacts of run 302
+artifacts() {
+    local a sep=
+    {
+        printf '{"total_count": %d, "artifacts": [' "$#"
+        for a in "$@"; do
+            printf '%s{"name": "%s", "expired": %s}' "$sep" "${a%=*}" "${a##*=}"
+            sep=', '
+        done
+        printf ']}\n'
+    } >"$GHFX/artifacts.json"
+}
+artifacts "rebuild-$tag=false"
 gated true hook_check_release_files "$gate_rel"
 expect_rc 0 "sign accepts a draft whose program the CI rebuild of $tag also gave"
 expect_err "the CI rebuild of $tag from $r1 (run 302 of release.yaml) gave the same tn-p2p-allow-sync, sha256 $packed" \
     "it names the run and the sha256"
 check "it looks for the release workflow's run on the push of $tag at the release commit" \
     grep -q -F -e "run list --repo Telcoin-Association/tn-p2p-allow-sync --workflow release.yaml --commit $r1 --event push " "$GHFX/gh.log"
+check "it looks up that run's artifacts before the download" \
+    test "$(awk '$1 == "api" && $2 == "repos/Telcoin-Association/tn-p2p-allow-sync/actions/runs/302/artifacts?per_page=100" { a = NR }
+        $1 == "run" && $2 == "download" { d = NR } END { print (a && d && a < d) }' "$GHFX/gh.log")" = 1
 check "it downloads that run's artifact rebuild-$tag" \
     grep -q -x -F -e "run download 302 --repo Telcoin-Association/tn-p2p-allow-sync -n rebuild-$tag -D $FX/gate-work/ci-rebuild" "$GHFX/gh.log"
 
@@ -738,6 +756,20 @@ gated true hook_check_release_files "$gate_rel"
 expect_rc 1 "sign refuses a draft whose program the CI rebuild did not give"
 expect_err "the draft's tn-p2p-allow-sync has sha256 $packed, but the CI rebuild of $tag from $r1 (run 302 of release.yaml) gave sha256 $drift" \
     "it names both sha256s"
+
+artifacts real-nft-debian-13=false "rebuild-$tag=true"
+gated true hook_check_release_files "$gate_rel"
+expect_rc 1 "sign stops when the run's artifact rebuild-$tag has expired"
+expect_err "the artifact rebuild-$tag of run 302 of release.yaml has expired" "it says the artifact expired"
+expect_err "re-run the release workflow's rebuild job of run 302" "it says to re-run the rebuild job"
+check "it does not try to download an expired artifact" \
+    test -z "$(awk '$1 == "run" && $2 == "download"' "$GHFX/gh.log")"
+
+artifacts real-nft-debian-13=false
+gated true hook_check_release_files "$gate_rel"
+expect_rc 1 "sign stops when the run has no artifact rebuild-$tag"
+expect_err "run 302 of release.yaml for $tag has no artifact rebuild-$tag" "it says the artifact is missing"
+expect_err "re-run the release workflow's rebuild job of run 302" "it says to re-run the rebuild job"
 
 printf '[{"databaseId": 301, "status": "completed", "conclusion": "failure", "headBranch": "v0.0.1"}]\n' >"$GHFX/runs.json"
 gated true hook_check_release_files "$gate_rel"

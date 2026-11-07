@@ -118,6 +118,9 @@ While the release is a draft, `sign`, `verify` and `publish` take the newest run
 - `GitHub has no run of release.yaml for the push of vX.Y.Z ...`, or `run <id> of release.yaml for vX.Y.Z is in_progress ...`, or `queued` (exit 2): the job has not finished yet; wait for it (`gh run watch <id>`) and run the step again.
 - `run <id> of release.yaml for vX.Y.Z concluded failure ...` (exit 1): there is no rebuild to compare with.
   Read the run's log, fix the cause, which is usually a failed download, re-run the run's failed jobs (`gh run rerun <id> --failed`), and run the step again.
+- `the artifact rebuild-vX.Y.Z of run <id> of release.yaml has expired ...`, or `run <id> of release.yaml for vX.Y.Z has no artifact rebuild-vX.Y.Z ...` (exit 1): the run succeeded, but its artifact is past the repository's artifact retention or was deleted, so there is nothing to compare with.
+  Re-run the run's `rebuild` job (`gh run view <id>` lists its jobs, then `gh run rerun --job <job-id>`) and run the step again.
+  GitHub re-runs a job only within 30 days of the run, less than the default retention of 90 days, so an artifact that expired under that default cannot be made again on that run.
 - `the draft's tn-p2p-allow-sync has sha256 <a>, but the CI rebuild of vX.Y.Z ... gave sha256 <b>` (exit 1): the program on the draft is not the one the tag builds.
   Sign nothing, publish nothing, and treat the build server as compromised until you know the cause.
   Build the tag on a machine you trust with `bash etc/ci-rebuild.sh vX.Y.Z <dir>`, which writes `<dir>/program.sha256` as the job does.
