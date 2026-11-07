@@ -15,12 +15,15 @@ Everything below describes what the code does; a change to any of it is a change
 | Memory file | 1 | `"version":1` in `state.json` | `state-invalid`, exit 2 |
 | nft program | schema 1 | the header comment of `current.nft` | not read back; the text is fixed by this page |
 
+Every build reads `status` and `state.json` of version 1, so the scripts can install a newer binary with `--p2p-committee sync` and keep the memory and the status it finds.
+Raising the status or memory version is a contract change, and the upgrade to such a build needs `off`, then `on`, on every host.
+
 ### `--version`
 
 `tn-p2p-allow-sync --version` prints five lines on stdout and exits 0:
 
 ```text
-tn-p2p-allow-sync 0.1.0
+tn-p2p-allow-sync 0.1.1
 commit 0123456789abcdef0123456789abcdef01234567
 target x86_64-unknown-linux-musl
 snapshot-versions 1
@@ -36,6 +39,20 @@ config-version 1
 
 The deployment scripts require line 1 to equal `tn-p2p-allow-sync` and the pinned tag without its `v`, the `config-version` line to equal the version they write, and the `snapshot-versions` line to contain 1.
 The release checks require the first three lines.
+
+## Release layout
+
+A release `vX.Y.Z` or `vX.Y.Z-rcN` carries three assets, which the deployment scripts install from:
+
+| Asset | What it holds |
+|---|---|
+| `tn-p2p-allow-sync-<tag>-x86_64-unknown-linux-musl.tar.gz` | one directory of the same name without `.tar.gz`, holding exactly `tn-p2p-allow-sync`, `LICENSE-APACHE`, `LICENSE-MIT` and `NOTICE` |
+| `SHA256SUMS` | one line, the sha256 of the tarball |
+| `SHA256SUMS.asc` | the maintainers' detached signatures over `SHA256SUMS` |
+
+The scripts require exactly one tarball line in `SHA256SUMS` and exactly those four files in the tarball, and refuse anything else.
+Adding a second target triple, or another file to the tarball, is a contract change.
+[installing.md](installing.md) describes how the scripts check and install a release.
 
 ## Command line
 
@@ -54,6 +71,7 @@ usage: tn-p2p-allow-sync [--state-dir DIR] [--nft PATH] COMMAND
 - A flag value or a `capture-floor` file that is empty or starts with `-` is a usage error, so a missing value never swallows the next flag; write `./-name` for such a file.
 - `--wait` takes decimal digits only, in seconds.
 - `--state-dir` defaults to `/var/lib/telcoin-p2p-allow`.
+  It loses any trailing `/`; a value whose last component is then `.` or `..`, or that was only slashes, is a usage error, since the kernel follows a symlink behind a trailing `/`, `.` or `..` and the state dir checks must see the dir itself.
 - `--nft` defaults to `/usr/sbin/nft`.
   It must be an absolute path: `sync`, `render`, `check` and `status` refuse a relative one with `error reason=usage` and exit 2.
   An absolute path other than the default is accepted with one `nft-path path=…` warning on every run.
@@ -68,13 +86,13 @@ nft refusing a call for lack of privilege is exit 2 with `nft: operation not per
 | Exit | `sync` | `check` | `status` | `render` | `capture-floor` |
 |---|---|---|---|---|---|
 | 0 | applied, or already loaded | `ok` | printed | program printed | `floor` written |
-| 1 | `--require-authoritative` only: any exit-3 reason, nothing written | `missing` or `absent` | never | a stale reason, no program | never |
+| 1 | `--require-authoritative` only: any exit-3 reason, nothing written | `missing`, `absent` or `dormant` | never | a stale reason, no program | never |
 | 2 | usage, local error, unsafe state dir, nft unavailable | usage, unsafe state dir, `config-invalid`, `nft-unavailable`, stdout failed | usage, unsafe state dir, stdout failed | usage, unsafe state dir, invalid input, `nft-unavailable` or `nft-check-failed` with `--check`, stdout failed | usage, unsafe state dir, unreadable input, write failed |
 | 3 | stale, last-good program kept | `stale` or `behind`: cannot judge | never | never | never |
 | 4 | busy: the lock is held | never | never | never | busy after 30 s |
 | 101 | panic, a bug | panic | panic | panic | panic |
 
-`--version` exits 0, or 2 when stdout cannot be written.
+`--version` exits 0, or 2 with no stderr line when stdout cannot be written.
 
 The sync unit lists `SuccessExitStatus=3 4`, so a stale or busy timer run is not a failed unit.
 It also sets `TimeoutStartSec=90`: the tool bounds every RPC call but not the run time of nft, so the unit's timeout is what ends a run whose nft hangs while it holds the lock.
@@ -110,11 +128,14 @@ Grammar, version 1:
   The program lists the ports sorted.
 - `P2P_ALLOW_FROM` is empty or a comma-separated list of IPv4 and IPv6 addresses and networks (`A` or `A/N`).
   A prefix is decimal without a sign or a leading zero (`/0` is fine), at most 32 or 128.
+  An IPv4-mapped address (`::ffff:a.b.c.d`) needs a prefix of at least 96; a shorter one refuses the file, naming the entry: `P2P_ALLOW_FROM entry "::ffff:10.0.0.0/95" is an IPv4-mapped address with a prefix length shorter than 96`.
   A bad entry, a hostname included, refuses the whole file: dropping it would cut the static list and resolving it would be DNS.
 - A host entry (an address, `/32` or `/128`) goes through the same canonicalisation as snapshot addresses: an IPv4-mapped IPv6 host becomes an IPv4 host, and an unspecified, multicast or link-local host refuses the file, naming the entry.
   Host entries go to the allow sets.
 - A network entry is masked to its network address and goes to the static set of its family.
+  An IPv4-mapped network `::ffff:a.b.c.d/N` is the IPv4 network `a.b.c.d/(N-96)`, masked, in `static_v4`, where the covered and catch-all rules apply to it as to any IPv4 network; `::ffff:0.0.0.0/96` is a catch-all.
   A network that a wider network of the same family covers is dropped, since nft refuses overlapping intervals in one set; `sync` and `render` log one `static-covered dropped=N` warning per run.
+  An entry repeated exactly, after canonicalisation and masking, is kept once and is not counted as covered.
 - `0.0.0.0/0` and `::/0` are accepted as the operator's policy, and `sync` and `render` log one `static-catch-all` warning per run.
 
 Every refusal is `config-invalid` and names the line at fault when there is one.
@@ -141,6 +162,7 @@ A wrong `RPC_PORT` fails open: the sync goes stale with `rpc-unreachable` and th
 `capture-floor FILE...` writes it, as root and outside the sync unit's sandbox:
 
 - Each file must be a regular file of at most 16 MiB; symlinks are followed, since the inputs live in `/etc/telcoin`.
+  A file is opened with `O_NONBLOCK` and checked on the open file, so a FIFO is refused, never waited on.
   An unreadable, special or larger file is `floor-invalid` and nothing is written, because a cut input could drop a peer.
 - No YAML or JSON parser is involved.
   Each file is split into runs of the bytes a multiaddr uses (letters, digits and `/.:-_%`), and each run goes through the snapshot's multiaddr parser.
@@ -161,27 +183,49 @@ The tool calls `tn_admissionSnapshot` with params `[]` over HTTP/1.1 on `127.0.0
 - The response head is capped at 16 KiB and the decoded body at 8 MiB.
 - The address is a literal, so no name is ever resolved.
 
+The node serves the method on that port only when:
+
+- its HTTP server is on (`--http`); otherwise the run is `rpc-unreachable`;
+- `tn` is in its HTTP module set: the default set holds it, and an explicit `--http.api` must list it; otherwise the run is `rpc-method-missing`;
+- it has no JWT secret (`--rpc.jwtsecret`), since the tool sends no token; otherwise every call is `rpc-http-401`;
+- `RPC_PORT` is worker 0's HTTP port, the node's base port; worker N above 0 listens at the base port minus 200 × N.
+
 The result is validated whole; the first fault in this order makes the whole snapshot stale (tokens in [Reason tokens](#reason-tokens)):
 
 1. `result` is an object whose `version` is an unsigned integer.
    `version` is read before the shape, so a later version reports `snapshot-version-<n>` even when its shape changed.
 2. `version` is 1.
 3. The fields fit the v1 model; unknown fields are ignored at every level, so v1 can gain fields.
+   `tracked_epoch`, `admission`, `admission.epoch` and `admission.fallback` are present in every swarm, possibly null; a missing one is `snapshot-malformed`, in a worker swarm too.
 4. 1 to 16 swarms, each named `primary` or `worker-N` (`N` a decimal worker id from 0 to 65535 without a leading zero), each name once.
 5. At most 10000 entries per swarm.
 6. Every `bls_pubkey` is `0x` and 192 hex digits.
 7. The primary swarm exists and is `available: true`.
 8. The primary's `tracked_epoch` is not null.
 9. The available primary has a non-null `admission` (a null one there is `snapshot-malformed`).
-10. The primary's `tracked_epoch` is not below its `admission.epoch`, when both are present.
+10. The primary's `tracked_epoch` is not below its `admission.epoch`, when that is not null.
 11. The primary's `admission.fallback` is null or `Unresolved`; `Missing`, `Stale`, `Contradictory` and any other value are stale.
 
 The snapshot's epoch is the primary's `tracked_epoch`, the epoch whose pool it lists; the top-level `epoch` is not used.
 A snapshot whose epoch is below the last applied epoch is `epoch-regressed`; an equal epoch is the normal case of the runs within one epoch.
 A primary `tracked_epoch` above its `admission.epoch` is accepted, and counted as one `pool-ahead` warning.
 
-A worker swarm is authoritative when it is available, its `tracked_epoch` is not null and not below its `admission.epoch`, and its `admission` is present with a fallback of null or `Unresolved`.
+A worker swarm is authoritative when it is available, its `tracked_epoch` is not null and not below its `admission.epoch`, and its `admission` is not null and has a fallback of null or `Unresolved`.
 A worker swarm that is absent from the snapshot or not authoritative is additions-only (see [Memory](#memory)); it never makes the snapshot stale, `admission: null` included.
+A worker swarm that lacks one of the four keys of rule 3 is a shape fault, so the whole snapshot is `snapshot-malformed`; only a present `null` keeps a worker additions-only.
+
+The 16-swarm cap allows the primary and 15 workers, so a node with more than 15 workers is `snapshot-swarms` on every run; more workers are a deployment constraint, and the deployments run one.
+The 8 MiB body cap binds before any count does: at roughly 600 B per entry it holds about 13000 entries over all swarms, so `rpc-body-too-large` fires before `snapshot-entries` can.
+A node lists at most about 1100 entries per swarm: its 1024 tracked keys, the committees of its window, and its trusted and bootstrap peers.
+
+Some stale reasons are expected and pass by themselves, and each keeps the loaded program:
+
+- At node start: `rpc-unreachable` until its HTTP server is up, `rpc-error--32001` until it has set up its snapshot source, then `fallback-missing` until it accepts its first committee window, then `pool-unpublished` until the entered epoch publishes its pool.
+  That takes seconds on a caught-up node and the whole catch-up on a syncing one.
+- At every epoch entry: a brief `pool-unpublished`, since the node installs the new window before it publishes the new pool.
+- Over a long epoch transition: `fallback-stale`, once the transition outlasts the node's 300 s admission lease.
+
+`check-node.sh` reports such a reason only once `STALE_SINCE` is older than 2 epochs (see [Reason tokens](#reason-tokens)).
 
 Faults inside a valid snapshot are absorbed, counted as occurrences over every swarm, and logged once per kind:
 
@@ -204,15 +248,17 @@ When `record_multiaddrs` is present and its addresses differ from those of `mult
 Fields the decision reads: `version`, `swarms[].network`, `available`, `tracked_epoch`, `admission.epoch`, `admission.fallback`, `entries[].bls_pubkey`, `slots`, `multiaddrs` and `record_multiaddrs`.
 The others (`worker_id`, `peer_id`, `network_pubkey`, `record_timestamp`, `source`, `admitted`, `admission.configured`, `admission.effective` and the admission counts) are parsed and not used; the admission mode never matters, because the firewall is a cost filter independent of the node's gate.
 Unused is not optional: `source` (a string) and `admitted` (a bool) on every entry, and `configured`, `effective` (strings) and `resolved_current`, `required_current`, `connected_current`, `contradicted` (unsigned integers) in every `admission` object, are required, and a snapshot that lacks one or gives it another type is `snapshot-malformed`.
-`worker_id`, `peer_id`, `network_pubkey` and `record_timestamp` may be null or absent.
+`tracked_epoch`, `admission`, `admission.epoch` and `admission.fallback` are present, possibly null.
+`worker_id`, `peer_id`, `network_pubkey`, `record_timestamp`, `record_multiaddrs` and the top-level `epoch` may be null or absent; the node sends `record_multiaddrs` only for a `stub` entry whose signed record lists other addresses.
 
 After a snapshot that validated and folded into memory, the tool calls `tn_getCurrentEpochInfo` best effort and stores its `epochDuration` as `EPOCH_DURATION`.
-A failure there logs `epoch-info-failed reason=<token>`, with the token of the RPC failure or `no-epoch-duration` when the answer holds no positive integer `epochDuration`, and never makes the run stale; the default is 21600 until a value is learned.
+A failure there logs `epoch-info-failed reason=<token>`, with the token of the RPC failure (`snapshot-malformed` when the body is not JSON, holds no `result` or its `result` is not an object, as for the snapshot) or `no-epoch-duration` when the answer holds no positive integer `epochDuration`, and never makes the run stale; the default is 21600 until a value is learned.
 
 ## The state dir
 
 The scripts create the state dir as root with mode 0700; the tool never creates it.
 Every run checks it first and refuses, with `state-dir-invalid` and exit 2 before touching anything, a path that is missing, a symlink, not a directory, owned by a uid other than the effective one (read from `/proc/self/status`) or not exactly mode 0700.
+It also refuses a path whose last component is empty (a trailing `/`), `.` or `..`, with `does not end in a name; a trailing /, . or .. would follow a symlink`; the command line never passes one (see [Command line](#command-line)).
 
 | File | Written by | Format | When |
 |---|---|---|---|
@@ -224,11 +270,15 @@ Every run checks it first and refuses, with `state-dir-invalid` and exit 2 befor
 | `lock` | every locking run | empty, mode 0600, never deleted | created on the first locked run |
 
 Every file the tool writes has mode 0600 whatever the umask; a `lock` found with another mode is set to 0600 by the next locked run.
-The directory is opened for its sync with `O_NOFOLLOW|O_DIRECTORY`, so a symlink swapped in for it is never followed.
+The directory is checked once, with `lstat`, when the run starts, and then held by its path: every later file open is by path, each with `O_NOFOLLOW`, which guards the last component only.
+Each sync of the directory opens it with `O_NOFOLLOW|O_DIRECTORY`, so a sync never follows a symlink swapped in for it.
 `state.json`, `status` and `floor` are written atomically: the bytes go to `.<name>.new`, created with `O_CREAT|O_EXCL|O_NOFOLLOW` and synced, then renamed into place, then the directory is synced.
 The program is staged the same way in `.current.nft.new`.
 A leftover `.<name>.new` from a run that died is removed by the next writer, which holds the lock.
-Every file is opened without following symlinks, and every temporary file lives in the state dir, never in `/tmp`.
+An empty directory at that name is removed too; one with anything in it is never emptied, and the write is `state-io-failed` with a detail ending `cannot remove the leftover: a directory is in the way: <os error>`.
+Every file is opened without following symlinks, and every read also with `O_NONBLOCK`, so a FIFO is refused, never waited on.
+Reads have no size cap, since every file is in the euid-owned 0700 dir.
+Every temporary file lives in the state dir, never in `/tmp`.
 
 ### The lock
 
@@ -242,7 +292,7 @@ The lock is an exclusive `flock` on `lock`.
 - `lock` itself is created by the first run that takes the lock, a refused one included.
 
 Bash never holds `lock` while the binary runs, since a second open file description conflicts with the tool's own attempt.
-`off` never runs the binary: it stops the timer and the sync service, then holds `flock -w 30` on `lock` itself around the table delete and the removal of the state dir.
+`off` never runs the binary: it stops the timer, the sync service and the boot unit, whose `ExecStop=-/usr/sbin/nft delete table inet tn_p2p_allow` deletes the table once outside the lock, then holds `flock -w 30` on `lock` itself around the table delete and the removal of the state dir.
 
 ## Memory
 
@@ -266,7 +316,7 @@ The dynamic set is every address memory holds; when it is empty the run is stale
 ```
 
 Keys sort by their lowercase hex, swarms by name, and addresses IPv4 first and numerically within a family.
-A missing file is the empty state at epoch 0.
+A missing file is the empty state at epoch 0, and a symlink or a special file at `state.json` is `state-io-failed`.
 The file must be exactly what the tool writes for a state it can reach: malformed JSON, another version, an unknown field, an uppercase or malformed key, a swarm name other than `primary` or `worker-N` as the snapshot spells them, a non-canonical address, a `seen` above the epoch or past the TTL, an absent count of 2 or more, an empty map, or any other spelling is `state-invalid`, exit 2.
 The recovery is `firewall-setup.sh --p2p-committee off`, then `on`.
 
@@ -330,15 +380,22 @@ add element inet tn_p2p_allow static_v4 { 203.0.113.0/24 }
 
 - the program equals `current.nft` byte for byte;
 - the table exists, and its four sets hold exactly the desired elements;
+- the table is not dormant: its `table` object carries no `flags` key;
 - chain `input` exists with type `filter`, hook `input`, priority -20 and policy `accept`;
 - it holds exactly the program's 5 rules in order, each with its `udp dport` ports, its `ip`/`ip6 saddr` set, its named counter and its verdict;
 - both named counters exist.
 
 Elements are compared as parsed values, never as text: a `/32` or `/128` prefix counts as its address, and a range that is exactly one CIDR block counts as that block (nft 1.0.2 lists a network reaching the top of the address space as a range).
 Rules are compared as nft lists their expressions, so a single port printed as a number and a port set printed as an anonymous set both compare as ports, and any expression outside those forms makes the rule differ.
-Anything else re-applies, which is how a sync heals an element, a set, a rule or a counter deleted by hand, and a verdict, a policy or a port list changed by hand.
+Anything else re-applies, which is how a sync heals an element, a set, a rule or a counter deleted by hand, a verdict, a policy or a port list changed by hand, and a table made dormant by hand.
 The listing runs only when the table is present and the program equals `current.nft`, since either failing already re-applies; on such a run the check costs one `nft -j list table inet tn_p2p_allow`.
 Re-applying the same program or a changed one keeps both counters: seen on nft 1.0.2 and 1.0.9, and checked on the Ubuntu 22.04 and 24.04 runner kernels by the real-kernel job.
+Re-applying the program also wakes a dormant table, since the program declares the table without flags: seen on nft 1.0.2, 1.0.9 and 1.1.3.
+
+Two hand edits are beyond a re-apply, and the recovery from both is `off`, then `on`:
+
+- An extra base chain in the table is invisible to the comparison, and `flush table` empties its rules but keeps the chain and its policy, so a `policy drop` there keeps dropping the host's whole input path.
+- Chain `input` recreated with another priority or hook differs from the program, so the run re-applies, but the kernel refuses to change a base chain's hook or priority: every run is then `nft-apply-failed`.
 
 ### How nft is run
 
@@ -347,14 +404,24 @@ nft runs from `/usr/sbin/nft` (or `--nft`), never through a shell, with a cleare
 | Call | Used by | For |
 |---|---|---|
 | `nft -j list tables inet` | `sync`, `check`, `status`, `render --check` | whether the table exists, and whether nft works at all |
-| `nft -j list table inet tn_p2p_allow` | `sync` (when the program is unchanged), `check`, `status` | the sets, the counters, and the chain's declaration and rules |
+| `nft -j list table inet tn_p2p_allow` | `sync` (when the program is unchanged), `check`, `status` | the table's flags, the elements of the four sets, the counters, and the chain's declaration and rules |
 | `nft -f <state-dir>/.current.nft.new` | `sync` | applying the program, one transaction |
 | `nft -f <state-dir>/current.nft` | the stale path of `sync` | reloading the last-good program into an absent table |
 | `nft -c -f -` | `render --check` | checking the program without applying it |
 
 Every `sync` lists the tables before it applies anything, so a missing CAP_NET_ADMIN is caught there; nft 1.0.2 prints nothing on a refused `-f`.
-Any failure of either listing call is `nft-unavailable`, exit 2, nothing touched, but one: when the table listing of `sync` fails and a second tables listing shows the table gone, deleted while the node was being asked, the program is applied.
+Any failure of either listing call is `nft-unavailable`, exit 2, nothing touched, with two exceptions in `sync`, which then applies the program:
+
+- the table listing fails and a second tables listing shows the table gone, deleted while the node was being asked;
+- nft prints the table listing but the tool cannot read it: the run logs one `listing-unreadable detail=…` warning and re-applies, since the comparison needs a listing it can read.
+
+Only the elements of the four sets are read, so a set or a map added by hand, whatever it holds, never makes the listing unreadable.
+`check` and `status` report an unreadable listing as `nft-unavailable`.
 The tool never deletes the table; `off` does.
+
+Nothing caps the program itself.
+The 8 MiB body cap bounds one snapshot at roughly 440k addresses (about 6800 entries of 64 addresses each), a program of 9 to 20 MB, and memory adds only what the snapshots of the last 3 epochs listed.
+The node's own limits, about 1024 tracked keys per swarm and at most 4 addresses in a signed record, put a realistic maximum near 65k addresses; the real-kernel job loads such a program in `<N> s`<!-- T12 fills in -->, well under the unit's 90 s.
 
 ## A sync run
 
@@ -372,12 +439,14 @@ In the order that decides what a run may touch:
 Every stale reason and every local error after step 1 takes the stale path; `nft-unavailable` does not: it exits 2 with nothing touched.
 
 - The tables are listed again first, unless the run has just loaded the program, so a table deleted while the node was being asked counts as absent.
-- A present table is kept as it is and never re-applied.
+  When that listing fails, the run logs one `nft-unavailable detail=…` warning, takes action `none` and goes on: it writes `status` and exits 3, or 2 for a local error.
+- A present table is kept as it is and never re-applied, since it may be newer than `current.nft`.
+  A table damaged or made dormant by hand therefore stays so until the next fresh run; `check` reports a dormant one as `dormant` meanwhile.
 - An absent table is reloaded with `nft -f current.nft` when `current.nft` exists; with no `current.nft` nothing is loaded.
   The sets are never flushed and a floor-only table is never built.
 - `state.json`, `current.nft` and `LAST_GOOD` are left untouched.
 - `status` gets `RESULT=stale` (exit 3) or `RESULT=error` (exit 2), `STALE_REASON` the token, and `STALE_SINCE` only when it was empty.
-- One log line `stale reason=<token> action=<action>` (warning) or `error reason=<token> action=<action> detail=…` (error), with action `kept`, `reloaded`, `none` or `reload-failed`.
+- One log line `stale reason=<token> action=<action>` (warning) or `error reason=<token> action=<action> detail=…` (error), with action `kept`, `reloaded`, `none` (no `current.nft`, or the tables listing failed) or `reload-failed`.
 - A failed reload overrides the run's reason: `STALE_REASON=reload-failed`, `RESULT=error`, exit 2, and the original reason stays in the first log line.
 
 With `--require-authoritative` every exit-3 reason is refused instead: exit 1, nothing written (not `status`, `state.json`, `current.nft` or the table), and no reload.
@@ -390,11 +459,11 @@ Every token below appears as `STALE_REASON` in `status`, as `reason=` on the std
 | Token | Trigger | `sync` exit | `RESULT` |
 |---|---|---|---|
 | `rpc-unreachable` | connection refused, broken or closed before any response byte, or a connect, read or overall timeout | 3 | `stale` |
-| `rpc-http-<code>` | an HTTP status other than 200, such as `rpc-http-503` | 3 | `stale` |
+| `rpc-http-<code>` | an HTTP status other than 200, such as `rpc-http-503`; the first status line is the answer, so an interim 1xx, which the request never asks for, reads as its code | 3 | `stale` |
 | `rpc-bad-http` | a response that breaks HTTP/1.1 framing | 3 | `stale` |
 | `rpc-body-too-large` | a head over 16 KiB or a decoded body over 8 MiB | 3 | `stale` |
 | `snapshot-malformed` | a body that is not JSON, no `result`, a `result` that is not an object, no valid `version`, a shape outside the v1 model, or an available primary with `admission: null` | 3 | `stale` |
-| `rpc-method-missing` | JSON-RPC error -32601: this node release lacks `tn_admissionSnapshot` | 3 | `stale` |
+| `rpc-method-missing` | JSON-RPC error -32601: the node lacks `tn_admissionSnapshot`, because its release predates the method or `tn` is not in its `--http.api` | 3 | `stale` |
 | `rpc-error-<code>` | any other JSON-RPC error, its code written literally, so -32001 reads `rpc-error--32001`; an `error` member without an integer `code` is `snapshot-malformed` | 3 | `stale` |
 | `snapshot-version-<n>` | `version` other than 1, such as `snapshot-version-2` | 3 | `stale` |
 | `snapshot-swarms` | no swarm, more than 16, a bad name or a name listed twice | 3 | `stale` |
@@ -405,22 +474,24 @@ Every token below appears as `STALE_REASON` in `status`, as `reason=` on the std
 | `fallback-missing` | the primary's fallback is `Missing` | 3 | `stale` |
 | `fallback-stale` | the primary's fallback is `Stale` | 3 | `stale` |
 | `fallback-contradictory` | the primary's fallback is `Contradictory`, or a value this build does not know | 3 | `stale` |
-| `epoch-regressed` | the snapshot's epoch is below the applied epoch; after a far-future `tracked_epoch` was accepted once, every honest snapshot regresses, and the recovery is `off`, then `on` | 3 | `stale` |
+| `epoch-regressed` | the snapshot's epoch is below the applied epoch; it clears by itself once the node's tracked epoch is back at or above the applied one, as after a node whose startup record sync failed replays old epochs; after a far-future `tracked_epoch` was accepted once, every honest snapshot regresses, it never clears, and the recovery is `off`, then `on` | 3 | `stale` |
 | `empty-set` | memory holds no address after the snapshot | 3 | `stale` |
 | `config-invalid` | `config` is missing, unreadable or breaks the grammar | 2 | `error` |
 | `floor-invalid` | `floor` is unreadable or malformed; for `capture-floor`, an input it cannot read | 2 | `error` |
 | `state-invalid` | `state.json` is not in the form the tool writes; recover with `off`, then `on` | 2 | `error` |
 | `state-io-failed` | a read, write, rename, sync or lock failure in the state dir, or a symlink or special file where a file should be (at `config` or `floor` it is `config-invalid` or `floor-invalid` instead) | 2 | `error`, or no status when the lock itself failed |
-| `nft-apply-failed` | `nft -f` refused the program; the transaction is atomic, so the live table is unchanged | 2 | `error` |
+| `nft-apply-failed` | `nft -f` did not confirm the load: it refused the program, and the transaction is atomic, so the live table is unchanged; or a signal ended it, maybe after it committed; `current.nft` is kept either way, so the next run applies the program again or finds it loaded | 2 | `error` |
 | `reload-failed` | the stale path's `nft -f current.nft` failed | 2 | `error` |
 | `state-dir-invalid` | the state dir failed its checks | 2 | no status written |
-| `nft-unavailable` | nft is missing, failed a listing call or was refused it | 2 | no status written |
+| `nft-unavailable` | nft is missing, failed a listing call or was refused it; a table listing of `sync` that nft printed and the tool cannot read re-applies instead (`listing-unreadable`) | 2 | no status written |
 | `busy` | the lock is held (log line `busy`) | 4 | no status written |
 
 Log-only tokens, never written to `status`: `usage` (a relative `--nft`), `snapshot-unreadable` (`render --snapshot` cannot read its file), `nft-check-failed` (`render --check` and nft rejected the program), `output-failed` (stdout could not be written, or `status --json` could not be serialised) and `no-epoch-duration` (the `epoch-info-failed` reason of an answer without a positive integer `epochDuration`).
 
-The deployment's `on` maps exit 1 with `reason=rpc-method-missing` on the stdout line to "this node release lacks tn_admissionSnapshot".
-`check-node.sh` reports `rpc-method-missing`, `snapshot-version-*` and `epoch-regressed` at once, since they never clear on their own, and every other reason once `STALE_SINCE` is older than 2 epochs.
+The deployment's `on` maps exit 1 with `reason=rpc-method-missing` on the stdout line to "this node release lacks tn_admissionSnapshot, or tn is not in its --http.api; update the node or add tn to --http.api", and `check-node.sh` prints the same text for that reason.
+`check-node.sh` reports at once: `rpc-method-missing`, `snapshot-version-*`, `epoch-regressed` and `state-invalid`, which can need the operator; any `RESULT=error`; and a sync unit whose last run failed, by its `Result` and `ExecMainStatus` (exit 0, 3 and 4 are not failures).
+It reports every other reason once `STALE_SINCE` is older than 2 epochs.
+`firewall-setup.sh --p2p-committee status` warns at once on the same four reasons.
 
 ## Outputs
 
@@ -437,9 +508,9 @@ result=applied reason= epoch=42 v4=3 v6=1 static=1 floor=2 keys=2 dns_skipped=0 
 - `epoch` is `EPOCH`, empty before the first good run.
 - `v4` and `v6` are `ALLOWED_V4` and `ALLOWED_V6`, `static` is `STATIC_V4` plus `STATIC_V6`, and `floor`, `keys`, `dns_skipped` and `unparsed` are `FLOOR`, `KEYS`, `DNS_SKIPPED` and `UNPARSED`.
 
-The counts come from the status the run wrote.
+The counts come from the status the run wrote, or tried to write.
 A stale or error run keeps every count of the previous status, so its line shows the previous counts: a first run that goes stale prints `floor=0` even with a floor file, and a refusal prints the counts of the last status on disk.
-A run whose write of `status` failed prints `result=error reason=state-io-failed` although no new status reached the disk.
+A run whose write of `status` failed prints `result=error reason=state-io-failed` although no new status reached the disk, with the counts of the status it failed to write.
 No line is printed on a usage error, an unsafe state dir, busy, a lock failure or `nft-unavailable`.
 
 ### `check`
@@ -458,13 +529,18 @@ result=ok missing_total=0 mismatch_total=0
 | `ok` | every current committee address of the primary swarm is in `allow_v4` or `allow_v6` | 0 | `mismatch` lines |
 | `missing` | a current committee address is in neither allow set, and `state.json` holds one such address or cannot be read | 1 | `missing` and `mismatch` lines |
 | `absent` | the table does not exist; the node is not asked | 1 | none |
+| `dormant` | the table exists but is dormant, so it enforces nothing, whatever the snapshot says | 1 | `missing` and `mismatch` lines as for the table awake; none when the snapshot is not authoritative or its epoch is below `EPOCH` |
 | `behind` | the snapshot's epoch is above `EPOCH`, no good sync has run yet, or every missing current address is one `state.json` does not hold yet: the next sync catches up | 3 | `missing` and `mismatch` lines, for information |
 | `stale` | the snapshot is not authoritative, or its epoch is below `EPOCH` | 3 | none |
+
+When more than one verdict applies, the first of these wins: an error (exit 2), `absent`, `dormant`, `stale`, `behind`, `missing`, `ok`.
 
 - An address counts as present only as the very element, a full-length prefix included; a static network that covers it does not count.
 - A mismatch is a key, in any swarm, whose `record_multiaddrs` give other addresses than its `multiaddrs`; both are allowed, so mismatches never change the verdict.
 - The totals count every missing address and every mismatched key, past the 5 lines shown.
+- A `state.json` that is absent, unreadable or invalid is no error for `check`: every missing address then counts as one it held, so a gap at the applied epoch is `missing` rather than `behind`.
 - `stale` logs `stale reason=<token>`, and for a snapshot below `EPOCH` `stale reason=epoch-regressed snapshot_epoch=N applied_epoch=N`; `behind` logs `behind snapshot_epoch=N applied_epoch=N`, with `applied_epoch=` empty before the first good sync and both epochs equal when the missing addresses are ones `state.json` does not hold yet.
+- `ok`, `missing`, `absent` and `dormant` log no closing line, so a `dormant` run logs no stale reason even when the snapshot is not authoritative.
 
 ### The status file
 
@@ -473,7 +549,7 @@ result=ok missing_total=0 mismatch_total=0
 | Key | Value | Meaning |
 |---|---|---|
 | `STATUS_VERSION` | `1` | the format |
-| `TOOL_VERSION` | `0.1.0` | the version of the build that wrote the file |
+| `TOOL_VERSION` | `0.1.1` | the version of the build that wrote the file |
 | `RESULT` | `applied`, `unchanged`, `stale`, `error` or empty | how the last run that reached a decision ended; empty before the first |
 | `LAST_RUN` | unix seconds | when that run started, once it held the lock |
 | `LAST_GOOD` | unix seconds or empty | when a run last applied the program or found it loaded |
@@ -513,6 +589,8 @@ result=ok missing_total=0 mismatch_total=0
 | `COUNTER_DROP_PACKETS`, `COUNTER_DROP_BYTES` | integer or empty | counter `tn_drop_p2p_unlisted` |
 
 The counters are empty when nft could not list the table, the table is absent or the counter is gone.
+`LOADED` is `true` for a dormant table too; `check` is what reports it.
+The 7 live keys are computed on every call and never written to the status file, which has no `STALE` key.
 `status` takes no lock and writes nothing.
 
 ### `status --json`
@@ -549,7 +627,7 @@ The scripts own those facts and splice them in front with `printf` (`"${json#\{}
 ### `render`
 
 `render [--snapshot FILE] [--check]` prints the program `sync` would load on stdout and one summary line on stderr, and writes nothing.
-The summary goes through the log's 8-line cap like any log line, so a run with many warnings can lose it to `log-capped`.
+The summary is the run's closing line, so the log's cap never drops it.
 
 - Memory comes from `state.json` and is updated in memory only; no lock is taken.
 - `--snapshot FILE` reads a regular file of at most 8 MiB holding either the `result` object or a whole JSON-RPC response; without it the node is asked.
@@ -565,12 +643,18 @@ Every log line goes to stderr, one event per line: the event name, then `key=val
 - Under systemd a line starts with `<3>` (error) or `<4>` (warning), which journald reads as its priority.
   The prefix appears only when `JOURNAL_STREAM` names the device and inode of fd 2, systemd's documented check, so interactive output stays plain.
 - A value that is not plain printable ASCII is written quoted and escaped, so an event always stays on one line.
-- A run writes at most 8 lines; past that, the eighth is replaced by `log-capped dropped=N`.
-- The events: `error`, `stale`, `refused`, `busy`, `behind`, `nft-path`, `nft-unavailable`, `static-catch-all`, `static-covered`, `floor-missing`, `absorbed kind=<kind> count=N`, `epoch-info-failed`, `status-unreadable`, `status-value-invalid` and `log-capped`.
+- A run writes at most 8 lines to stderr.
+  Its closing line, the one that says how it ended (`error`, `stale`, `refused`, check's `behind`, `stale` or `error`, render's `result=` summary), is never dropped and is always the last line.
+  The lines before it share the other 7 slots; when more than 7 arrive, 6 are written and the 7th slot becomes `log-capped dropped=N`, N counting every line before the closing line that was not written.
+  A run with no closing line (a fresh or busy `sync`, a `check` that ends `ok`, `missing`, `absent` or `dormant`, or `status`) writes at most 7 lines.
+- On the stale path, a failed reload closes the run with `error reason=reload-failed`, and a failed write of `status` with `error reason=state-io-failed`; the stale path's own line comes before it.
+- The closing line is written when the run ends, after its stdout line.
+- The events: `error`, `stale`, `refused`, `busy`, `behind`, `nft-path`, `nft-unavailable`, `listing-unreadable`, `static-catch-all`, `static-covered`, `floor-missing`, `absorbed kind=<kind> count=N`, `epoch-info-failed`, `status-unreadable`, `status-value-invalid` and `log-capped`.
 - `capture-floor` writes its single failure line without a prefix: `capture-floor: <token>: <detail>`.
 
 The deployment reads exit codes, stdout lines and the status file, never the log lines.
 One exception: the `result=` line of `check` carries no reason, so the deployment reads the `reason=` word of the `<3>error reason=…` and `<4>stale reason=…` lines `check` writes, and that word on those two events of `check` is part of this contract.
+Either line is `check`'s closing line, so the cap never drops it; it reaches stderr after the stdout `result=` line, which matters only to a reader that merges the two streams.
 
 ## What the tool never does
 
