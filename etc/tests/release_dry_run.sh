@@ -62,7 +62,7 @@ if [ "$STUB" = 1 ] && [ "${GITHUB_ACTIONS:-}" = true ]; then
     bail "RELEASE_BUILD_STUB=1 is refused in CI, which runs the real build"
 fi
 
-for tool in git gpg gpgconf gpg-connect-agent make docker tar gzip awk sed od; do
+for tool in git gpg gpgconf gpg-connect-agent make docker tar gzip awk sed od jq; do
     command -v "$tool" >/dev/null 2>&1 || bail "missing required tool: $tool"
 done
 docker info >/dev/null 2>&1 || bail "docker does not answer"
@@ -341,6 +341,7 @@ expect_rc 0 "check-tag accepts $tag"
 expect_out "commit=$r1 signer=alice fingerprint=$fpr channel=stable version=$version features= prerelease=false" \
     "check-tag prints the commit, the signer and the version"
 expect_err "$r1 keeps panic = \"unwind\" in its release build" "check-tag finds the panic strategy unwind at the tag"
+expect_err "dry run: not checking the CI results of $r1" "a dry run leaves the required checks on the tag's commit alone"
 
 step "$clone" rel ./release/release.sh notes "$tag"
 expect_rc 0 "notes renders the release body"
@@ -585,6 +586,101 @@ abort=$(git -C "$clone" commit-tree -p "$r1" -m 'fixture: panic = "abort"' "$abo
 sourced tn_check_unwind "$abort"
 expect_rc 1 "a commit whose Cargo.toml sets panic = \"abort\" is refused"
 expect_err "Cargo.toml at $abort sets the panic strategy to abort (line " "it names the file and the line"
+
+# gh for the gates: logs its arguments to GH_FIXTURE/gh.log, then answers from the files there,
+# applying --jq with jq as gh does: runs.json (run list), artifact-RUN-NAME/ (run download),
+# release.json (release view; without it the release does not exist), check-runs.json (api)
+GHFX=$FX/gh-fixture
+mkdir -p "$GHFX" "$FX/gate-bin"
+cat >"$FX/gate-bin/gh" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$GH_FIXTURE/gh.log"
+cmd="$1 $2"
+shift 2
+jqx=. dest= name= arg=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --jq) jqx=$2; shift 2 ;;
+        -D) dest=$2; shift 2 ;;
+        -n) name=$2; shift 2 ;;
+        --repo | --workflow | --commit | --event | --json) shift 2 ;;
+        --paginate) shift ;;
+        *) arg=$1; shift ;;
+    esac
+done
+case $cmd in
+    "run list") exec jq -r "$jqx" "$GH_FIXTURE/runs.json" ;;
+    "run download")
+        if [ ! -d "$GH_FIXTURE/artifact-$arg-$name" ]; then echo "no valid artifacts found to download" >&2; exit 1; fi
+        cp "$GH_FIXTURE/artifact-$arg-$name"/* "$dest/" ;;
+    "release view")
+        if [ ! -f "$GH_FIXTURE/release.json" ]; then echo "release not found" >&2; exit 1; fi
+        exec jq -r "$jqx" "$GH_FIXTURE/release.json" ;;
+    api\ */check-runs*) exec jq -r "$jqx" "$GH_FIXTURE/check-runs.json" ;;
+    *) echo "fixture gh: no answer for gh $cmd" >&2; exit 1 ;;
+esac
+EOF
+chmod 0755 "$FX/gate-bin/gh"
+
+# gated DRAFT FUNCTION ARG...: FUNCTION of release.sh or release.conf after load_conf and
+# parse_tag of $tag, outside a dry run, with COMMIT the release commit, REPO, WORK and
+# REL_DRAFT=DRAFT set as the step that runs it sets them, and the fixture gh first on PATH.
+gated() {
+    local draft=$1
+    shift
+    rm -rf "$FX/gate-work"
+    mkdir "$FX/gate-work"
+    : >"$GHFX/gh.log"
+    # shellcheck disable=SC2016 # the inner shell expands them
+    step "$clone" env PATH="$FX/gate-bin:$PATH" GH_FIXTURE="$GHFX" bash -c \
+        '. ./release/release.sh && load_conf && parse_tag "$1" && COMMIT=$2 REPO=$DEFAULT_REPO WORK=$3 REL_DRAFT=$4 && shift 4 && "$@"' \
+        _ "$tag" "$r1" "$FX/gate-work" "$draft" "$@"
+}
+
+# check_runs ID=NAME=CONCLUSION...: check-runs.json, the check runs on the release commit; the
+# conclusion pending stands for a run in progress
+check_runs() {
+    local r id name concl state sep=
+    {
+        printf '{"total_count": %d, "check_runs": [' "$#"
+        for r in "$@"; do
+            id=${r%%=*}
+            r=${r#*=}
+            name=${r%=*}
+            concl="\"${r##*=}\""
+            state=completed
+            if [ "$concl" = '"pending"' ]; then state=in_progress concl=null; fi
+            printf '%s{"id": %s, "name": "%s", "status": "%s", "conclusion": %s}' "$sep" "$id" "$name" "$state" "$concl"
+            sep=', '
+        done
+        printf ']}\n'
+    } >"$GHFX/check-runs.json"
+}
+
+# the required checks on the tag's commit (hook_check_tag_extra, as check-tag runs it)
+check_runs 10=test=failure 11=fmt=success 12=clippy=success 13=test=success 14=deny=success 15=audit=success \
+    16=release-dry-run=success '17=nft-real (ubuntu-24.04)=success' '18=nft-real (ubuntu-22.04)=success' \
+    '19=nft-real (debian:13)=success' 20=validate-tag=pending
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 0 "check-tag accepts a commit on which every required check passed"
+expect_err "CI passed on $r1: fmt, clippy, test, deny, audit, release-dry-run, nft-real (ubuntu-24.04), nft-real (ubuntu-22.04), nft-real (debian:13)" \
+    "it lists the required checks, of which the newest run counts"
+check "it reads the check runs of the release commit" \
+    grep -q -F -e "api repos/Telcoin-Association/tn-p2p-allow-sync/commits/$r1/check-runs" "$GHFX/gh.log"
+
+check_runs 11=fmt=success 12=clippy=success 21=clippy=failure 13=test=success 14=deny=success 15=audit=success \
+    16=release-dry-run=success '17=nft-real (ubuntu-24.04)=success' '18=nft-real (ubuntu-22.04)=pending'
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 1 "check-tag refuses a commit with a failed, a running and a missing required check"
+expect_err "CI has not passed on $r1: clippy (failure), nft-real (ubuntu-22.04) (in_progress), nft-real (debian:13) (no check run)" \
+    "it names each of them and what it found"
+
+printf '{"isDraft": false, "isPrerelease": false, "author": {"login": "github-actions[bot]"}, "assets": []}\n' >"$GHFX/release.json"
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 0 "the required checks of a published release are not asked for again"
+expect_err "release $tag is published: not checking the CI results of $r1 again" "it says the release is published"
+rm "$GHFX/release.json"
 
 # ---------------------------------------------------------------------------------------------
 # Nothing left the machine.
