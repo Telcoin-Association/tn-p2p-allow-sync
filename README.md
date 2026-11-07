@@ -57,9 +57,9 @@ cargo run -- --version
 
 CI runs these jobs; [.github/ACTIONS.md](.github/ACTIONS.md) has each one's command and what it stops:
 
-- `ci.yaml`, on every pull request and every push to `main`: `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`; `deny` and `audit` also run weekly on `main`, so a new advisory shows without a pull request.
+- `ci.yaml`, on every pull request and every push to `main`: `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`.
 - `nft-real.yaml`, on every push to `main` and every pull request that touches the code it covers: the real-kernel test, on Ubuntu 24.04 and 22.04 runners and in a Debian 13 container.
-- `scheduled.yaml`, weekly on `main` and report-only: mutation testing and fuzzing.
+- `scheduled.yaml`, weekly on `main`: `deny-weekly` and `audit-weekly` on Mondays, so a new advisory shows without a pull request, and report-only mutation testing and fuzzing on Saturdays.
 
 Locally, `make ci` runs `fmt`, `clippy`, `test`, `deny` and `audit` as CI does, `make nft-real-docker DISTRO=<image>` runs the real-kernel test in a container of `ubuntu:24.04`, `ubuntu:22.04` or `debian:13` without sudo, and `RELEASE_BUILD_STUB=1` makes the release dry run quick by swapping its Docker build for a stub:
 
