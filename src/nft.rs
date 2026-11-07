@@ -415,7 +415,10 @@ fn parse_tables(json: &[u8]) -> Result<bool, NftError> {
 }
 
 /// Reads `nft -j list table inet tn_p2p_allow` output; objects of other kinds, or of other tables, and sets the program does not declare are skipped.
-fn parse_listing(json: &[u8]) -> Result<Listing, NftError> {
+///
+/// Every failure is [`NftError::Parse`].
+/// Public for the fuzz targets in `fuzz/`; the program reads a listing only through [`Nft::list_table`].
+pub fn parse_listing(json: &[u8]) -> Result<Listing, NftError> {
     let mut listing = Listing::default();
     for (kind, body) in objects(json)? {
         match kind.as_str() {

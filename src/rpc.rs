@@ -209,7 +209,10 @@ fn request(port: u16, method: &str, params: Value) -> Vec<u8> {
 }
 
 /// Reads one response and returns its decoded body.
-fn read_response<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
+///
+/// The head is capped at [`MAX_HEADER_BYTES`] and the decoded body at [`MAX_BODY_BYTES`], and every failure is the [`RpcError`] that [`RpcClient::call`] returns for it.
+/// Public for the fuzz targets in `fuzz/`; the program reads a response only through [`RpcClient::call`].
+pub fn read_response<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
     // a server that closes before its first byte never answered: the connection broke, not the framing
     if reader.fill_buf().map_err(io_error)?.is_empty() {
         return Err(RpcError::Unreachable);
