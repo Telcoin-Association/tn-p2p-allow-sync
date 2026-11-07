@@ -61,7 +61,7 @@ pub const INPUT_RULES: usize = 5;
 /// The named counters the program declares.
 pub const COUNTERS: [&str; 2] = ["tn_accept_p2p_listed", "tn_drop_p2p_unlisted"];
 
-/// The protocol keyword and the set of each accept rule of the program, in chain order, as [`render`] writes them.
+/// The protocol keyword and the set of each accept rule of the program, in chain order, as [`render::render`] writes them.
 const ACCEPT_RULES: [(&str, &str); 4] = [
     ("ip", "allow_v4"),
     ("ip", "static_v4"),
