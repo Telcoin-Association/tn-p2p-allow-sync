@@ -92,7 +92,7 @@ nft refusing a call for lack of privilege is exit 2 with `nft: operation not per
 | 4 | busy: the lock is held | never | never | never | busy after 30 s |
 | 101 | panic, a bug | panic | panic | panic | panic |
 
-`--version` exits 0, or 2 when stdout cannot be written.
+`--version` exits 0, or 2 with no stderr line when stdout cannot be written.
 
 The sync unit lists `SuccessExitStatus=3 4`, so a stale or busy timer run is not a failed unit.
 It also sets `TimeoutStartSec=90`: the tool bounds every RPC call but not the run time of nft, so the unit's timeout is what ends a run whose nft hangs while it holds the lock.
@@ -252,7 +252,7 @@ Unused is not optional: `source` (a string) and `admitted` (a bool) on every ent
 `worker_id`, `peer_id`, `network_pubkey`, `record_timestamp`, `record_multiaddrs` and the top-level `epoch` may be null or absent; the node sends `record_multiaddrs` only for a `stub` entry whose signed record lists other addresses.
 
 After a snapshot that validated and folded into memory, the tool calls `tn_getCurrentEpochInfo` best effort and stores its `epochDuration` as `EPOCH_DURATION`.
-A failure there logs `epoch-info-failed reason=<token>`, with the token of the RPC failure or `no-epoch-duration` when the answer holds no positive integer `epochDuration`, and never makes the run stale; the default is 21600 until a value is learned.
+A failure there logs `epoch-info-failed reason=<token>`, with the token of the RPC failure (`snapshot-malformed` when the body is not JSON, holds no `result` or its `result` is not an object, as for the snapshot) or `no-epoch-duration` when the answer holds no positive integer `epochDuration`, and never makes the run stale; the default is 21600 until a value is learned.
 
 ## The state dir
 
@@ -316,7 +316,7 @@ The dynamic set is every address memory holds; when it is empty the run is stale
 ```
 
 Keys sort by their lowercase hex, swarms by name, and addresses IPv4 first and numerically within a family.
-A missing file is the empty state at epoch 0.
+A missing file is the empty state at epoch 0, and a symlink or a special file at `state.json` is `state-io-failed`.
 The file must be exactly what the tool writes for a state it can reach: malformed JSON, another version, an unknown field, an uppercase or malformed key, a swarm name other than `primary` or `worker-N` as the snapshot spells them, a non-canonical address, a `seen` above the epoch or past the TTL, an absent count of 2 or more, an empty map, or any other spelling is `state-invalid`, exit 2.
 The recovery is `firewall-setup.sh --p2p-committee off`, then `on`.
 
@@ -508,9 +508,9 @@ result=applied reason= epoch=42 v4=3 v6=1 static=1 floor=2 keys=2 dns_skipped=0 
 - `epoch` is `EPOCH`, empty before the first good run.
 - `v4` and `v6` are `ALLOWED_V4` and `ALLOWED_V6`, `static` is `STATIC_V4` plus `STATIC_V6`, and `floor`, `keys`, `dns_skipped` and `unparsed` are `FLOOR`, `KEYS`, `DNS_SKIPPED` and `UNPARSED`.
 
-The counts come from the status the run wrote.
+The counts come from the status the run wrote, or tried to write.
 A stale or error run keeps every count of the previous status, so its line shows the previous counts: a first run that goes stale prints `floor=0` even with a floor file, and a refusal prints the counts of the last status on disk.
-A run whose write of `status` failed prints `result=error reason=state-io-failed` although no new status reached the disk.
+A run whose write of `status` failed prints `result=error reason=state-io-failed` although no new status reached the disk, with the counts of the status it failed to write.
 No line is printed on a usage error, an unsafe state dir, busy, a lock failure or `nft-unavailable`.
 
 ### `check`
@@ -538,6 +538,7 @@ When more than one verdict applies, the first of these wins: an error (exit 2), 
 - An address counts as present only as the very element, a full-length prefix included; a static network that covers it does not count.
 - A mismatch is a key, in any swarm, whose `record_multiaddrs` give other addresses than its `multiaddrs`; both are allowed, so mismatches never change the verdict.
 - The totals count every missing address and every mismatched key, past the 5 lines shown.
+- A `state.json` that is absent, unreadable or invalid is no error for `check`: every missing address then counts as one it held, so a gap at the applied epoch is `missing` rather than `behind`.
 - `stale` logs `stale reason=<token>`, and for a snapshot below `EPOCH` `stale reason=epoch-regressed snapshot_epoch=N applied_epoch=N`; `behind` logs `behind snapshot_epoch=N applied_epoch=N`, with `applied_epoch=` empty before the first good sync and both epochs equal when the missing addresses are ones `state.json` does not hold yet.
 - `ok`, `missing`, `absent` and `dormant` log no closing line, so a `dormant` run logs no stale reason even when the snapshot is not authoritative.
 
@@ -589,6 +590,7 @@ When more than one verdict applies, the first of these wins: an error (exit 2), 
 
 The counters are empty when nft could not list the table, the table is absent or the counter is gone.
 `LOADED` is `true` for a dormant table too; `check` is what reports it.
+The 7 live keys are computed on every call and never written to the status file, which has no `STALE` key.
 `status` takes no lock and writes nothing.
 
 ### `status --json`
