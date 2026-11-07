@@ -8,6 +8,10 @@
 //!
 //! The model ignores unknown fields at every level, so a v1 node can add fields without breaking this parser.
 //! A change that an old parser must not read raises `version` instead.
+//!
+//! A nullable field the decision reads is present, possibly null: `tracked_epoch`, `admission`, `admission.epoch` and `admission.fallback`.
+//! A missing one is `snapshot-malformed`, because reading it as null would trust a snapshot that never said it could be trusted.
+//! Only `record_multiaddrs`, the top-level `epoch`, `worker_id`, `peer_id`, `network_pubkey` and `record_timestamp` may be absent.
 
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,7 +47,7 @@ const BLS_KEY_HEX_DIGITS: usize = 192;
 pub struct RawSnapshot {
     /// The schema version; [`parse`] reads only [`SNAPSHOT_VERSION`].
     pub version: u32,
-    /// The primary swarm's accepted admission epoch, or `None` before one is accepted.
+    /// The primary swarm's accepted admission epoch, or `None` before one is accepted; may be absent, and is not used.
     pub epoch: Option<u64>,
     /// One report per swarm: the primary and each worker.
     pub swarms: Vec<RawSwarm>,
@@ -54,13 +58,19 @@ pub struct RawSnapshot {
 pub struct RawSwarm {
     /// The swarm's name: `primary`, or `worker-N` for worker `N`.
     pub network: String,
-    /// The worker id of a worker swarm, or `None` for the primary.
+    /// The worker id of a worker swarm, or `None` for the primary; may be absent.
     pub worker_id: Option<u16>,
     /// Whether the swarm answered the node in time.
     pub available: bool,
     /// The epoch of the latest scheduled and eligible key publication the swarm accepted, or `None` before the first.
+    ///
+    /// Present, possibly null: a missing key is `snapshot-malformed`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub tracked_epoch: Option<u64>,
     /// The swarm's admission status, `None` exactly when `available` is false.
+    ///
+    /// Present, possibly null: a missing key is `snapshot-malformed`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub admission: Option<RawAdmission>,
     /// Every key the swarm tracks.
     pub entries: Vec<RawEntry>,
@@ -74,8 +84,14 @@ pub struct RawAdmission {
     /// The mode applied to connections, below `configured` while a fallback holds.
     pub effective: String,
     /// The latest accepted committee window epoch, or `None` before one is accepted.
+    ///
+    /// Present, possibly null: a missing key is `snapshot-malformed`, since a null one skips the pool-behind check.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub epoch: Option<u64>,
     /// Why `Closed` cannot be enforced (`Missing`, `Stale`, `Contradictory` or `Unresolved`), or `None` when nothing prevents it.
+    ///
+    /// Present, possibly null: a missing key is `snapshot-malformed`, since a null one reads as authoritative.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub fallback: Option<String>,
     /// Current committee identities with authenticated records, the local one included.
     pub resolved_current: u64,
@@ -94,15 +110,15 @@ pub struct RawEntry {
     pub bls_pubkey: String,
     /// The slots the key holds in the swarm, by name.
     pub slots: Vec<String>,
-    /// The base58 PeerId of the held record, or `None` while no record is held.
+    /// The base58 PeerId of the held record, or `None` while no record is held; may be absent.
     pub peer_id: Option<String>,
-    /// The network public key of the held record, as `tn_info` serialises it, or `None` while no record is held.
+    /// The network public key of the held record, as `tn_info` serialises it, or `None` while no record is held; may be absent.
     pub network_pubkey: Option<Value>,
     /// The addresses the swarm uses for the key.
     pub multiaddrs: Vec<String>,
-    /// The signed record's own addresses, present only when a configured address replaces them in `multiaddrs`.
+    /// The signed record's own addresses, present only when a configured address replaces them in `multiaddrs`; the node omits the key otherwise.
     pub record_multiaddrs: Option<Vec<String>>,
-    /// The signed record's timestamp in seconds since the Unix epoch, or `None` while no signed record is held.
+    /// The signed record's timestamp in seconds since the Unix epoch, or `None` while no signed record is held; may be absent.
     pub record_timestamp: Option<u64>,
     /// Where `multiaddrs` came from: `record`, `config`, `stub` or `unresolved`.
     pub source: String,
@@ -315,7 +331,7 @@ pub struct Warnings {
 /// Why a snapshot is not authoritative; [`SnapshotError::token`] is the `STALE_REASON`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotError {
-    /// `snapshot-malformed`: `result` is not an object, `version` is missing or not an unsigned integer, the fields do not fit the v1 model, or the available primary has no admission status.
+    /// `snapshot-malformed`: `result` is not an object, `version` is missing or not an unsigned integer, the fields do not fit the v1 model (a required key missing, a present-possibly-null key missing, or a value of another type), or the available primary has no admission status.
     Malformed,
     /// `snapshot-version-<n>`: a version other than [`SNAPSHOT_VERSION`].
     Version(u64),
@@ -680,6 +696,16 @@ mod tests {
         Ok(())
     }
 
+    /// Removes `field` from the object at `object`; fails when the field is not there, so no case passes by removing nothing.
+    fn remove(result: &mut Value, object: &str, field: &str) -> TestResult {
+        at(result, object)?
+            .as_object_mut()
+            .ok_or_else(|| format!("{object} is not an object"))?
+            .remove(field)
+            .ok_or_else(|| format!("no {object}/{field} in the fixture"))?;
+        Ok(())
+    }
+
     fn push_swarm(result: &mut Value, swarm: &str) -> TestResult {
         at(result, "/swarms")?
             .as_array_mut()
@@ -905,6 +931,38 @@ mod tests {
         let mut result = value(GOOD)?;
         *at(&mut result, "/swarms/0/admission")? = Value::Null;
         assert_eq!(token_of(result).as_deref(), Some("snapshot-malformed"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_nullable_decision_field_is_malformed_in_any_swarm() -> TestResult {
+        // present, possibly null: a null keeps its meaning (see worker_doubts_are_not_fatal and
+        // a_pool_behind_the_admission_window_is_unpublished), but a missing key never reads as null
+        for (object, field) in [
+            ("", "tracked_epoch"),
+            ("", "admission"),
+            ("/admission", "epoch"),
+            ("/admission", "fallback"),
+        ] {
+            let mut result = value(GOOD)?;
+            remove(&mut result, &format!("/swarms/0{object}"), field)?;
+            assert_eq!(
+                token_of(result).as_deref(),
+                Some("snapshot-malformed"),
+                "primary{object}/{field}"
+            );
+
+            let mut result = value(GOOD)?;
+            let mut worker = at(&mut result, "/swarms/0")?.clone();
+            set(&mut worker, "", "network", "worker-3".into())?;
+            remove(&mut worker, object, field)?;
+            push_swarm(&mut result, &worker.to_string())?;
+            assert_eq!(
+                token_of(result).as_deref(),
+                Some("snapshot-malformed"),
+                "worker-3{object}/{field}"
+            );
+        }
         Ok(())
     }
 
