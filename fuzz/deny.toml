@@ -1,0 +1,33 @@
+# cargo deny check for the fuzz crate, run in fuzz/ as `cargo deny --config deny.toml check`.
+# The root deny.toml, rule for rule, with one more license: the fuzz crate is never part of the
+# program, but it builds and runs code from crates.io all the same.
+
+[graph]
+# no target filter: every platform's dependencies are checked
+all-features = true
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# the path dependency on the crate under test has no version; this crate is publish = false,
+# so cargo deny may let that one through and still deny every registry wildcard
+allow-wildcard-paths = true
+highlight = "all"
+
+[licenses]
+# NCSA: libfuzzer-sys is "(MIT OR Apache-2.0) AND NCSA", for the libFuzzer sources from LLVM
+# it vendors and builds; no other crate here needs more than the root list
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "NCSA"]
+confidence-threshold = 0.93
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

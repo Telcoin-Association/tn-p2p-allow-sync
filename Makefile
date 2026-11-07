@@ -2,7 +2,7 @@
 # Every target runs the command CI or the release procedure runs, so a local pass means a CI
 # pass (.github/ACTIONS.md) and a release step behaves the same from make or by hand.
 
-.PHONY: help ci nft-real nft-real-docker release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
+.PHONY: help ci fuzz nft-realnft-real-docker release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
 
 .DEFAULT_GOAL := help
 
@@ -10,6 +10,9 @@ help:
 	@echo "make ci                        five of the seven gates of ci.yaml: fmt, clippy, test, deny, audit;"
 	@echo "                               coverage (cargo llvm-cov) runs in CI only, release-dry-run locally"
 	@echo "                               with bash etc/tests/release_dry_run.sh"
+	@echo "make fuzz [FUZZ_SECONDS=300]   the fuzz job of scheduled.yaml: each target of fuzz/ for FUZZ_SECONDS"
+	@echo "                               (default 300) with its pinned nightly; failing inputs land in"
+	@echo "                               fuzz/artifacts/ (fuzz/README.md)"
 	@echo "make nft-real                  the real-kernel nft test (tests/real_nft.rs) under sudo"
 	@echo "make nft-real-docker [DISTRO=ubuntu:24.04|ubuntu:22.04|debian:13]"
 	@echo "                               the same test without sudo, as root in a privileged container of"
@@ -34,6 +37,22 @@ ci:
 	cargo test --locked
 	cargo deny check
 	cargo audit
+
+# the fuzz job of scheduled.yaml: every target runs, even after one fails, and the target fails at
+# the end if any did; the nightly is the job's FUZZ_TOOLCHAIN and moves with it. The snapshot and
+# nft_listing corpora are seeded from the test fixtures first, which only adds starting points
+FUZZ_TOOLCHAIN = nightly-2026-10-15
+FUZZ_TARGETS = multiaddr cidr_or_host config snapshot nft_listing http_response
+fuzz: FUZZ_SECONDS ?= 300
+fuzz:
+	mkdir -p fuzz/corpus/snapshot fuzz/corpus/nft_listing
+	cp tests/fixtures/snapshot/*.json fuzz/corpus/snapshot/
+	cp tests/fixtures/nft/*.json fuzz/corpus/nft_listing/
+	cd fuzz && failed="" && \
+	for target in $(FUZZ_TARGETS); do \
+		cargo +$(FUZZ_TOOLCHAIN) fuzz run "$$target" -- -max_total_time=$(FUZZ_SECONDS) || failed="$$failed $$target"; \
+	done; \
+	test -z "$$failed" || { echo "failing input found by:$$failed (fuzz/artifacts/<target>/)" >&2; exit 1; }
 
 # the test binary is built as the invoking user and only that binary runs as root, as in
 # nft-real.yaml; TN_REAL_NFT_REQUIRED=1 turns a skip (no root, nft or ip) into a failure
