@@ -8,7 +8,7 @@
 //! 4. The snapshot is fetched, validated and folded into memory; a snapshot that is not authoritative, a regressed epoch and an empty dynamic set are stale (exit 3).
 //! 5. The program is rendered.
 //!    When it equals `current.nft` and the live table holds exactly the desired sets, chain `input` as the program declares it with the program's five rules, and both counters, nft is not run; otherwise the program is staged in `.current.nft.new`, loaded with `nft -f` and renamed to `current.nft`.
-//!    A table that is gone by the time it is listed, deleted while the node was being asked, is loaded again the same way.
+//!    A table that is gone by the time it is listed, deleted while the node was being asked, is loaded again the same way, and so is one whose listing the parser cannot read, with a `listing-unreadable` warning.
 //! 6. `state.json` is written whenever its canonical bytes changed, once the program is loaded, then `status`.
 //!
 //! The stale path, which every exit 3 and every local error takes, lists the tables again unless the run has just loaded the program, keeps a present table as it is, reloads `current.nft` when the table is gone, never writes `state.json` or `current.nft`, and records the reason in `status` with `STALE_SINCE` set only once.
@@ -227,10 +227,11 @@ fn program_rules(ports: &BTreeSet<u16>) -> Vec<Vec<Expr>> {
 /// Whether the live table, as `listing` shows it, is the loaded program for `sets` and `ports`.
 ///
 /// The four sets must hold exactly the desired elements, compared as parsed values after [`normalise`] and never as text.
-/// Chain `input` must have the program's type, hook, priority and policy and hold exactly its [`INPUT_RULES`] rules in order, each with its ports, its source set, its counter and its verdict; both [`COUNTERS`] must exist.
-/// A set, a rule or a counter deleted by hand, and a verdict, a policy or a port list changed by hand, make this false, so the next run re-applies and heals it.
+/// Chain `input` must have the program's type, hook, priority and policy and hold exactly its [`INPUT_RULES`] rules in order, each with its ports, its source set, its counter and its verdict; both [`COUNTERS`] must exist; the table must not be dormant.
+/// A set, a rule or a counter deleted by hand, a verdict, a policy or a port list changed by hand, and a table made dormant by hand make this false, so the next run re-applies and heals it: the program declares the table without flags, which wakes it.
 pub fn listing_matches(listing: &Listing, sets: &Sets, ports: &BTreeSet<u16>) -> bool {
-    listing.chain.as_ref() == Some(&program_chain())
+    !listing.dormant
+        && listing.chain.as_ref() == Some(&program_chain())
         && listing.rules == program_rules(ports)
         && COUNTERS
             .iter()
@@ -624,6 +625,16 @@ impl<O: Write, E: Write> Run<'_, O, E> {
         let listing = if present && current.as_deref() == Some(program.as_bytes()) {
             match self.nft.list_table() {
                 Ok(listing) => Some(listing),
+                // nft listed the table but in a form the comparison cannot read: applying the
+                // program again is the only way back to a table it can
+                Err(NftError::Parse(detail)) => {
+                    self.log.line(
+                        Priority::Warning,
+                        "listing-unreadable",
+                        &[("detail", &detail)],
+                    );
+                    None
+                }
                 // gone while the node was being asked: no listing, so the program is applied again
                 Err(e) => match self.nft.table_present() {
                     Ok(false) => None,
@@ -1036,6 +1047,7 @@ mod tests {
                 .collect(),
             chain: Some(program_chain()),
             rules: program_rules(&ports()),
+            dormant: false,
         };
         for (name, elements) in sets.elements() {
             listing.sets.insert(name.to_owned(), elements);
@@ -1246,6 +1258,40 @@ mod tests {
                 "case {n}"
             );
         }
+    }
+
+    #[test]
+    fn a_dormant_table_re_applies_even_when_everything_else_matches() {
+        let (sets, config) = sample();
+        let program = sets.program(&config.p2p_ports);
+        let ports = &config.p2p_ports;
+        let awake = listing_of(&sets);
+        assert!(is_unchanged(
+            &program,
+            Some(program.as_bytes()),
+            Some(&awake),
+            &sets,
+            ports
+        ));
+        // the same sets, rules and counters, counters with traffic included: the table enforces nothing
+        let mut dormant = Listing {
+            dormant: true,
+            ..awake
+        };
+        for counter in dormant.counters.values_mut() {
+            *counter = Counter {
+                packets: 1,
+                bytes: 29,
+            };
+        }
+        assert!(!listing_matches(&dormant, &sets, ports));
+        assert!(!is_unchanged(
+            &program,
+            Some(program.as_bytes()),
+            Some(&dormant),
+            &sets,
+            ports
+        ));
     }
 
     #[test]
@@ -1560,6 +1606,104 @@ mod tests {
             "{message}"
         );
         assert_eq!(std::fs::read(leftover.join("kept"))?, b"kept");
+        Ok(())
+    }
+
+    /// One `sync` of `state` through `nft`, with `rpc` serving the good snapshot: the exit, stdout and stderr.
+    fn sync_once(
+        state: &Path,
+        nft: &Nft,
+        rpc: &mut crate::support::fake_rpc::FakeRpc,
+    ) -> Result<(Exit, String, String), Box<dyn std::error::Error>> {
+        use crate::support::fake_rpc;
+
+        let snapshot = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/snapshot/good.json"
+        ))?;
+        rpc.set(vec![
+            fake_rpc::result(&snapshot),
+            fake_rpc::result(r#"{"epochId":42,"epochDuration":86400}"#),
+        ])?;
+        let options = SyncOptions {
+            state_dir: state,
+            nft,
+            require_authoritative: false,
+            wait: None,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut log = Log::new(&mut err, false);
+        let exit = sync(&options, &mut out, &mut log);
+        log.finish();
+        Ok((exit, String::from_utf8(out)?, String::from_utf8(err)?))
+    }
+
+    #[test]
+    fn a_listing_the_parser_cannot_read_re_applies_the_program()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::support::{FakeNft, TempDir, fake_rpc::FakeRpc};
+
+        let temp = TempDir::new("sync-unreadable")?;
+        let state = temp.join("state");
+        std::fs::create_dir(&state)?;
+        std::fs::set_permissions(&state, Permissions::from_mode(0o700))?;
+        let fake = FakeNft::install(temp.path())?;
+        let nft = Nft::new(Some(&fake.path()));
+        let mut rpc = FakeRpc::start(Vec::new())?;
+        let config = state.join(config::CONFIG_FILE);
+        std::fs::write(
+            &config,
+            format!(
+                "CONFIG_VERSION=1\nRPC_PORT={}\nP2P_PORTS=49590,49594\nP2P_ALLOW_FROM=\n",
+                rpc.port()
+            ),
+        )?;
+        std::fs::set_permissions(&config, Permissions::from_mode(0o600))?;
+        let result = |out: &str| out.split(' ').next().unwrap_or_default().to_owned();
+
+        let (exit, out, err) = sync_once(&state, &nft, &mut rpc)?;
+        assert_eq!(
+            (exit, result(&out)),
+            (Exit::Fresh, "result=applied".to_owned()),
+            "{err}"
+        );
+        let loaded = fake.table()?.ok_or("no table after the first run")?;
+
+        // a set the program does not declare, whatever it holds, is not read and changes nothing
+        fake.set_table(&format!("{loaded}set ports inet_service\nelem ports 80\n"))?;
+        let (exit, out, err) = sync_once(&state, &nft, &mut rpc)?;
+        assert_eq!(
+            (exit, result(&out)),
+            (Exit::Fresh, "result=unchanged".to_owned()),
+            "{err}"
+        );
+
+        // an element of one of the program's sets that the parser cannot read
+        fake.set_table(&format!("{loaded}elem allow_v4 192.0.2.300\n"))?;
+        let (exit, out, err) = sync_once(&state, &nft, &mut rpc)?;
+        assert_eq!(
+            (exit, result(&out)),
+            (Exit::Fresh, "result=applied".to_owned()),
+            "{err}"
+        );
+        let unreadable: Vec<&str> = err
+            .lines()
+            .filter(|line| line.starts_with("listing-unreadable "))
+            .collect();
+        assert_eq!(
+            unreadable,
+            [r#"listing-unreadable detail="set allow_v4: \"192.0.2.300\" is not an IP address""#]
+        );
+        assert_eq!(fake.loaded()?.len(), 2);
+        // the re-apply replaced the table, so the next run finds it as the program left it
+        assert_eq!(fake.table()?.as_deref(), Some(loaded.as_str()));
+        let (exit, out, err) = sync_once(&state, &nft, &mut rpc)?;
+        assert_eq!(
+            (exit, result(&out)),
+            (Exit::Fresh, "result=unchanged".to_owned()),
+            "{err}"
+        );
+        assert!(!err.contains("listing-unreadable"), "{err}");
         Ok(())
     }
 }

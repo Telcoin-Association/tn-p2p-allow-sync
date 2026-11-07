@@ -7,13 +7,15 @@
 //!
 //! 1. An unsafe state dir, an invalid config or nft failing to list the table is an error, exit 2, as for `sync`.
 //! 2. No table is `absent`, exit 1; the node is not asked.
-//! 3. A snapshot that is not authoritative, or whose epoch is below the applied `EPOCH`, is `stale`, exit 3: the run cannot judge.
-//! 4. A snapshot newer than the applied `EPOCH`, or any snapshot before the first good sync, is `behind`, exit 3: the next sync catches up, so a gap now is no fault.
+//! 3. A dormant table, one whose chains see no packet, is `dormant`, exit 1, whatever the snapshot says: the table enforces nothing.
+//!    The node is still asked, so the lines below show what the table lacks as well.
+//! 4. A snapshot that is not authoritative, or whose epoch is below the applied `EPOCH`, is `stale`, exit 3: the run cannot judge.
+//! 5. A snapshot newer than the applied `EPOCH`, or any snapshot before the first good sync, is `behind`, exit 3: the next sync catches up, so a gap now is no fault.
 //!    So is a gap made only of addresses `state.json` does not hold, such as a record republished at a new address since the last sync.
-//! 5. A current committee address of the primary swarm that the allow sets lack is `missing`, exit 1, when `state.json` holds it or cannot be read.
-//! 6. Otherwise `ok`, exit 0.
+//! 6. A current committee address of the primary swarm that the allow sets lack is `missing`, exit 1, when `state.json` holds it or cannot be read.
+//! 7. Otherwise `ok`, exit 0.
 //!
-//! Whenever a snapshot was compared, up to [`MAX_LINES`] `missing IP` lines and up to [`MAX_LINES`] `mismatch 0x<first 16 hex>` lines come first, then one `result=` line with both totals.
+//! Whenever a snapshot was compared, `dormant` included, up to [`MAX_LINES`] `missing IP` lines and up to [`MAX_LINES`] `mismatch 0x<first 16 hex>` lines come first, then one `result=` line with both totals.
 //! A mismatch is a key whose signed record lists other IPs than the addresses the node dials; both are allowed, so it never changes the verdict.
 
 use std::collections::BTreeSet;
@@ -53,6 +55,8 @@ pub enum Verdict {
     Missing,
     /// The table does not exist: `absent`, exit 1.
     Absent,
+    /// The table exists but is dormant, so it enforces nothing: `dormant`, exit 1.
+    Dormant,
     /// The snapshot is newer than the applied epoch, or every missing address is one the last good sync never held: `behind`, exit 3.
     Behind,
     /// No authoritative snapshot to judge by: `stale`, exit 3.
@@ -66,6 +70,7 @@ impl Verdict {
             Self::Ok => "ok",
             Self::Missing => "missing",
             Self::Absent => "absent",
+            Self::Dormant => "dormant",
             Self::Behind => "behind",
             Self::Stale => "stale",
         }
@@ -75,7 +80,7 @@ impl Verdict {
     pub const fn exit(self) -> Exit {
         match self {
             Self::Ok => Exit::Fresh,
-            Self::Missing | Self::Absent => Exit::Refused,
+            Self::Missing | Self::Absent | Self::Dormant => Exit::Refused,
             Self::Behind | Self::Stale => Exit::Stale,
         }
     }
@@ -136,7 +141,26 @@ fn shown(key: &BlsKey) -> String {
 /// Judges an authoritative `snapshot` against the live table `listing`, with `applied` the `EPOCH` of `status` and `synced` the addresses `state.json` holds, `None` when it is absent or unreadable.
 ///
 /// A snapshot below `applied` is not authoritative under rule 1 and compares nothing; every other snapshot is compared, `behind` included, so the lines show what the next sync adds.
+/// A dormant `listing` makes the verdict `dormant` whatever the snapshot says, with the lines and totals as they would be for the table awake.
 pub fn judge(
+    snapshot: &Snapshot,
+    applied: Option<u64>,
+    synced: Option<&BTreeSet<IpAddr>>,
+    listing: &Listing,
+) -> Report {
+    let report = compare(snapshot, applied, synced, listing);
+    if listing.dormant {
+        Report {
+            verdict: Verdict::Dormant,
+            ..report
+        }
+    } else {
+        report
+    }
+}
+
+/// [`judge`] for a table that is not dormant.
+fn compare(
     snapshot: &Snapshot,
     applied: Option<u64>,
     synced: Option<&BTreeSet<IpAddr>>,
@@ -234,6 +258,11 @@ pub fn check<O: Write, E: Write>(
     };
     let snapshot = match fetch_snapshot(&RpcClient::new(config.rpc_port)) {
         Ok(snapshot) => snapshot,
+        // the table enforces nothing whether or not the node answers; like `absent`, no line
+        // closes the run
+        Err(_) if listing.dormant => {
+            return print(&Report::bare(Verdict::Dormant), out, log, None);
+        }
         Err(reason) => {
             let stale = Line {
                 priority: Priority::Warning,
@@ -263,7 +292,7 @@ pub fn check<O: Write, E: Write>(
             event: "behind",
             fields: &epochs,
         }),
-        Verdict::Ok | Verdict::Missing | Verdict::Absent => None,
+        Verdict::Ok | Verdict::Missing | Verdict::Absent | Verdict::Dormant => None,
     };
     print(&report, out, log, closing)
 }
@@ -629,6 +658,7 @@ mod tests {
             (Verdict::Ok, "ok", 0),
             (Verdict::Missing, "missing", 1),
             (Verdict::Absent, "absent", 1),
+            (Verdict::Dormant, "dormant", 1),
             (Verdict::Behind, "behind", 3),
             (Verdict::Stale, "stale", 3),
         ];
@@ -640,6 +670,90 @@ mod tests {
             Report::bare(Verdict::Absent).render(),
             "result=absent missing_total=0 mismatch_total=0\n"
         );
+    }
+
+    #[test]
+    fn a_dormant_table_is_never_ok_and_still_shows_what_it_lacks() -> TestResult {
+        let snap = primary(vec![
+            entry(1, &["current"], &["203.0.113.10"], None),
+            entry(2, &["current"], &["198.51.100.7"], Some(&["198.51.100.8"])),
+        ])?;
+        let asleep = |listing: &Listing| Listing {
+            dormant: true,
+            ..listing.clone()
+        };
+        let full = hosts(&["203.0.113.10", "198.51.100.7", "198.51.100.8"])?;
+        let gap = hosts(&["203.0.113.10"])?;
+        // ok or missing while awake; dormant while not, with the same lines and totals
+        for (listing, awake) in [(&full, Verdict::Ok), (&gap, Verdict::Missing)] {
+            let report = judge(&snap, Some(42), None, listing);
+            assert_eq!(report.verdict, awake);
+            assert_eq!(
+                judge(&snap, Some(42), None, &asleep(listing)),
+                Report {
+                    verdict: Verdict::Dormant,
+                    ..report
+                }
+            );
+        }
+        let report = judge(&snap, Some(42), None, &asleep(&gap));
+        assert_eq!(
+            report.render().lines().collect::<Vec<_>>(),
+            [
+                "missing 198.51.100.7",
+                "missing 198.51.100.8",
+                "mismatch 0x0200000000000000",
+                "result=dormant missing_total=2 mismatch_total=1",
+            ]
+        );
+        assert_eq!(report.verdict.exit().code(), 1);
+        // a snapshot that makes the awake table behind or stale does not hide it either
+        for applied in [None, Some(41)] {
+            let report = judge(&snap, applied, None, &asleep(&gap));
+            assert_eq!(report.verdict, Verdict::Dormant, "{applied:?}");
+            assert_eq!(report.missing.len(), 2, "{applied:?}");
+        }
+        assert_eq!(
+            judge(&snap, Some(43), None, &asleep(&gap)),
+            Report::bare(Verdict::Dormant)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_is_decided_before_the_listing_that_could_say_dormant() -> TestResult {
+        use crate::support::{FakeNft, TempDir, fake_rpc::FakeRpc};
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("check-absent-first")?;
+        let fake = FakeNft::install(temp.path())?;
+        let rpc = FakeRpc::start(Vec::new())?;
+        let state = temp.join("state");
+        std::fs::create_dir(&state)?;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+        let config = state.join(config::CONFIG_FILE);
+        std::fs::write(
+            &config,
+            format!(
+                "CONFIG_VERSION=1\nRPC_PORT={}\nP2P_PORTS=49590,49594\nP2P_ALLOW_FROM=\n",
+                rpc.port()
+            ),
+        )?;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))?;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut log = Log::new(&mut err, false);
+        let exit = check(&state, &Nft::new(Some(&fake.path())), &mut out, &mut log);
+        drop(log);
+        assert_eq!(exit, Exit::Refused);
+        assert_eq!(
+            String::from_utf8(out)?,
+            "result=absent missing_total=0 mismatch_total=0\n"
+        );
+        // only the tables were listed: a table that is not there has no flags to read, and the
+        // node was not asked
+        assert_eq!(fake.argv()?, ["-j list tables inet"]);
+        assert!(rpc.requests().is_empty());
+        Ok(())
     }
 
     /// A stdout that refuses every write.
