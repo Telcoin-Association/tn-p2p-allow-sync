@@ -161,27 +161,49 @@ The tool calls `tn_admissionSnapshot` with params `[]` over HTTP/1.1 on `127.0.0
 - The response head is capped at 16 KiB and the decoded body at 8 MiB.
 - The address is a literal, so no name is ever resolved.
 
+The node serves the method on that port only when:
+
+- its HTTP server is on (`--http`); otherwise the run is `rpc-unreachable`;
+- `tn` is in its HTTP module set: the default set holds it, and an explicit `--http.api` must list it; otherwise the run is `rpc-method-missing`;
+- it has no JWT secret (`--rpc.jwtsecret`), since the tool sends no token; otherwise every call is `rpc-http-401`;
+- `RPC_PORT` is worker 0's HTTP port, the node's base port; worker N above 0 listens at the base port minus 200 × N.
+
 The result is validated whole; the first fault in this order makes the whole snapshot stale (tokens in [Reason tokens](#reason-tokens)):
 
 1. `result` is an object whose `version` is an unsigned integer.
    `version` is read before the shape, so a later version reports `snapshot-version-<n>` even when its shape changed.
 2. `version` is 1.
 3. The fields fit the v1 model; unknown fields are ignored at every level, so v1 can gain fields.
+   `tracked_epoch`, `admission`, `admission.epoch` and `admission.fallback` are present in every swarm, possibly null; a missing one is `snapshot-malformed`, in a worker swarm too.
 4. 1 to 16 swarms, each named `primary` or `worker-N` (`N` a decimal worker id from 0 to 65535 without a leading zero), each name once.
 5. At most 10000 entries per swarm.
 6. Every `bls_pubkey` is `0x` and 192 hex digits.
 7. The primary swarm exists and is `available: true`.
 8. The primary's `tracked_epoch` is not null.
 9. The available primary has a non-null `admission` (a null one there is `snapshot-malformed`).
-10. The primary's `tracked_epoch` is not below its `admission.epoch`, when both are present.
+10. The primary's `tracked_epoch` is not below its `admission.epoch`, when that is not null.
 11. The primary's `admission.fallback` is null or `Unresolved`; `Missing`, `Stale`, `Contradictory` and any other value are stale.
 
 The snapshot's epoch is the primary's `tracked_epoch`, the epoch whose pool it lists; the top-level `epoch` is not used.
 A snapshot whose epoch is below the last applied epoch is `epoch-regressed`; an equal epoch is the normal case of the runs within one epoch.
 A primary `tracked_epoch` above its `admission.epoch` is accepted, and counted as one `pool-ahead` warning.
 
-A worker swarm is authoritative when it is available, its `tracked_epoch` is not null and not below its `admission.epoch`, and its `admission` is present with a fallback of null or `Unresolved`.
+A worker swarm is authoritative when it is available, its `tracked_epoch` is not null and not below its `admission.epoch`, and its `admission` is not null and has a fallback of null or `Unresolved`.
 A worker swarm that is absent from the snapshot or not authoritative is additions-only (see [Memory](#memory)); it never makes the snapshot stale, `admission: null` included.
+A worker swarm that lacks one of the four keys of rule 3 is a shape fault, so the whole snapshot is `snapshot-malformed`; only a present `null` keeps a worker additions-only.
+
+The 16-swarm cap allows the primary and 15 workers, so a node with more than 15 workers is `snapshot-swarms` on every run; more workers are a deployment constraint, and the deployments run one.
+The 8 MiB body cap binds before any count does: at roughly 600 B per entry it holds about 13000 entries over all swarms, so `rpc-body-too-large` fires before `snapshot-entries` can.
+A node lists at most about 1100 entries per swarm: its 1024 tracked keys, the committees of its window, and its trusted and bootstrap peers.
+
+Some stale reasons are expected and pass by themselves, and each keeps the loaded program:
+
+- At node start: `rpc-unreachable` until its HTTP server is up, `rpc-error--32001` until it has set up its snapshot source, then `fallback-missing` until it accepts its first committee window, then `pool-unpublished` until the entered epoch publishes its pool.
+  That takes seconds on a caught-up node and the whole catch-up on a syncing one.
+- At every epoch entry: a brief `pool-unpublished`, since the node installs the new window before it publishes the new pool.
+- Over a long epoch transition: `fallback-stale`, once the transition outlasts the node's 300 s admission lease.
+
+`check-node.sh` reports such a reason only once `STALE_SINCE` is older than 2 epochs (see [Reason tokens](#reason-tokens)).
 
 Faults inside a valid snapshot are absorbed, counted as occurrences over every swarm, and logged once per kind:
 
@@ -204,7 +226,8 @@ When `record_multiaddrs` is present and its addresses differ from those of `mult
 Fields the decision reads: `version`, `swarms[].network`, `available`, `tracked_epoch`, `admission.epoch`, `admission.fallback`, `entries[].bls_pubkey`, `slots`, `multiaddrs` and `record_multiaddrs`.
 The others (`worker_id`, `peer_id`, `network_pubkey`, `record_timestamp`, `source`, `admitted`, `admission.configured`, `admission.effective` and the admission counts) are parsed and not used; the admission mode never matters, because the firewall is a cost filter independent of the node's gate.
 Unused is not optional: `source` (a string) and `admitted` (a bool) on every entry, and `configured`, `effective` (strings) and `resolved_current`, `required_current`, `connected_current`, `contradicted` (unsigned integers) in every `admission` object, are required, and a snapshot that lacks one or gives it another type is `snapshot-malformed`.
-`worker_id`, `peer_id`, `network_pubkey` and `record_timestamp` may be null or absent.
+`tracked_epoch`, `admission`, `admission.epoch` and `admission.fallback` are present, possibly null.
+`worker_id`, `peer_id`, `network_pubkey`, `record_timestamp`, `record_multiaddrs` and the top-level `epoch` may be null or absent; the node sends `record_multiaddrs` only for a `stub` entry whose signed record lists other addresses.
 
 After a snapshot that validated and folded into memory, the tool calls `tn_getCurrentEpochInfo` best effort and stores its `epochDuration` as `EPOCH_DURATION`.
 A failure there logs `epoch-info-failed reason=<token>`, with the token of the RPC failure or `no-epoch-duration` when the answer holds no positive integer `epochDuration`, and never makes the run stale; the default is 21600 until a value is learned.
