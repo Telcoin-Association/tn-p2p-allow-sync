@@ -27,6 +27,8 @@
 # honors only in a dry run) links the fixture agent's extra socket where ssh -R would put it,
 # at the agent socket of the server's GnuPG home, and runs the remote command here, so the
 # clone is the server's checkout and its home signs through the restricted socket alone.
+# verify then runs again against the clone in each state the server refuses: a local change
+# to a tracked file, another branch, a detached HEAD and a commit behind origin's main.
 #
 # The gates a dry run skips (the comparison with the CI rebuild, the required checks on the
 # tag's commit) run last, one case at a time, as release.sh's own tests call its functions,
@@ -489,6 +491,36 @@ expect_out "verified $tag commit=$r1 signatures=1/1" "verify counts the signatur
 expect_err "==> 1/2 buildbox: connecting" "verify prints its first stage"
 expect_err_line "==> 2/2 " ": make release-verify TAG=$tag" "the server prints stage 2, make release-verify"
 check "verify connects without a forward" test "$(tail -n 1 "$FAKE_SSH_LOG" 2>/dev/null)" = buildbox
+
+# the server's checkout must be main at origin's tip with no local changes: the same verify
+# against the clone put in each state the step refuses, then put back, so a refusal is the
+# checkout check's and a pass would have run verify
+refused_remote() {
+    step "$clone" rel RELEASE_REMOTE_SSH="$FX/fake-ssh" RELEASE_DIR="$rd2" TN_P2P_ALLOW_REBUILD=0 \
+        make --no-print-directory release-verify-remote "TAG=$tag" "REMOTE=buildbox:$clone"
+    expect_rc 2 "make release-verify-remote refuses a server checkout $1"
+    expect_err "git checkout main && git pull --ff-only" "it says to check out main and pull"
+}
+printf 'a local change\n' >>"$clone/README.md"
+refused_remote "with a change to a tracked file"
+expect_err "has local changes to tracked files" "it names the local changes"
+git -C "$clone" checkout -q -- README.md
+git -C "$clone" checkout -q -b other
+refused_remote "on a branch other than main"
+expect_err "is on branch other, not on main" "it names the branch"
+git -C "$clone" checkout -q main
+git -C "$clone" branch -q -D other
+git -C "$clone" checkout -q --detach
+refused_remote "at a detached HEAD"
+expect_err "is at a detached HEAD, not on main" "it says HEAD is detached"
+git -C "$clone" checkout -q main
+git -C "$clone" reset -q --hard HEAD~1
+refused_remote "one commit behind origin/main"
+expect_err "is at $main0, not at origin/main $r1 (1 behind, 0 ahead)" "it says how far behind it is"
+git -C "$clone" reset -q --hard "$r1"
+check "the server's checkout is clean on main at $r1 again" \
+    test "$(git -C "$clone" symbolic-ref --short HEAD)@$(git -C "$clone" rev-parse HEAD)" = "main@$r1" \
+    -a -z "$(git -C "$clone" status --porcelain --untracked-files=no)"
 
 # a rebuild that differs fails verify; release.conf is changed in the clone only, which verify,
 # unlike build and publish, does not compare with main
