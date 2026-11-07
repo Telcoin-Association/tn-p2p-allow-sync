@@ -23,7 +23,7 @@ Raising the status or memory version is a contract change, and the upgrade to su
 `tn-p2p-allow-sync --version` prints five lines on stdout and exits 0:
 
 ```text
-tn-p2p-allow-sync 0.1.0
+tn-p2p-allow-sync 0.1.1
 commit 0123456789abcdef0123456789abcdef01234567
 target x86_64-unknown-linux-musl
 snapshot-versions 1
@@ -548,7 +548,7 @@ When more than one verdict applies, the first of these wins: an error (exit 2), 
 | Key | Value | Meaning |
 |---|---|---|
 | `STATUS_VERSION` | `1` | the format |
-| `TOOL_VERSION` | `0.1.0` | the version of the build that wrote the file |
+| `TOOL_VERSION` | `0.1.1` | the version of the build that wrote the file |
 | `RESULT` | `applied`, `unchanged`, `stale`, `error` or empty | how the last run that reached a decision ended; empty before the first |
 | `LAST_RUN` | unix seconds | when that run started, once it held the lock |
 | `LAST_GOOD` | unix seconds or empty | when a run last applied the program or found it loaded |
