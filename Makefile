@@ -70,7 +70,8 @@ nft-real:
 # not the host's. Only the checkout is mounted, read-write and at its own path, because the
 # binary writes target/real-nft/ under the path it was compiled at; that directory is made first,
 # as the user, so the files root leaves in it can be removed. CI (nft-real.yaml) is the
-# authority, on each Ubuntu release's own kernel; this is the local, sudo-free way to run it
+# authority, on GitHub's runner kernels and with debian:13 pinned by digest; this is the
+# local, sudo-free way to run it
 nft-real-docker: DISTRO ?= ubuntu:24.04
 nft-real-docker:
 	cargo test --locked --no-run --test real_nft --target x86_64-unknown-linux-musl
