@@ -1,0 +1,1 @@
+{"nftables": [{"metainfo": {"version": "1.0.9", "release_name": "Old Doc Yak #3", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "tn_p2p_allow", "handle": 14, "flags": 
