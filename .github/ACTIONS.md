@@ -99,6 +99,37 @@ sudo target/debug/deps/real_nft-<hash> --ignored --exact real_kernel_nft --nocap
 In a container, `ip netns add` has to mount `/run/netns`, so the container needs `--cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN --security-opt apparmor=unconfined`.
 Build with `--target x86_64-unknown-linux-musl` there, so the static binary also starts in an image whose glibc is older than the host's, and mount the checkout at its own path, because the test writes to `target/real-nft/` under the path it was built in.
 
+### `scheduled.yaml`
+
+Two report-only jobs, every Saturday at 03:41 UTC on `main` and on dispatch (*Actions* -> *Scheduled* -> *Run workflow*), never on a pull request.
+Neither is a required check, and neither may become one: they take hours or depend on a nightly compiler, and what they find is work for a maintainer, not a reason to hold a pull request.
+The 60-day rule for schedules in `ci.yaml` applies here too.
+
+| Job | Command | What it reports |
+|---|---|---|
+| `mutants` | `cargo mutants --cargo-arg=--locked --jobs 2 --output target/mutants` | each change to the code (a mutant) that no test notices, in the step summary and the artifact `mutants` |
+| `fuzz` | `cargo +nightly-2026-10-15 fuzz run <target> -- -max_total_time=300` in `fuzz/`, for `multiaddr`, `cidr_or_host`, `config`, `snapshot`, `nft_listing` and `http_response`, then `cargo deny --config deny.toml check` in `fuzz/` | an input that crashes a target, as the artifact `fuzz-artifacts`, and a dependency of the fuzz crate that `fuzz/deny.toml` refuses |
+
+`mutants` stays green whatever it finds: cargo-mutants exits non-zero for a missed or timed-out mutant, and the step has `continue-on-error`.
+Read the step summary, which counts caught, missed, timed-out and unviable mutants and lists the first 50 missed ones, and `mutants.out/` in the artifact, which has all of them with their diffs.
+The step stops after 300 minutes so that the summary and the upload still run; a run cut short reports what it reached.
+`fuzz` runs every target even after one fails, then fails if any did, and uploads `fuzz/artifacts/<target>/` with the crashing inputs.
+The fuzz crate is not a dependency of the program, so nothing of it reaches a release; its dependencies get their own `cargo deny` run because `ci.yaml`'s `deny` sees only the program's.
+Neither job sets `RUSTFLAGS=-D warnings`: a mutant that leaves a value unused has to build and be tested, not be counted as unviable.
+
+To run them locally, from the repository root:
+
+```sh
+cargo install --locked cargo-mutants@27.1.0
+cargo mutants --cargo-arg=--locked --output target/mutants
+
+rustup toolchain install nightly-2026-10-15 --profile minimal
+cargo +nightly-2026-10-15 install --locked cargo-fuzz@0.13.2
+cd fuzz
+cargo +nightly-2026-10-15 fuzz run <target> -- -max_total_time=300
+cargo +nightly-2026-10-15 fuzz run <target> artifacts/<target>/<crash-file>   # replay one input
+```
+
 ## Required checks
 
 Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`, and the two checks of `nft-real.yaml`, `nft-real (ubuntu-24.04)` and `nft-real (ubuntu-22.04)`.
@@ -115,8 +146,8 @@ A SHA cannot move, so the code that runs is the code that was reviewed when the 
 | Action | Release | Commit | Runtime | Used by |
 |---|---|---|---|---|
 | `actions/checkout` | `v7.0.1` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | node24 | every job |
-| `taiki-e/install-action` | `v2.87.22` | `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` | composite (shell steps only) | `deny`, `audit`, `coverage` |
-| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real`, `coverage` |
+| `taiki-e/install-action` | `v2.87.22` | `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` | composite (shell steps only) | `deny`, `audit`, `coverage`, `mutants`, `fuzz` |
+| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real`, `coverage`, `mutants`, `fuzz` |
 
 These are the releases `telcoin-network` pins, so one review of an upstream release covers both repositories.
 All three are lightweight tags, so the tag ref names the commit directly.
@@ -128,6 +159,14 @@ The tools `install-action` installs are pinned by an explicit version as well:
 | `cargo-deny` | `0.20.2` | the manifest in the pinned `install-action` commit, with its sha256 |
 | `cargo-audit` | `0.22.2` | the same |
 | `cargo-llvm-cov` | `0.9.1` | the same |
+| `cargo-mutants` | `27.1.0` | the same (`scheduled.yaml`) |
+
+`fuzz` installs two things outside the manifest, each pinned in `scheduled.yaml`:
+
+| Tool | Version | Source |
+|---|---|---|
+| nightly toolchain | `nightly-2026-10-15` (`FUZZ_TOOLCHAIN`) | `rustup toolchain install --profile minimal`, checked against the Rust release manifest of that date |
+| `cargo-fuzz` | `0.13.2` | `cargo install --locked` from crates.io, built with the `Cargo.lock` it was published with; the pinned `install-action` manifest has no cargo-fuzz |
 
 `fallback: none` on every such step makes the step fail when the pinned manifest lacks the version, instead of fetching an unchecked build through `cargo-binstall`.
 Run the same versions locally (`cargo install --locked cargo-deny@0.20.2 cargo-audit@0.22.2 cargo-llvm-cov@0.9.1`) so a local pass means a CI pass.
@@ -155,7 +194,9 @@ There is no Dependabot here; pins move by hand, in a pull request of their own.
    A `null` answer means that version is gone from the manifest; with `fallback: none` the job would fail, so bump the tool version too.
 4. Rewrite the SHA and the `# vX.Y.Z` comment together on every line that uses the action, and update the tables above in the same commit.
 
-A tool version moves the same way: pick the release, confirm the pinned `install-action` manifest has it (or move that pin first), change `tool:` in `ci.yaml` and the table above, and install the same version locally.
+A tool version moves the same way: pick the release, confirm the pinned `install-action` manifest has it (or move that pin first), change `tool:` in the workflow and the table above, and install the same version locally.
+The nightly of `fuzz` moves by an edit of `FUZZ_TOOLCHAIN` in `scheduled.yaml` and of the table and commands above: pick a date at least 14 days old, so a nightly that breaks or is withdrawn in its first days never lands, and dispatch *Scheduled* on the branch before it merges.
+`cargo-fuzz` moves by its version in the same step.
 
 ### What a pin does not cover
 
