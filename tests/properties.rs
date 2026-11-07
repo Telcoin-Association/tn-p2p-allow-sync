@@ -5,6 +5,9 @@
 //! Nothing is read from the clock or the environment, so every run checks the same cases.
 //! `permuted_inputs_render_byte_equal` in `render_golden.rs` reverses the golden cases; the render properties here generalise it to random inputs, orders and spellings.
 
+// tests build fixtures with std::fs directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::cmp::Ordering;

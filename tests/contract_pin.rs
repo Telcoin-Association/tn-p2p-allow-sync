@@ -6,6 +6,9 @@
 //!
 //! A failure means the contract and the code disagree: fix whichever of the two is wrong, never this test alone.
 
+// tests build fixtures with std::fs directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::collections::BTreeSet;

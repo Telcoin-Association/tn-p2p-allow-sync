@@ -476,6 +476,9 @@ fn read_capture_input(path: &Path) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use crate::support::TempDir;
     use std::error::Error;

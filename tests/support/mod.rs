@@ -6,6 +6,8 @@
 //! [`fake_rpc`] and [`FakeNft`] stand in for the node and for nft in the tests that run the built binary.
 
 #![allow(dead_code)]
+// test helpers build fixtures with std::fs and serve a loopback listener directly
+#![allow(clippy::disallowed_methods)]
 
 pub mod fake_rpc;
 pub mod rng;

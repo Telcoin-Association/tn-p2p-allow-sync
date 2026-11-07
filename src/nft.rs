@@ -597,6 +597,9 @@ fn parse_ip(text: &str) -> Result<IpAddr, String> {
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use std::error::Error;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::os::unix::process::ExitStatusExt;

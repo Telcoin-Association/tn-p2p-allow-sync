@@ -932,6 +932,9 @@ fn snapshot_from_bytes(bytes: &[u8]) -> Result<Snapshot, String> {
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use crate::nft::Counter;
     use std::collections::BTreeMap;

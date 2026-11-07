@@ -3,6 +3,9 @@
 //! Each test gets its own directory holding the state dir, mode 0700, a link to `tests/support/fake-nft.sh` and a [`FakeRpc`].
 //! Every run of the binary is bounded by [`RUN_LIMIT`], so an input that would block a run fails its test instead of hanging the suite.
 
+// tests build fixtures with std::fs directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::collections::BTreeMap;

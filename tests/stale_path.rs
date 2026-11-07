@@ -4,6 +4,9 @@
 //! The fake's knobs make nft fail where a test needs it: a reload, a table listing, the stale path's re-listing, an unreadable or a dormant listing.
 //! Every test checks the exit code, the stdout line, the log lines that matter with the closing line last, the `status` keys, the files the contract says stay untouched, and the nft calls the fake recorded.
 
+// tests build fixtures with std::fs directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::collections::BTreeMap;

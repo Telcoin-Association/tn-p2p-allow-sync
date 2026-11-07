@@ -3,6 +3,9 @@
 //! Each test gets its own directory holding the state dir, mode 0700, and a link to `tests/support/fake-nft.sh`, whose files, kept next to the link, show every call the tool made and the table it left loaded.
 //! The node is a [`FakeRpc`] that answers each call with the next canned response.
 
+// tests build fixtures with std::fs directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::collections::BTreeMap;
