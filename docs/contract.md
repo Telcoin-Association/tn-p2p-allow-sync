@@ -265,7 +265,7 @@ The lock is an exclusive `flock` on `lock`.
 - `lock` itself is created by the first run that takes the lock, a refused one included.
 
 Bash never holds `lock` while the binary runs, since a second open file description conflicts with the tool's own attempt.
-`off` never runs the binary: it stops the timer and the sync service, then holds `flock -w 30` on `lock` itself around the table delete and the removal of the state dir.
+`off` never runs the binary: it stops the timer, the sync service and the boot unit, whose `ExecStop=-/usr/sbin/nft delete table inet tn_p2p_allow` deletes the table once outside the lock, then holds `flock -w 30` on `lock` itself around the table delete and the removal of the state dir.
 
 ## Memory
 
@@ -353,15 +353,22 @@ add element inet tn_p2p_allow static_v4 { 203.0.113.0/24 }
 
 - the program equals `current.nft` byte for byte;
 - the table exists, and its four sets hold exactly the desired elements;
+- the table is not dormant: its `table` object carries no `flags` key;
 - chain `input` exists with type `filter`, hook `input`, priority -20 and policy `accept`;
 - it holds exactly the program's 5 rules in order, each with its `udp dport` ports, its `ip`/`ip6 saddr` set, its named counter and its verdict;
 - both named counters exist.
 
 Elements are compared as parsed values, never as text: a `/32` or `/128` prefix counts as its address, and a range that is exactly one CIDR block counts as that block (nft 1.0.2 lists a network reaching the top of the address space as a range).
 Rules are compared as nft lists their expressions, so a single port printed as a number and a port set printed as an anonymous set both compare as ports, and any expression outside those forms makes the rule differ.
-Anything else re-applies, which is how a sync heals an element, a set, a rule or a counter deleted by hand, and a verdict, a policy or a port list changed by hand.
+Anything else re-applies, which is how a sync heals an element, a set, a rule or a counter deleted by hand, a verdict, a policy or a port list changed by hand, and a table made dormant by hand.
 The listing runs only when the table is present and the program equals `current.nft`, since either failing already re-applies; on such a run the check costs one `nft -j list table inet tn_p2p_allow`.
 Re-applying the same program or a changed one keeps both counters: seen on nft 1.0.2 and 1.0.9, and checked on the Ubuntu 22.04 and 24.04 runner kernels by the real-kernel job.
+Re-applying the program also wakes a dormant table, since the program declares the table without flags: seen on nft 1.0.2, 1.0.9 and 1.1.3.
+
+Two hand edits are beyond a re-apply, and the recovery from both is `off`, then `on`:
+
+- An extra base chain in the table is invisible to the comparison, and `flush table` empties its rules but keeps the chain and its policy, so a `policy drop` there keeps dropping the host's whole input path.
+- Chain `input` recreated with another priority or hook differs from the program, so the run re-applies, but the kernel refuses to change a base chain's hook or priority: every run is then `nft-apply-failed`.
 
 ### How nft is run
 
@@ -370,14 +377,24 @@ nft runs from `/usr/sbin/nft` (or `--nft`), never through a shell, with a cleare
 | Call | Used by | For |
 |---|---|---|
 | `nft -j list tables inet` | `sync`, `check`, `status`, `render --check` | whether the table exists, and whether nft works at all |
-| `nft -j list table inet tn_p2p_allow` | `sync` (when the program is unchanged), `check`, `status` | the sets, the counters, and the chain's declaration and rules |
+| `nft -j list table inet tn_p2p_allow` | `sync` (when the program is unchanged), `check`, `status` | the table's flags, the elements of the four sets, the counters, and the chain's declaration and rules |
 | `nft -f <state-dir>/.current.nft.new` | `sync` | applying the program, one transaction |
 | `nft -f <state-dir>/current.nft` | the stale path of `sync` | reloading the last-good program into an absent table |
 | `nft -c -f -` | `render --check` | checking the program without applying it |
 
 Every `sync` lists the tables before it applies anything, so a missing CAP_NET_ADMIN is caught there; nft 1.0.2 prints nothing on a refused `-f`.
-Any failure of either listing call is `nft-unavailable`, exit 2, nothing touched, but one: when the table listing of `sync` fails and a second tables listing shows the table gone, deleted while the node was being asked, the program is applied.
+Any failure of either listing call is `nft-unavailable`, exit 2, nothing touched, with two exceptions in `sync`, which then applies the program:
+
+- the table listing fails and a second tables listing shows the table gone, deleted while the node was being asked;
+- nft prints the table listing but the tool cannot read it: the run logs one `listing-unreadable detail=…` warning and re-applies, since the comparison needs a listing it can read.
+
+Only the elements of the four sets are read, so a set or a map added by hand, whatever it holds, never makes the listing unreadable.
+`check` and `status` report an unreadable listing as `nft-unavailable`.
 The tool never deletes the table; `off` does.
+
+Nothing caps the program itself.
+The 8 MiB body cap bounds one snapshot at roughly 440k addresses (about 6800 entries of 64 addresses each), a program of 9 to 20 MB, and memory adds only what the snapshots of the last 3 epochs listed.
+The node's own limits, about 1024 tracked keys per swarm and at most 4 addresses in a signed record, put a realistic maximum near 65k addresses; the real-kernel job loads such a program in `<N> s`<!-- T12 fills in -->, well under the unit's 90 s.
 
 ## A sync run
 
@@ -434,10 +451,10 @@ Every token below appears as `STALE_REASON` in `status`, as `reason=` on the std
 | `floor-invalid` | `floor` is unreadable or malformed; for `capture-floor`, an input it cannot read | 2 | `error` |
 | `state-invalid` | `state.json` is not in the form the tool writes; recover with `off`, then `on` | 2 | `error` |
 | `state-io-failed` | a read, write, rename, sync or lock failure in the state dir, or a symlink or special file where a file should be (at `config` or `floor` it is `config-invalid` or `floor-invalid` instead) | 2 | `error`, or no status when the lock itself failed |
-| `nft-apply-failed` | `nft -f` refused the program; the transaction is atomic, so the live table is unchanged | 2 | `error` |
+| `nft-apply-failed` | `nft -f` did not confirm the load: it refused the program, and the transaction is atomic, so the live table is unchanged; or a signal ended it, maybe after it committed; `current.nft` is kept either way, so the next run applies the program again or finds it loaded | 2 | `error` |
 | `reload-failed` | the stale path's `nft -f current.nft` failed | 2 | `error` |
 | `state-dir-invalid` | the state dir failed its checks | 2 | no status written |
-| `nft-unavailable` | nft is missing, failed a listing call or was refused it | 2 | no status written |
+| `nft-unavailable` | nft is missing, failed a listing call or was refused it; a table listing of `sync` that nft printed and the tool cannot read re-applies instead (`listing-unreadable`) | 2 | no status written |
 | `busy` | the lock is held (log line `busy`) | 4 | no status written |
 
 Log-only tokens, never written to `status`: `usage` (a relative `--nft`), `snapshot-unreadable` (`render --snapshot` cannot read its file), `nft-check-failed` (`render --check` and nft rejected the program), `output-failed` (stdout could not be written, or `status --json` could not be serialised) and `no-epoch-duration` (the `epoch-info-failed` reason of an answer without a positive integer `epochDuration`).
