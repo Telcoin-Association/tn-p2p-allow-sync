@@ -2,7 +2,7 @@
 # Every target runs the command CI or the release procedure runs, so a local pass means a CI
 # pass (.github/ACTIONS.md) and a release step behaves the same from make or by hand.
 
-.PHONY: help ci fuzz nft-real nft-real-docker release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
+.PHONY: help ci fuzz mutants nft-real nft-real-docker release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
 
 .DEFAULT_GOAL := help
 
@@ -10,6 +10,8 @@ help:
 	@echo "make ci                        five of the seven gates of ci.yaml: fmt, clippy, test, deny, audit;"
 	@echo "                               coverage (cargo llvm-cov) runs in CI only, release-dry-run locally"
 	@echo "                               with bash etc/tests/release_dry_run.sh"
+	@echo "make mutants [MUTANTS_JOBS=4]  the mutants job of scheduled.yaml in one piece: cargo mutants over the"
+	@echo "                               whole crate, report-only, results under target/mutants/ (about an hour)"
 	@echo "make fuzz [FUZZ_SECONDS=300]   the fuzz job of scheduled.yaml: each target of fuzz/ for FUZZ_SECONDS"
 	@echo "                               (default 300) with its pinned nightly; failing inputs land in"
 	@echo "                               fuzz/artifacts/ (fuzz/README.md)"
@@ -43,6 +45,13 @@ ci:
 # nft_listing corpora are seeded from the test fixtures first, which only adds starting points
 FUZZ_TOOLCHAIN = nightly-2026-10-15
 FUZZ_TARGETS = multiaddr cidr_or_host config snapshot nft_listing http_response
+# the weekly mutants job of scheduled.yaml, unsharded: every mutant of src/ is built and tested
+# in a copy of the tree; a missed mutant is a test gap to close or to justify in the review
+# notes, never a CI gate; cargo-mutants is installed with cargo install cargo-mutants --locked
+mutants: MUTANTS_JOBS ?= 4
+mutants:
+	cargo mutants --cargo-arg=--locked --jobs $(MUTANTS_JOBS) --output target/mutants
+
 fuzz: FUZZ_SECONDS ?= 300
 fuzz:
 	mkdir -p fuzz/corpus/snapshot fuzz/corpus/nft_listing
