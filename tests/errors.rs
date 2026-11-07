@@ -4,6 +4,9 @@
 //! A stdout that cannot be written is `/dev/full`, where every write fails with ENOSPC, or a pipe whose read end is closed before the run, where every write fails with EPIPE.
 //! A closed fd 1 is not among them: closing it in the child needs `unsafe`, and the Rust runtime reopens a closed standard fd on `/dev/null` anyway.
 
+// tests build fixtures with std::fs directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::collections::BTreeMap;

@@ -10,6 +10,9 @@
 //!
 //! The steps, in order: traffic from a listed and an unlisted IPv4 source; the same program and then a larger one re-applied; the smaller one again, so an element departs; a table made dormant by hand and woken by a re-apply; delete and reload; traffic through the IPv6 and static rules; adjacent static networks; `nft -c` of every golden program and of a syntax error; networks at the top of the address space; the built binary's own `sync` twice, against a [`FakeRpc`] on loopback; and timed loads of 20000 and of 65000 elements.
 
+// tests build fixtures with std::fs and send their own UDP probes directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::collections::BTreeSet;

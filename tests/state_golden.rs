@@ -16,6 +16,9 @@
 //!
 //! The unit tests in `src/memory.rs` pin the same file against the writer byte for byte and fold the same snapshots to reach it.
 
+// tests build fixtures with std::fs directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::error::Error;

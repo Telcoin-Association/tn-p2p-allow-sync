@@ -1,12 +1,31 @@
-# Each method below is allowed in exactly one module, the one named in its reason.
+# Each method below is allowed in exactly one module, the one named in its reason, or in none.
 # That module's call site carries `#[allow(clippy::disallowed_methods)]` with a comment
 # saying why, so every exception is visible where it is made; nowhere else may call them.
+# `fsutil` owns std::fs whole, so it allows them once, at the top of the module.
+# Test code builds its fixtures with std::fs and serves its own listeners, so each test
+# module and each test crate allows them once, as its first line, with that reason.
 disallowed-methods = [
     { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "resolves names through DNS; only `rpc` connects, to a literal 127.0.0.1 SocketAddr" },
     { path = "std::net::TcpStream::connect", reason = "takes ToSocketAddrs and may resolve names; only `rpc` connects, with connect_timeout to a SocketAddr" },
+    { path = "std::net::TcpStream::connect_timeout", reason = "opens a connection; only `rpc` connects, to a literal 127.0.0.1 SocketAddr" },
+    { path = "std::net::UdpSocket::bind", reason = "takes ToSocketAddrs and may resolve names; nobody: the tool sends no UDP" },
+    { path = "std::net::UdpSocket::connect", reason = "takes ToSocketAddrs and may resolve names; nobody: the tool sends no UDP" },
+    { path = "std::net::UdpSocket::send_to", reason = "takes ToSocketAddrs and may resolve names; nobody: the tool sends no UDP" },
+    { path = "std::net::TcpListener::bind", reason = "takes ToSocketAddrs and may resolve names; nobody: the tool listens on no port" },
     { path = "std::process::Command::new", reason = "only `nft` runs a program: /usr/sbin/nft from a fixed path with a cleared environment" },
     { path = "std::env::var", reason = "the environment is untrusted input; only `log` reads it, and only JOURNAL_STREAM" },
     { path = "std::env::var_os", reason = "the environment is untrusted input; only `log` reads it, and only JOURNAL_STREAM" },
     { path = "std::env::vars", reason = "the environment is untrusted input; only `log` reads it, and only JOURNAL_STREAM" },
     { path = "std::env::vars_os", reason = "the environment is untrusted input; only `log` reads it, and only JOURNAL_STREAM" },
+    { path = "std::fs::File::open", reason = "follows a symlink and waits on a FIFO; only `fsutil` opens files, with O_NOFOLLOW or O_NONBLOCK and a type check on the open file" },
+    { path = "std::fs::File::create", reason = "follows a symlink and truncates in place; only `fsutil` creates files, with O_CREAT|O_EXCL|O_NOFOLLOW" },
+    { path = "std::fs::OpenOptions::open", reason = "its flags decide whether a symlink is followed or a FIFO waited on; only `fsutil` opens files" },
+    { path = "std::fs::rename", reason = "replaces whatever the target names; only `fsutil` renames, inside the checked state dir" },
+    { path = "std::fs::remove_file", reason = "only `fsutil` removes files, inside the checked state dir and under the lock" },
+    { path = "std::fs::remove_dir", reason = "only `fsutil` removes a directory: an empty leftover in the checked state dir, under the lock" },
+    { path = "std::fs::metadata", reason = "follows a symlink; only `log` stats a path, /proc/self/fd/2, a symlink it must follow; files go through `fsutil`" },
+    { path = "std::fs::symlink_metadata", reason = "only `fsutil` inspects files by path, and refuses what it finds there that is not a regular file" },
+    { path = "std::fs::read", reason = "follows a symlink, has no size cap and waits on a FIFO; only `fsutil` reads files" },
+    { path = "std::fs::read_to_string", reason = "follows a symlink, has no size cap and waits on a FIFO; only `fsutil` reads files" },
+    { path = "std::fs::write", reason = "follows a symlink and truncates in place; only `fsutil` writes files, atomically" },
 ]

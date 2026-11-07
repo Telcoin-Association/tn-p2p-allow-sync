@@ -18,10 +18,8 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{self, Read, Write};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -63,7 +61,7 @@ pub const INPUT_RULES: usize = 5;
 /// The named counters the program declares.
 pub const COUNTERS: [&str; 2] = ["tn_accept_p2p_listed", "tn_drop_p2p_unlisted"];
 
-/// The protocol keyword and the set of each accept rule of the program, in chain order, as [`render`] writes them.
+/// The protocol keyword and the set of each accept rule of the program, in chain order, as [`render::render`] writes them.
 const ACCEPT_RULES: [(&str, &str); 4] = [
     ("ip", "allow_v4"),
     ("ip", "static_v4"),
@@ -473,46 +471,15 @@ fn fetch_epoch_duration<E: Write>(rpc: &RpcClient, log: &mut Log<E>) -> Option<u
 
 /// Writes the program to [`STAGED_FILE`] with mode 0600 and syncs it, removing a leftover of a run that died first.
 ///
-/// Creating with `O_CREAT|O_EXCL|O_NOFOLLOW` never follows a symlink, so the program cannot be written through one.
+/// [`StateDir::create`] creates it with `O_CREAT|O_EXCL|O_NOFOLLOW`, which never follows a symlink, so the program cannot be written through one.
 /// The caller holds the lock, which is what makes removing a leftover safe.
 fn stage(dir: &StateDir, program: &[u8]) -> Result<PathBuf, FsError> {
-    let path = dir.file(STAGED_FILE)?;
-    let io_error = |action, source| FsError::Io {
-        path: path.clone(),
-        action,
-        source,
-    };
-    fsutil::remove_leftover(&path)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(FILE_MODE)
-        .custom_flags(fsutil::O_NOFOLLOW)
-        .open(&path)
-        .map_err(|e| io_error("create", e))?;
-    // the mode given at creation is masked by the umask
-    let written = file
-        .set_permissions(Permissions::from_mode(FILE_MODE))
-        .and_then(|()| file.write_all(program))
-        .and_then(|()| file.sync_all());
-    if let Err(e) = written {
-        // best effort: the error that matters is the one returned
-        let _ = fs::remove_file(&path);
-        return Err(io_error("write", e));
-    }
-    Ok(path)
+    dir.create(STAGED_FILE, program, FILE_MODE)
 }
 
 /// Renames the loaded [`STAGED_FILE`] to [`CURRENT_FILE`] and syncs the directory, so the rename survives a crash.
 fn place(dir: &StateDir) -> Result<(), FsError> {
-    let staged = dir.file(STAGED_FILE)?;
-    let current = dir.file(CURRENT_FILE)?;
-    fs::rename(&staged, &current).map_err(|source| FsError::Io {
-        path: current,
-        action: "rename into place",
-        source,
-    })?;
-    dir.sync()
+    dir.rename(STAGED_FILE, CURRENT_FILE)
 }
 
 /// What `sync` was asked to do.
@@ -659,7 +626,7 @@ impl<O: Write, E: Write> Run<'_, O, E> {
             };
             if let Err(e) = self.nft.load_file(&staged) {
                 // the transaction failed whole, so the live table is as it was
-                let _ = fs::remove_file(&staged);
+                let _ = self.dir.remove(STAGED_FILE);
                 return self.local_error(&Failure::new("nft-apply-failed", &e), None);
             }
             if let Err(e) = place(self.dir) {
@@ -892,7 +859,7 @@ pub fn render<O: Write, E: Write>(
         return nft_unavailable(log, &e);
     }
     let snap = match options.snapshot {
-        Some(path) => match read_snapshot_file(path) {
+        Some(path) => match fsutil::read_bounded(path, count(MAX_SNAPSHOT_FILE)) {
             Ok(bytes) => snapshot_from_bytes(&bytes),
             Err(e) => {
                 return untouched(log, "snapshot-unreadable", &format_args!("{path:?}: {e}"));
@@ -944,23 +911,6 @@ pub fn render<O: Write, E: Write>(
     Exit::Fresh
 }
 
-/// Reads the file of `render --snapshot`: a regular file, at most one byte past [`MAX_SNAPSHOT_FILE`] read.
-fn read_snapshot_file(path: &Path) -> io::Result<Vec<u8>> {
-    // checked before the open, so a FIFO cannot block the run
-    if !fs::metadata(path)?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    let cap = u64::try_from(MAX_SNAPSHOT_FILE)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut bytes = Vec::new();
-    File::open(path)?.take(cap).read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
 /// The snapshot in `bytes`, either a `result` object or a whole JSON-RPC response that holds one, or the stale reason.
 ///
 /// A body past the RPC cap is `rpc-body-too-large` and bytes that are not JSON are `snapshot-malformed`, as from the node.
@@ -982,9 +932,14 @@ fn snapshot_from_bytes(bytes: &[u8]) -> Result<Snapshot, String> {
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use crate::nft::Counter;
     use std::collections::BTreeMap;
+    use std::fs::{self, Permissions};
+    use std::os::unix::fs::PermissionsExt;
     use std::str::FromStr;
 
     fn ip(text: &str) -> IpAddr {

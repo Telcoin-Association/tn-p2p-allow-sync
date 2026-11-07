@@ -2,6 +2,9 @@
 //!
 //! Each test gets its own directory holding the state dir and a link to `tests/support/fake-nft.sh`; the node is a [`FakeRpc`].
 
+// tests build fixtures with std::fs directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::collections::BTreeMap;

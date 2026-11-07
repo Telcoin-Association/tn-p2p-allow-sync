@@ -345,6 +345,9 @@ fn print<O: Write, E: Write>(
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use std::collections::BTreeMap;
     use std::error::Error;

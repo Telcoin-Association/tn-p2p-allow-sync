@@ -82,6 +82,9 @@ pub fn stderr_is_journal() -> bool {
     if stream.is_none() {
         return false;
     }
+    // the crate's one stat that follows a symlink: /proc/self/fd/2 links to whatever fd 2 is,
+    // and JOURNAL_STREAM names that file's device and inode, so following it is the point
+    #[allow(clippy::disallowed_methods)]
     let fd2 = fs::metadata(FD2).ok().map(|meta| (meta.dev(), meta.ino()));
     journal_matches(stream.as_deref(), fd2)
 }

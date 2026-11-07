@@ -89,7 +89,9 @@ impl RpcClient {
     pub fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let started = Instant::now();
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), self.port);
-        // the deadline bounds the connect as well, so the whole call ends within it
+        // the one connection the tool opens: to a literal 127.0.0.1 SocketAddr, so nothing is
+        // resolved; the deadline bounds the connect as well, so the whole call ends within it
+        #[allow(clippy::disallowed_methods)]
         let mut stream = TcpStream::connect_timeout(&addr, self.connect_timeout.min(self.deadline))
             .map_err(io_error)?;
         stream
@@ -461,6 +463,9 @@ fn to_u64(n: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    // tests serve the client from their own loopback listeners
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     use std::error::Error;
