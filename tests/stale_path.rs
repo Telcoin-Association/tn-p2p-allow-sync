@@ -780,11 +780,7 @@ fn an_unreadable_listing_re_applies_the_program_with_a_warning() -> TestResult {
 
     let before = bed.calls()?;
     let ran = bed.sync(answers(&two_keys()))?;
-    // CONTRACT MISMATCH: docs/contract.md, How nft is run, says "Any failure of either listing
-    // call is nft-unavailable, exit 2, nothing touched" with one exception (a table gone), and its
-    // Log lines event list has no `listing-unreadable`. Observed (contract-notes T4b): a listing
-    // nft printed but the parser cannot read is the warning `listing-unreadable detail=…`, and the
-    // program is applied again, exit 0.
+    // docs/contract.md, How nft is run: a listing nft printed but the tool cannot read is `listing-unreadable` and re-applies
     assert_eq!(ran.code, Some(0), "{ran:?}");
     assert_eq!(ran.stdout, format!("result=applied reason= {COUNTS}\n"));
     let events = ran.events();
@@ -814,10 +810,7 @@ fn a_dormant_table_is_re_applied_and_check_reports_it_dormant() -> TestResult {
     let program = bed.read("current.nft")?.ok_or("no current.nft")?;
     let table = bed.nft.table()?.ok_or("no table loaded")?;
 
-    // CONTRACT MISMATCH: docs/contract.md, Idempotence, lists no condition on the table's flags,
-    // its check verdict table has no `dormant`, and its exit table gives check exit 1 only for
-    // `missing` or `absent`. Observed (contract-notes T4b): a dormant table re-applies, and check
-    // says `result=dormant`, exit 1.
+    // docs/contract.md, Idempotence (a dormant table re-applies) and the `dormant` row of `check` (exit 1)
     bed.nft.knob("dormant")?;
     let before = bed.calls()?;
     let ran = bed.sync(answers(&two_keys()))?;
@@ -883,11 +876,7 @@ fn a_failed_listing_on_the_stale_path_is_a_warning_and_reloads_nothing() -> Test
         bed.nft.knob_with("tables-fail-nth", "2")?;
         let before = bed.calls()?;
         let ran = bed.sync(vec![Response::Down])?;
-        // CONTRACT MISMATCH: docs/contract.md, How nft is run, says "Any failure of either listing
-        // call is nft-unavailable, exit 2, nothing touched", and The stale path says
-        // nft-unavailable never takes it. Observed (contract-notes T5, F-B-7): a failure of the
-        // stale path's own listing is the warning `nft-unavailable detail=…`, the stale path goes on
-        // with action=none and no reload, writes status and exits 3.
+        // docs/contract.md, The stale path: a failed re-listing is an `nft-unavailable` warning, action `none`, exit 3
         assert_eq!(ran.code, Some(3), "present={present}: {ran:?}");
         assert_eq!(
             ran.stdout,
