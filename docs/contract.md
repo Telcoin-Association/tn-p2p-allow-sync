@@ -15,6 +15,9 @@ Everything below describes what the code does; a change to any of it is a change
 | Memory file | 1 | `"version":1` in `state.json` | `state-invalid`, exit 2 |
 | nft program | schema 1 | the header comment of `current.nft` | not read back; the text is fixed by this page |
 
+Every build reads `status` and `state.json` of version 1, so the scripts can install a newer binary with `--p2p-committee sync` and keep the memory and the status it finds.
+Raising the status or memory version is a contract change, and the upgrade to such a build needs `off`, then `on`, on every host.
+
 ### `--version`
 
 `tn-p2p-allow-sync --version` prints five lines on stdout and exits 0:
@@ -36,6 +39,20 @@ config-version 1
 
 The deployment scripts require line 1 to equal `tn-p2p-allow-sync` and the pinned tag without its `v`, the `config-version` line to equal the version they write, and the `snapshot-versions` line to contain 1.
 The release checks require the first three lines.
+
+## Release layout
+
+A release `vX.Y.Z` or `vX.Y.Z-rcN` carries three assets, which the deployment scripts install from:
+
+| Asset | What it holds |
+|---|---|
+| `tn-p2p-allow-sync-<tag>-x86_64-unknown-linux-musl.tar.gz` | one directory of the same name without `.tar.gz`, holding exactly `tn-p2p-allow-sync`, `LICENSE-APACHE`, `LICENSE-MIT` and `NOTICE` |
+| `SHA256SUMS` | one line, the sha256 of the tarball |
+| `SHA256SUMS.asc` | the maintainers' detached signatures over `SHA256SUMS` |
+
+The scripts require exactly one tarball line in `SHA256SUMS` and exactly those four files in the tarball, and refuse anything else.
+Adding a second target triple, or another file to the tarball, is a contract change.
+[installing.md](installing.md) describes how the scripts check and install a release.
 
 ## Command line
 
