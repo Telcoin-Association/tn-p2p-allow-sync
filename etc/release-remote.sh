@@ -26,8 +26,18 @@
 #   etc/release-remote.sh socket                  server: print the agent socket path gpg uses
 #                                                 for the home
 #   etc/release-remote.sh step STEP TAG [LABEL]   server: make release-STEP TAG=TAG in this
-#                                                 checkout; tag and sign check the forwarded
-#                                                 agent first and sign through it
+#                                                 checkout, once it is on main at origin's tip
+#                                                 with no local changes; tag and sign check the
+#                                                 forwarded agent next and sign through it
+#
+# step checks the checkout before make runs anything in it, since the Makefile, this script,
+# release/ and release.conf otherwise run as the server holds them (release.sh compares only
+# itself and release.conf with main, and only in build and publish): it fetches main from
+# origin, then refuses (exit 2) local changes to tracked files, the submodule's commit and
+# files included (untracked files are fine), a branch other than main or a detached HEAD, and
+# a HEAD that is not origin's main, and says what to run. setup does not check: it writes
+# nothing outside the GnuPG home, and the tag or sign step that signs with the home checks
+# first.
 #
 # host is the ssh destination (an alias from ~/.ssh/config, or user@host); dir is the checkout
 # on the server, relative to its home unless absolute, by default one named like this checkout.
@@ -192,8 +202,41 @@ step_tools() {
     esac
 }
 
-# make release-STEP in this checkout; tag and sign sign through the forwarded agent, so they
-# check it first and point gpg at the home its socket belongs to
+# The checkout is main at origin's tip, with no local changes (see the header). A detached
+# HEAD at that commit is refused too: no pull moves it, so it is behind at the next release.
+check_checkout() {
+    local where branch changes head main counts ahead behind
+    where=$(uname -n):$ROOT
+    # untracked: the submodule's commit and tracked files count, whatever the config says, and
+    # its untracked files are fine as the checkout's own are
+    changes=$(git -C "$ROOT" status --porcelain --untracked-files=no --ignore-submodules=untracked) ||
+        die 2 "git status failed in $where"
+    if [ -n "$changes" ]; then
+        info "error: $where has local changes to tracked files, and a release step runs only in a clean checkout of main:"
+        printf '%s\n' "$changes" | sed 's/^/    /' >&2
+        info "  run git stash there, or git submodule update --init -- release for the submodule, then git checkout main && git pull --ff-only"
+        exit 2
+    fi
+    branch=$(git -C "$ROOT" symbolic-ref --quiet --short HEAD) || branch=
+    [ "$branch" = main ] ||
+        die 2 "$where is ${branch:+on branch }${branch:-at a detached HEAD}, not on main: run git checkout main && git pull --ff-only there"
+    # the refspec in full, so origin/main is the fetched tip whatever the clone's own refspec
+    git -C "$ROOT" fetch --quiet --no-recurse-submodules origin '+refs/heads/main:refs/remotes/origin/main' >&2 ||
+        die 2 "git fetch of main from origin failed in $where"
+    head=$(git -C "$ROOT" rev-parse --verify --quiet 'HEAD^{commit}') || die 2 "no HEAD commit in $where"
+    main=$(git -C "$ROOT" rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}') ||
+        die 2 "no origin/main in $where after the fetch"
+    if [ "$head" != "$main" ]; then
+        # "<ahead> <behind>": the commits only HEAD has, then those only origin/main has
+        counts=$(git -C "$ROOT" rev-list --left-right --count "$head...$main") || counts='? ?'
+        ahead=${counts%%[[:space:]]*}
+        behind=${counts##*[[:space:]]}
+        die 2 "$where is at $head, not at origin/main $main ($behind behind, $ahead ahead): run git checkout main && git pull --ff-only there"
+    fi
+}
+
+# make release-STEP in this checkout, once check_checkout passes; tag and sign sign through the
+# forwarded agent, so they check it next and point gpg at the home its socket belongs to
 cmd_step() {
     local step=$1 tag=$2 label=${3:-} t missing=
     step_path
@@ -202,6 +245,7 @@ cmd_step() {
     done
     [ -z "$missing" ] ||
         die 2 "missing on $(uname -n):$missing; a command run over ssh reads no .bashrc, so its PATH holds the system directories plus ~/.local/bin, ~/.cargo/bin, /usr/local/bin, /snap/bin and /opt/homebrew/bin when they exist; install the tool in one of them, or pass RELEASE_REMOTE_PATH=<dir>[:<dir>] from the laptop"
+    check_checkout
     if [ "$step" = tag ] || [ "$step" = sign ]; then
         export GNUPGHOME=$HOMEDIR
         cmd_check
