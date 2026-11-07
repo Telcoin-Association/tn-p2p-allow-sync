@@ -1,11 +1,12 @@
 //! Command line: argument parsing, the usage text, the `--version` lines and the exit codes.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::fsutil::{FsError, Lock, StateDir};
+use crate::fsutil::{self, FsError, Lock, StateDir};
 use crate::log::{self, Log, Priority};
 use crate::nft::{self, Nft};
 use crate::sync::{self, RenderOptions, SyncOptions};
@@ -165,6 +166,7 @@ pub enum Command {
 ///
 /// The global flags come before the command, every flag at most once, and only the long forms of the usage text exist.
 /// A flag value or a `capture-floor` file that starts with `-` or is empty is a usage error, so a forgotten value never swallows the next flag; write `./-name` for such a file.
+/// `--state-dir` loses any trailing `/`, and one whose last component is then `.` or `..`, or that was only slashes, is a usage error, so the state dir checks see the dir itself and never what a symlink there points to.
 /// `--wait` takes decimal digits only.
 pub fn parse<I>(args: I) -> Option<Invocation>
 where
@@ -176,7 +178,9 @@ where
     let command = loop {
         let arg = args.next()?;
         match arg.to_str()? {
-            "--state-dir" if state_dir.is_none() => state_dir = Some(path_value(args.next()?)?),
+            "--state-dir" if state_dir.is_none() => {
+                state_dir = Some(state_dir_value(args.next()?)?)
+            }
             "--nft" if nft.is_none() => nft = Some(path_value(args.next()?)?),
             "--version" => break Command::Version,
             "check" => break Command::Check,
@@ -247,6 +251,19 @@ fn parse_files(args: &mut impl Iterator<Item = OsString>) -> Option<Vec<PathBuf>
 fn path_value(arg: OsString) -> Option<PathBuf> {
     let bytes = arg.as_encoded_bytes();
     (!bytes.is_empty() && !bytes.starts_with(b"-")).then(|| PathBuf::from(arg))
+}
+
+/// A `--state-dir` value: a [`path_value`] without its trailing `/`s, and then [ending in a name](fsutil::ends_in_a_name).
+///
+/// The kernel follows a symlink before a trailing `/`, so `DIR/` would pass the state dir's symlink check as the dir it points to.
+fn state_dir_value(arg: OsString) -> Option<PathBuf> {
+    let path = path_value(arg)?;
+    let mut bytes = path.as_os_str().as_bytes();
+    while let Some(rest) = bytes.strip_suffix(b"/") {
+        bytes = rest;
+    }
+    let path = PathBuf::from(OsStr::from_bytes(bytes));
+    fsutil::ends_in_a_name(&path).then_some(path)
 }
 
 /// A `--wait` value: decimal digits, no sign.
@@ -690,9 +707,59 @@ mod tests {
             &["--nft", "a", "--nft", "b", "sync"],
             &["--nft", "", "sync"],
             &["--state-dir=/srv/state", "sync"],
+            &["--state-dir", ".", "sync"],
+            &["--state-dir", "..", "sync"],
+            &["--state-dir", "dir/.", "sync"],
+            &["--state-dir", "dir/..", "sync"],
+            &["--state-dir", "dir/./", "sync"],
+            &["--state-dir", "/", "sync"],
             &["-h"],
         ] {
             assert_eq!(parsed(args), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_state_dir_is_dropped_for_every_command() {
+        // Path equality ignores a trailing `/`, so the raw bytes are compared
+        let raw = |args: &[&str]| parsed(args).map(|i| (i.state_dir.into_os_string(), i.command));
+        for command in [
+            &["sync", "--wait", "5"][..],
+            &["check"],
+            &["status", "--json"],
+            &["render", "--check"],
+            &["capture-floor", "peers.yaml"],
+            &["--version"],
+        ] {
+            for (given, kept) in [
+                ("/srv/state/", "/srv/state"),
+                ("/srv/state///", "/srv/state"),
+                ("rel/", "rel"),
+                ("./.state/", "./.state"),
+            ] {
+                let args = [&["--state-dir", given][..], command].concat();
+                let expected = raw(&[&["--state-dir", kept][..], command].concat());
+                assert_eq!(
+                    expected.as_ref().map(|(dir, _)| dir.as_os_str()),
+                    Some(OsStr::new(kept))
+                );
+                assert_eq!(raw(&args), expected, "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_state_dir_ending_in_dot_or_dot_dot_is_a_usage_error() {
+        for dir in [
+            ".", "..", "./", "../", "dir/.", "dir/..", "dir/./", "dir/..//", "/", "//",
+        ] {
+            for command in ["sync", "check", "status", "render", "--version"] {
+                let args = ["tn-p2p-allow-sync", "--state-dir", dir, command];
+                let (exit, out, err) = run_args(&args);
+                assert_eq!(exit.code(), 2, "{args:?}");
+                assert_eq!(out, "", "{args:?}");
+                assert_eq!(err, USAGE, "{args:?}");
+            }
         }
     }
 
