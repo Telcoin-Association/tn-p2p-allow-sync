@@ -500,6 +500,16 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
 
     use super::*;
+
+    /// `unix_now` reads the wall clock: a constant stand-in (0 or 1) would freeze `LAST_RUN`
+    /// and every age in the status file.
+    #[test]
+    fn unix_now_is_the_wall_clock() {
+        let now = unix_now();
+        // 2025-11-01 00:00:00 UTC; any earlier value means a broken clock or a constant
+        assert!(now > 1_761_955_200, "unix_now gave {now}");
+        assert!(now < 4_102_444_800, "unix_now gave {now}"); // 2100-01-01
+    }
     use crate::support::TempDir;
 
     fn full() -> Status {
