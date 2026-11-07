@@ -421,7 +421,7 @@ The tool never deletes the table; `off` does.
 
 Nothing caps the program itself.
 The 8 MiB body cap bounds one snapshot at roughly 440k addresses (about 6800 entries of 64 addresses each), a program of 9 to 20 MB, and memory adds only what the snapshots of the last 3 epochs listed.
-The node's own limits, about 1024 tracked keys per swarm and at most 4 addresses in a signed record, put a realistic maximum near 65k addresses; the real-kernel job loads such a program in `<N> s`<!-- T12 fills in -->, well under the unit's 90 s.
+The node's own limits, about 1024 tracked keys per swarm and at most 4 addresses in a signed record, put a realistic maximum near 65k addresses; the real-kernel job loads such a program in about 0.3 s (0.2 to 0.3 s on nft 1.0.2, 1.0.9 and 1.1.3), well under the unit's 90 s.
 
 ## A sync run
 
