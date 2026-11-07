@@ -7,7 +7,9 @@
 .DEFAULT_GOAL := help
 
 help:
-	@echo "make ci                        the five gates of ci.yaml: fmt, clippy, test, deny, audit"
+	@echo "make ci                        five of the seven gates of ci.yaml: fmt, clippy, test, deny, audit;"
+	@echo "                               coverage (cargo llvm-cov) runs in CI only, release-dry-run locally"
+	@echo "                               with bash etc/tests/release_dry_run.sh"
 	@echo "make nft-real                  the real-kernel nft test (tests/real_nft.rs) under sudo"
 	@echo "make nft-real-docker [DISTRO=ubuntu:24.04|ubuntu:22.04|debian:13]"
 	@echo "                               the same test without sudo, as root in a privileged container of"
