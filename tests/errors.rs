@@ -1,4 +1,4 @@
-//! Integration tests of error handling and outputs through the built binary: the best-effort epoch info, a `status` or `lock` that cannot be written, `render --check` refused, and the exit code of each failure the contract's table names.
+//! Integration tests of error handling and outputs through the built binary: the best-effort epoch info, a `status` or `lock` that cannot be written, `render --check` refused, the exit code of each failure the contract's table names, and the priority prefixes on a stderr that is the journal.
 //!
 //! Each test gets its own directory holding the state dir, mode 0700, with a config and an empty floor, a link to `tests/support/fake-nft.sh` and a [`FakeRpc`] for the node, as in `tests/sync.rs`.
 //! A stdout that cannot be written is `/dev/full`, where every write fails with ENOSPC, or a pipe whose read end is closed before the run, where every write fails with EPIPE.
@@ -11,8 +11,8 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::fs::{self, OpenOptions};
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -957,5 +957,45 @@ fn a_capture_floor_whose_write_fails_exits_2_and_keeps_the_old_floor() -> TestRe
         bed.read("floor")?.as_deref(),
         Some("# floor 1\n198.51.100.1\n")
     );
+    Ok(())
+}
+
+// ---- the journal ----
+
+#[test]
+fn a_stderr_that_is_the_journal_gets_the_priority_prefixes() -> TestResult {
+    let temp = TempDir::new("journal")?;
+    let missing = temp.join("absent");
+    let refused = format!("state dir {missing:?}: does not exist");
+    let lines =
+        format!("nft-path path=/opt/nft\nerror reason=state-dir-invalid detail={refused:?}\n");
+    let prefixed = format!(
+        "<4>nft-path path=/opt/nft\n<3>error reason=state-dir-invalid detail={refused:?}\n"
+    );
+    // stderr is a file; JOURNAL_STREAM names its device and inode, or those of another file
+    let elsewhere = fs::metadata(temp.path())?;
+    for (name, journal) in [("journal", true), ("elsewhere", false)] {
+        let path = temp.join(name);
+        let stderr = File::create(&path)?;
+        let named = if journal {
+            stderr.metadata()?
+        } else {
+            elsewhere.clone()
+        };
+        // the binary under test is the one program these tests start
+        #[allow(clippy::disallowed_methods)]
+        let status = Command::new(BIN)
+            .arg("--state-dir")
+            .arg(&missing)
+            .args(["--nft", "/opt/nft", "status"])
+            .env("JOURNAL_STREAM", format!("{}:{}", named.dev(), named.ino()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .status()?;
+        assert_eq!(status.code(), Some(2), "{name}");
+        let expected = if journal { &prefixed } else { &lines };
+        assert_eq!(&fs::read_to_string(&path)?, expected, "{name}");
+    }
     Ok(())
 }

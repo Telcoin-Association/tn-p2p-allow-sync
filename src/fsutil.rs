@@ -638,6 +638,16 @@ mod tests {
     }
 
     #[test]
+    fn a_dir_that_cannot_be_inspected_is_refused_with_the_error() -> TestResult {
+        let temp = TempDir::new("uninspectable")?;
+        fs::write(temp.join("file"), b"")?;
+        // a file where a parent dir belongs: lstat fails with ENOTDIR, which is not a missing dir
+        let message = reason(StateDir::open(&temp.join("file").join("state")))?;
+        assert!(message.contains("state\": cannot inspect: "), "{message}");
+        Ok(())
+    }
+
+    #[test]
     fn a_symlinked_dir_is_refused() -> TestResult {
         let temp = TempDir::new("symlink")?;
         let real = temp.join("real");
@@ -869,6 +879,49 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn read_and_mtime_report_any_error_but_a_missing_file() -> TestResult {
+        let temp = TempDir::new("read-error")?;
+        let path = temp.join("state");
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, Permissions::from_mode(STATE_DIR_MODE))?;
+        let dir = StateDir::open(&path)?;
+        // the dir swapped for a file after the checks of open: every lstat in it fails with ENOTDIR
+        fs::remove_dir(&path)?;
+        fs::write(&path, b"")?;
+        assert_eq!(
+            dir.read("status").map_err(|e| e.token()),
+            Err("state-io-failed")
+        );
+        assert_eq!(
+            dir.mtime("status").map_err(|e| e.token()),
+            Err("state-io-failed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn only_an_io_error_has_a_source() -> TestResult {
+        let (temp, dir) = state_dir("source")?;
+        symlink(temp.join("absent"), temp.join("config"))?;
+        let Err(error) = dir.read("config") else {
+            return Err("a symlink was read".into());
+        };
+        assert_eq!(
+            error.source().map(ToString::to_string),
+            Some("is a symlink".to_owned())
+        );
+        let Err(error) = StateDir::open(&temp.join("absent")) else {
+            return Err("a missing dir opened".into());
+        };
+        assert!(error.source().is_none(), "{error:?}");
+        let error = FsError::Busy {
+            path: temp.join(LOCK_FILE),
+        };
+        assert!(error.source().is_none(), "{error:?}");
+        Ok(())
+    }
+
     /// Makes a FIFO at `path` with mkfifo(1); `false` when the host has no mkfifo.
     fn mkfifo(path: &Path) -> Result<bool, Box<dyn Error>> {
         // std cannot make a FIFO, so this test starts mkfifo; the tool itself never does
@@ -918,6 +971,20 @@ mod tests {
         }
         reader.join().map_err(|_| "the reader thread panicked")?;
         assert_eq!(result?, Err("is not a regular file".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn the_open_after_the_check_reads_a_vanished_file_as_none_and_refuses_a_symlink() -> TestResult
+    {
+        let temp = TempDir::new("read-opened")?;
+        // the file removed between the check and the open
+        assert_eq!(read_opened(&temp.join("gone"))?, None);
+        // a symlink swapped in between them: the open refuses it rather than reading its target
+        fs::write(temp.join("secret"), b"secret")?;
+        symlink(temp.join("secret"), temp.join("link"))?;
+        let read = read_opened(&temp.join("link"));
+        assert!(read.is_err(), "{read:?}");
         Ok(())
     }
 
