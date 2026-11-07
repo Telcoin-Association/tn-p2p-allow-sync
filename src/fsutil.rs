@@ -268,20 +268,28 @@ fn regular_file(meta: &fs::Metadata) -> io::Result<()> {
 
 /// Reads a file an operator named on the command line: symlinks followed, a regular file only, at most `max + 1` bytes.
 ///
-/// The open is `O_NONBLOCK` and the type is checked on the open file, so a FIFO, even one swapped in for the file, is refused at once instead of blocking the run.
-/// A regular file ignores `O_NONBLOCK`, and a socket file cannot be opened at all.
+/// The type is checked before the open, so a device, a FIFO or a socket is refused without being opened.
+/// It is checked again on the open file, opened `O_NONBLOCK`, so a FIFO swapped in between the two is refused at once instead of blocking the run; a regular file ignores `O_NONBLOCK`.
 /// The one byte past `max` lets the caller tell a file of exactly `max` bytes from a larger one; what a larger one means is the caller's to say.
 pub fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let regular = |meta: fs::Metadata| {
+        if meta.is_file() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "is not a regular file",
+            ))
+        }
+    };
+    // the tool runs as root, and opening a device node can act on the device: a watchdog arms on open
+    regular(fs::metadata(path)?)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "is not a regular file",
-        ));
-    }
+    // the entry may have been swapped between the check and the open
+    regular(file.metadata()?)?;
     let mut bytes = Vec::new();
     file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
     Ok(bytes)
@@ -910,6 +918,31 @@ mod tests {
         }
         reader.join().map_err(|_| "the reader thread panicked")?;
         assert_eq!(result?, Err("is not a regular file".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn read_bounded_refuses_a_special_file_before_opening_it() -> TestResult {
+        let temp = TempDir::new("bounded-special")?;
+        let socket = temp.join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        // a socket cannot be opened at all, so its detail shows the check came before the open
+        for path in [Path::new("/dev/null"), temp.path(), &socket] {
+            let read = read_bounded(path, 16).map_err(|e| e.to_string());
+            assert_eq!(read, Err("is not a regular file".to_owned()), "{path:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn read_bounded_follows_a_symlink_and_reads_one_byte_past_max() -> TestResult {
+        let temp = TempDir::new("bounded-file")?;
+        let file = temp.join("input");
+        fs::write(&file, b"0123456789")?;
+        let link = temp.join("link");
+        symlink(&file, &link)?;
+        assert_eq!(read_bounded(&file, 16)?, b"0123456789");
+        assert_eq!(read_bounded(&link, 4)?, b"01234");
         Ok(())
     }
 

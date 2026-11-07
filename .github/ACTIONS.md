@@ -64,12 +64,16 @@ One job, `nft-real`, on `pull_request` and on every push to `main`, in three leg
 |---|---|---|---|
 | `nft-real (ubuntu-24.04)` | `ubuntu-24.04` | on the runner, nft 1.0.9 | `real-nft-ubuntu-24.04` |
 | `nft-real (ubuntu-22.04)` | `ubuntu-22.04` | on the runner, nft 1.0.2 | `real-nft-ubuntu-22.04` |
-| `nft-real (debian:13)` | `ubuntu-24.04` | in a privileged `debian:13` container, with Debian's nft | `real-nft-debian-13` |
+| `nft-real (debian:13)` | `ubuntu-24.04` | in a privileged `debian:13` container pinned by digest, with Debian's nft | `real-nft-debian-13` |
 
 The runners are pinned by release rather than `ubuntu-latest` because the question the job answers is about kernels and nft versions.
 The two Ubuntu legs install `nftables` and `iproute2`, build the test binary as the runner user (`cargo test --locked --no-run --test real_nft`), and run only that binary under `sudo -E` with `--ignored`.
-The Debian leg runs `make nft-real-docker DISTRO=debian:13`: it builds the test binary for `x86_64-unknown-linux-musl` as the runner user, so it starts whatever the image's glibc, and runs it with `docker run --privileged` in that image, with its `nftables` and `iproute2` and with `TN_REAL_NFT_REQUIRED=1`.
+The Debian leg runs `make nft-real-docker DISTRO=debian:13@sha256:<digest>`: it builds the test binary for `x86_64-unknown-linux-musl` as the runner user, so it starts whatever the image's glibc, and runs it with `docker run --privileged` in that image, with its `nftables` and `iproute2` and with `TN_REAL_NFT_REQUIRED=1`.
 A container shares the runner's kernel, so that leg answers for Debian 13's nft and its JSON listing against Ubuntu 24.04's kernel, not for Debian's kernel.
+
+The leg's image is the `distro` value of its matrix entry, `debian:13@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6`, the digest of the multi-platform index, so a retagged `debian:13` changes nothing until a pull request moves the pin.
+The pin covers the base image only: `nftables` and `iproute2` still come from Debian's archive through `apt-get` at run time, unpinned on purpose, as on the Ubuntu legs, so the leg tests the versions a Debian 13 validator gets.
+To move it, pick an image at least 7 days old, resolve the index digest with `docker buildx imagetools inspect debian:13` (its `Digest:` line), replace the digest after `debian:13@` in `nft-real.yaml` and here, and let the pull request's run of the leg show that it still passes; the check name stays `nft-real (debian:13)`.
 Every leg uploads `target/real-nft/` (the raw `nft -j` listing after each step and `summary.txt`) as its artifact; the Debian one is named `real-nft-debian-13` because an artifact name cannot hold a `:`.
 
 `tests/real_nft.rs` creates a network namespace and a veth pair, loads the rendered program into the runner's own namespace, and sends UDP from the far end of the pair:
@@ -167,6 +171,8 @@ Branch protection on `main` must require `fmt`, `clippy`, `test`, `coverage`, `d
 `coverage` and `nft-real (debian:13)` are new in v0.1.1 and have to be added to the list by hand; `coverage` belongs there, because a gate that is not required lets a pull request merge while it is red.
 Those settings live on GitHub, not in this repository, so whoever creates or changes the repository sets them.
 No job of `release.yaml` or `scheduled.yaml` may share its name with one of these checks (today: `validate-tag`, `draft-release`, `rebuild`, `verify-release`, `mutants (<k>/4)`, `fuzz`, `deny-weekly` and `audit-weekly`): GitHub matches a required check by name on a commit, whatever workflow reported it.
+It matches by name whatever app reported it, too, and any GitHub App installed on the repository with `checks: write` can post a check run under a required check's name.
+The release gate of `release.conf` (`tn_check_ci_green`) therefore counts only check runs of the GitHub Actions app (`app.slug` `github-actions`), and branch protection should pin each required check's source to GitHub Actions as well (the app chosen beside each check's name in the rule), so a pull request cannot merge on another app's run either.
 A change under `.github/` is a change to the gate and gets the same review as code.
 
 ## Action pins
@@ -179,7 +185,7 @@ A SHA cannot move, so the code that runs is the code that was reviewed when the 
 |---|---|---|---|---|
 | `actions/checkout` | `v7.0.1` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | node24 | every job |
 | `taiki-e/install-action` | `v2.87.22` | `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` | composite (shell steps only) | `deny`, `audit`, `coverage`, `mutants`, `fuzz`, `deny-weekly`, `audit-weekly` |
-| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real`, `coverage`, `mutants`, `fuzz` |
+| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | node24 | `nft-real`, `coverage`, `rebuild`, `mutants`, `fuzz` |
 
 These are the releases `telcoin-network` pins, so one review of an upstream release covers both repositories.
 All three are lightweight tags, so the tag ref names the commit directly.
@@ -233,7 +239,7 @@ The nightly of `fuzz` moves by an edit of `FUZZ_TOOLCHAIN` in `scheduled.yaml` a
 ### What a pin does not cover
 
 The runner image is a label (`ubuntu-24.04`, `ubuntu-22.04`), not a digest, so everything preinstalled on it, `rustup` included, is trusted and not pinned.
-`nft-real` installs `nftables` and `iproute2` from the runner release's own archive, unpinned on purpose: the job tests the versions a validator on that release gets.
+`nft-real` installs `nftables` and `iproute2` unpinned on purpose, from the runner release's own archive or, on the Debian leg, from Debian 13's inside the pinned image: the job tests the versions a validator on that release gets.
 `rustup` downloads the toolchain of `rust-toolchain.toml` and checks it against the Rust release manifest; that pin is the channel `1.94.1`, not a digest.
 The advisory databases `deny`, `audit`, `deny-weekly` and `audit-weekly` read are fetched fresh on every run, on purpose.
 

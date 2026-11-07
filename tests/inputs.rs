@@ -492,14 +492,11 @@ fn capture_floor_refuses_a_special_input_or_a_directory_without_blocking() -> Te
     let directory = bed.temp.join("directory.yaml");
     fs::create_dir(&directory)?;
     let not_regular = "cannot read: is not a regular file";
-    // a socket cannot be opened, so the open's own error is the detail
-    let mut refused = vec![
-        (socket, "cannot read: No such device or address"),
-        (directory, not_regular),
-    ];
+    // the type is checked before the open: a socket, which cannot be opened at all, gets the same detail
+    let mut refused = vec![(socket, not_regular), (directory, not_regular)];
     let fifo = bed.temp.join("fifo.yaml");
     if mkfifo(&fifo)? {
-        // a symlink is followed, and what it reaches is checked on the open file
+        // a symlink is followed, and what it reaches is checked
         let link = bed.temp.join("link.yaml");
         symlink(&fifo, &link)?;
         refused.extend([(fifo, not_regular), (link, not_regular)]);

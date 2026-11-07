@@ -27,6 +27,8 @@
 # honors only in a dry run) links the fixture agent's extra socket where ssh -R would put it,
 # at the agent socket of the server's GnuPG home, and runs the remote command here, so the
 # clone is the server's checkout and its home signs through the restricted socket alone.
+# verify then runs again against the clone in each state the server refuses: a local change
+# to a tracked file, another branch, a detached HEAD and a commit behind origin's main.
 #
 # The gates a dry run skips (the comparison with the CI rebuild, the required checks on the
 # tag's commit) run last, one case at a time, as release.sh's own tests call its functions,
@@ -490,6 +492,36 @@ expect_err "==> 1/2 buildbox: connecting" "verify prints its first stage"
 expect_err_line "==> 2/2 " ": make release-verify TAG=$tag" "the server prints stage 2, make release-verify"
 check "verify connects without a forward" test "$(tail -n 1 "$FAKE_SSH_LOG" 2>/dev/null)" = buildbox
 
+# the server's checkout must be main at origin's tip with no local changes: the same verify
+# against the clone put in each state the step refuses, then put back, so a refusal is the
+# checkout check's and a pass would have run verify
+refused_remote() {
+    step "$clone" rel RELEASE_REMOTE_SSH="$FX/fake-ssh" RELEASE_DIR="$rd2" TN_P2P_ALLOW_REBUILD=0 \
+        make --no-print-directory release-verify-remote "TAG=$tag" "REMOTE=buildbox:$clone"
+    expect_rc 2 "make release-verify-remote refuses a server checkout $1"
+    expect_err "git checkout main && git pull --ff-only" "it says to check out main and pull"
+}
+printf 'a local change\n' >>"$clone/README.md"
+refused_remote "with a change to a tracked file"
+expect_err "has local changes to tracked files" "it names the local changes"
+git -C "$clone" checkout -q -- README.md
+git -C "$clone" checkout -q -b other
+refused_remote "on a branch other than main"
+expect_err "is on branch other, not on main" "it names the branch"
+git -C "$clone" checkout -q main
+git -C "$clone" branch -q -D other
+git -C "$clone" checkout -q --detach
+refused_remote "at a detached HEAD"
+expect_err "is at a detached HEAD, not on main" "it says HEAD is detached"
+git -C "$clone" checkout -q main
+git -C "$clone" reset -q --hard HEAD~1
+refused_remote "one commit behind origin/main"
+expect_err "is at $main0, not at origin/main $r1 (1 behind, 0 ahead)" "it says how far behind it is"
+git -C "$clone" reset -q --hard "$r1"
+check "the server's checkout is clean on main at $r1 again" \
+    test "$(git -C "$clone" symbolic-ref --short HEAD)@$(git -C "$clone" rev-parse HEAD)" = "main@$r1" \
+    -a -z "$(git -C "$clone" status --porcelain --untracked-files=no)"
+
 # a rebuild that differs fails verify; release.conf is changed in the clone only, which verify,
 # unlike build and publish, does not compare with main
 cat >>"$clone/release.conf" <<'EOF'
@@ -596,7 +628,8 @@ expect_err "Cargo.toml at $abort sets the panic strategy to abort (line " "it na
 
 # gh for the gates: logs its arguments to GH_FIXTURE/gh.log, then answers from the files there,
 # applying --jq with jq as gh does: runs.json (run list), artifact-RUN-NAME/ (run download),
-# release.json (release view; without it the release does not exist), check-runs.json (api)
+# release.json (release view; without it the release does not exist), check-runs.json and
+# artifacts.json (api, a commit's check runs and a run's artifacts)
 GHFX=$FX/gh-fixture
 mkdir -p "$GHFX" "$FX/gate-bin"
 cat >"$FX/gate-bin/gh" <<'EOF'
@@ -625,6 +658,7 @@ case $cmd in
         if [ ! -f "$GH_FIXTURE/release.json" ]; then echo "release not found" >&2; exit 1; fi
         exec jq -r "$jqx" "$GH_FIXTURE/release.json" ;;
     api\ */check-runs*) exec jq -r "$jqx" "$GH_FIXTURE/check-runs.json" ;;
+    api\ */artifacts*) exec jq -r "$jqx" "$GH_FIXTURE/artifacts.json" ;;
     *) echo "fixture gh: no answer for gh $cmd" >&2; exit 1 ;;
 esac
 EOF
@@ -645,20 +679,24 @@ gated() {
         _ "$tag" "$r1" "$FX/gate-work" "$draft" "$@"
 }
 
-# check_runs ID=NAME=CONCLUSION...: check-runs.json, the check runs on the release commit; the
-# conclusion pending stands for a run in progress
+# check_runs ID=NAME=CONCLUSION[@APP]...: check-runs.json, the check runs on the release commit,
+# each reported by the app whose slug is APP, github-actions without one; the conclusion
+# pending stands for a run in progress
 check_runs() {
-    local r id name concl state sep=
+    local r id name concl state app sep=
     {
         printf '{"total_count": %d, "check_runs": [' "$#"
         for r in "$@"; do
+            app=github-actions
+            case $r in *@*) app=${r##*@} r=${r%@*} ;; esac
             id=${r%%=*}
             r=${r#*=}
             name=${r%=*}
             concl="\"${r##*=}\""
             state=completed
             if [ "$concl" = '"pending"' ]; then state=in_progress concl=null; fi
-            printf '%s{"id": %s, "name": "%s", "status": "%s", "conclusion": %s}' "$sep" "$id" "$name" "$state" "$concl"
+            printf '%s{"id": %s, "name": "%s", "status": "%s", "conclusion": %s, "app": {"slug": "%s"}}' \
+                "$sep" "$id" "$name" "$state" "$concl" "$app"
             sep=', '
         done
         printf ']}\n'
@@ -700,6 +738,13 @@ expect_rc 1 "check-tag refuses a commit with a failed, a running and a missing r
 expect_err "CI has not passed on $r1: clippy (failure), nft-real (ubuntu-22.04) (in_progress), nft-real (debian:13) (no check run)" \
     "it names each of them and what it found"
 
+# another app posts same-named runs: a success newer than test's failure, and fmt's only run
+check_runs "${green[@]:1}" 41=fmt=success@other-app 42=test=failure 43=test=success@other-app
+gated '' hook_check_tag_extra "$r1" always
+expect_rc 1 "check-tag counts only the check runs of GitHub Actions"
+expect_err "CI has not passed on $r1: fmt (no check run), test (failure)" \
+    "another app's newer success masks no failure and stands in for no check"
+
 printf '{"isDraft": false, "isPrerelease": false, "author": {"login": "github-actions[bot]"}, "assets": []}\n' >"$GHFX/release.json"
 gated '' hook_check_tag_extra "$r1" always
 expect_rc 0 "the required checks of a published release are not asked for again"
@@ -712,12 +757,28 @@ printf '[{"databaseId": 302, "status": "completed", "conclusion": "success", "he
     "$tag" >"$GHFX/runs.json"
 mkdir -p "$GHFX/artifact-302-rebuild-$tag"
 printf '%s  tn-p2p-allow-sync\n' "$packed" >"$GHFX/artifact-302-rebuild-$tag/program.sha256"
+# artifacts NAME=EXPIRED...: artifacts.json, the artifacts of run 302
+artifacts() {
+    local a sep=
+    {
+        printf '{"total_count": %d, "artifacts": [' "$#"
+        for a in "$@"; do
+            printf '%s{"name": "%s", "expired": %s}' "$sep" "${a%=*}" "${a##*=}"
+            sep=', '
+        done
+        printf ']}\n'
+    } >"$GHFX/artifacts.json"
+}
+artifacts "rebuild-$tag=false"
 gated true hook_check_release_files "$gate_rel"
 expect_rc 0 "sign accepts a draft whose program the CI rebuild of $tag also gave"
 expect_err "the CI rebuild of $tag from $r1 (run 302 of release.yaml) gave the same tn-p2p-allow-sync, sha256 $packed" \
     "it names the run and the sha256"
 check "it looks for the release workflow's run on the push of $tag at the release commit" \
     grep -q -F -e "run list --repo Telcoin-Association/tn-p2p-allow-sync --workflow release.yaml --commit $r1 --event push " "$GHFX/gh.log"
+check "it looks up that run's artifacts before the download" \
+    test "$(awk '$1 == "api" && $2 == "repos/Telcoin-Association/tn-p2p-allow-sync/actions/runs/302/artifacts?per_page=100" { a = NR }
+        $1 == "run" && $2 == "download" { d = NR } END { print (a && d && a < d) }' "$GHFX/gh.log")" = 1
 check "it downloads that run's artifact rebuild-$tag" \
     grep -q -x -F -e "run download 302 --repo Telcoin-Association/tn-p2p-allow-sync -n rebuild-$tag -D $FX/gate-work/ci-rebuild" "$GHFX/gh.log"
 
@@ -727,6 +788,20 @@ gated true hook_check_release_files "$gate_rel"
 expect_rc 1 "sign refuses a draft whose program the CI rebuild did not give"
 expect_err "the draft's tn-p2p-allow-sync has sha256 $packed, but the CI rebuild of $tag from $r1 (run 302 of release.yaml) gave sha256 $drift" \
     "it names both sha256s"
+
+artifacts real-nft-debian-13=false "rebuild-$tag=true"
+gated true hook_check_release_files "$gate_rel"
+expect_rc 1 "sign stops when the run's artifact rebuild-$tag has expired"
+expect_err "the artifact rebuild-$tag of run 302 of release.yaml has expired" "it says the artifact expired"
+expect_err "re-run the release workflow's rebuild job of run 302" "it says to re-run the rebuild job"
+check "it does not try to download an expired artifact" \
+    test -z "$(awk '$1 == "run" && $2 == "download"' "$GHFX/gh.log")"
+
+artifacts real-nft-debian-13=false
+gated true hook_check_release_files "$gate_rel"
+expect_rc 1 "sign stops when the run has no artifact rebuild-$tag"
+expect_err "run 302 of release.yaml for $tag has no artifact rebuild-$tag" "it says the artifact is missing"
+expect_err "re-run the release workflow's rebuild job of run 302" "it says to re-run the rebuild job"
 
 printf '[{"databaseId": 301, "status": "completed", "conclusion": "failure", "headBranch": "v0.0.1"}]\n' >"$GHFX/runs.json"
 gated true hook_check_release_files "$gate_rel"

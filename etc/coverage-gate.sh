@@ -33,12 +33,14 @@ baseline_file=$2
 
 number='^[0-9]+(\.[0-9]+)?$'
 
-# exactly one line holding one number, so a stray edit cannot turn the gate off
-mapfile -t lines < "$baseline_file"
-if [ "${#lines[@]}" -ne 1 ] || ! [[ ${lines[0]} =~ $number ]]; then
+# exactly one line holding one number, so a stray edit cannot turn the gate off. awk counts a
+# last line without its newline, as read takes it; no mapfile, which bash 3.2 lacks
+lines=$(awk 'END { print NR }' "$baseline_file") || die "cannot read $baseline_file"
+baseline=
+IFS= read -r baseline < "$baseline_file" || true
+if [ "$lines" -ne 1 ] || ! [[ $baseline =~ $number ]]; then
 	die "$baseline_file must hold one number on one line, such as 97.3"
 fi
-baseline=${lines[0]}
 
 # one export with a numeric line total; anything else is not a coverage run
 if ! total=$(jq -er '

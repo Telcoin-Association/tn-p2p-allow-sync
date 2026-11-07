@@ -50,7 +50,8 @@ jobs:
       fail-fast: false
       matrix:
         # runner: the GitHub runner; distro: the image the test runs in, none for the runner
-        # itself; artifact: the name suffix of the listings, since an artifact name has no `:`
+        # itself, pinned by its index digest (how it moves: .github/ACTIONS.md); artifact: the
+        # name suffix of the listings, since an artifact name has no `:`
         include:
           - name: ubuntu-24.04
             runner: ubuntu-24.04
@@ -60,7 +61,7 @@ jobs:
             artifact: ubuntu-22.04
           - name: debian:13
             runner: ubuntu-24.04
-            distro: debian:13
+            distro: debian:13@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
             artifact: debian-13
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -127,7 +128,7 @@ jobs:
       # builds the musl test binary as the runner user (rust-toolchain.toml lists the target)
       # and runs it in a privileged container of the image with nftables and iproute2 and
       # TN_REAL_NFT_REQUIRED=1, writing target/real-nft/ as the steps above do
-      - name: Run the real-kernel test in ${{ matrix.distro }}
+      - name: Run the real-kernel test in ${{ matrix.name }}
         if: steps.scope.outputs.run == 'true' && matrix.distro
         env:
           DISTRO: ${{ matrix.distro }}

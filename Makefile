@@ -2,7 +2,7 @@
 # Every target runs the command CI or the release procedure runs, so a local pass means a CI
 # pass (.github/ACTIONS.md) and a release step behaves the same from make or by hand.
 
-.PHONY: help ci fuzz nft-realnft-real-docker release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
+.PHONY: help ci fuzz nft-real nft-real-docker release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
 
 .DEFAULT_GOAL := help
 
@@ -70,7 +70,8 @@ nft-real:
 # not the host's. Only the checkout is mounted, read-write and at its own path, because the
 # binary writes target/real-nft/ under the path it was compiled at; that directory is made first,
 # as the user, so the files root leaves in it can be removed. CI (nft-real.yaml) is the
-# authority, on each Ubuntu release's own kernel; this is the local, sudo-free way to run it
+# authority, on GitHub's runner kernels and with debian:13 pinned by digest; this is the
+# local, sudo-free way to run it
 nft-real-docker: DISTRO ?= ubuntu:24.04
 nft-real-docker:
 	cargo test --locked --no-run --test real_nft --target x86_64-unknown-linux-musl

@@ -162,7 +162,7 @@ A wrong `RPC_PORT` fails open: the sync goes stale with `rpc-unreachable` and th
 `capture-floor FILE...` writes it, as root and outside the sync unit's sandbox:
 
 - Each file must be a regular file of at most 16 MiB; symlinks are followed, since the inputs live in `/etc/telcoin`.
-  A file is opened with `O_NONBLOCK` and checked on the open file, so a FIFO is refused, never waited on.
+  A file's type is checked before it is opened and again on the file opened with `O_NONBLOCK`, so a device is never opened and a FIFO is refused, never waited on.
   An unreadable, special or larger file is `floor-invalid` and nothing is written, because a cut input could drop a peer.
 - No YAML or JSON parser is involved.
   Each file is split into runs of the bytes a multiaddr uses (letters, digits and `/.:-_%`), and each run goes through the snapshot's multiaddr parser.
