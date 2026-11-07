@@ -504,7 +504,8 @@ mod tests {
 
     fn full() -> Status {
         Status {
-            tool_version: "0.1.0".to_owned(),
+            // not this build's version, which is the default a load that skipped the key would leave
+            tool_version: "0.0.9".to_owned(),
             result: Some(RunResult::Stale),
             last_run: Some(1_762_300_000),
             last_good: Some(1_762_299_700),

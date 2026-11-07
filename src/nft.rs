@@ -1260,6 +1260,30 @@ mod tests {
     }
 
     #[test]
+    fn a_full_length_prefix_object_is_read() -> TestResult {
+        // the longest prefix of each family is in range; one past it is refused above
+        for (element, net, prefix) in [
+            (
+                r#"{"prefix": {"addr": "192.0.2.10", "len": 32}}"#,
+                v4(192, 0, 2, 10),
+                32,
+            ),
+            (
+                r#"{"prefix": {"addr": "2001:db8::1", "len": 128}}"#,
+                v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]),
+                128,
+            ),
+        ] {
+            assert_eq!(
+                parse_value(serde_json::from_str(element)?),
+                Ok(Element::Cidr { net, prefix }),
+                "{element}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn output_that_is_not_an_nft_document_is_a_parse_error() {
         for json in [
             "",
@@ -1394,11 +1418,14 @@ mod tests {
     #[test]
     fn a_missing_program_is_unavailable() {
         let path = Path::new(FIXTURES).join("no-such-nft");
-        let result = Nft::new(Some(&path)).table_present();
-        assert!(
-            matches!(&result, Err(NftError::Unavailable(why)) if why.starts_with(&format!("{}: ", path.display()))),
-            "{result:?}"
-        );
+        let nft = Nft::new(Some(&path));
+        // delete_table too: it runs nft like every other call, so it cannot succeed without one
+        for result in [nft.table_present().map(drop), nft.delete_table()] {
+            assert!(
+                matches!(&result, Err(NftError::Unavailable(why)) if why.starts_with(&format!("{}: ", path.display()))),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]

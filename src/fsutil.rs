@@ -774,6 +774,33 @@ mod tests {
     }
 
     #[test]
+    fn remove_takes_a_missing_name_as_done_and_refuses_a_directory() -> TestResult {
+        let (temp, dir) = state_dir("remove")?;
+        fs::write(temp.join("current.nft"), b"x")?;
+        dir.remove("current.nft")?;
+        assert!(fs::symlink_metadata(temp.join("current.nft")).is_err());
+        // nothing under the name is already what the removal is for
+        dir.remove("current.nft")?;
+        // a directory is not a file to unlink, and what is in it stays
+        let full = temp.join("snapshot.json");
+        fs::create_dir(&full)?;
+        fs::write(full.join("kept"), b"kept")?;
+        let result = dir.remove("snapshot.json");
+        assert!(
+            matches!(
+                &result,
+                Err(FsError::Io {
+                    action: "remove",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(full.join("kept"))?, b"kept");
+        Ok(())
+    }
+
+    #[test]
     fn write_atomic_removes_an_empty_directory_at_the_temporary_name() -> TestResult {
         let (temp, dir) = state_dir("leftover-dir")?;
         fs::create_dir(temp.join(".status.new"))?;

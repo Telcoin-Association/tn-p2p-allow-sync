@@ -1596,6 +1596,29 @@ mod tests {
         ] {
             assert_eq!(text.parse::<BlsKey>(), Err(BlsKeyError), "{text:?}");
         }
+        // the run maps the error to a token, so the text shows only where a caller prints it
+        assert_eq!(
+            BlsKeyError.to_string(),
+            "not a BLS public key: expected 0x and 192 hex digits"
+        );
+    }
+
+    #[test]
+    fn a_mismatch_in_any_listing_of_a_key_marks_the_merged_entry() {
+        let listing = |mismatch| Entry {
+            mismatch,
+            ..Entry::default()
+        };
+        for (first, second, merged) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let mut entry = listing(first);
+            entry.merge(listing(second));
+            assert_eq!(entry.mismatch, merged, "{first} then {second}");
+        }
     }
 
     #[test]
