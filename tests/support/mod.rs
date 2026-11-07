@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 pub mod fake_rpc;
+pub mod rng;
 
 use std::fs;
 use std::io;
