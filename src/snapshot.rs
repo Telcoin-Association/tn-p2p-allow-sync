@@ -594,6 +594,17 @@ mod tests {
     const ABSORBED: &str = include_str!("../tests/fixtures/snapshot/absorbed.json");
     const WORKER_BEHIND: &str = include_str!("../tests/fixtures/snapshot/worker-behind.json");
 
+    /// The node's schema example as the node serialises it: telcoin-network 250843edc, the JSON
+    /// `admission_snapshot_serves_the_schema_example` asserts (crates/execution/tn-rpc/src/rpc_ext.rs:2177-2291),
+    /// in its wire form (compact, struct field order) with the keys of seeds 7 and 9 that the test derives.
+    const NODE_SCHEMA_V1: &str = include_str!("../tests/fixtures/snapshot/node-schema-v1.json");
+
+    /// `bls_key(7)` of the node test: the compressed BLS public key of the scalar `[7; 32]`.
+    const NODE_KEY_7: &str = "0xaecb3fe3d22a958237df2fdb9c6932c837687151bf8b819f18296cce5c5967fb215f16445486c93dbf6a2c933969a93601c2fda599ece5eb4f44c7a311f061d1390e8337230c72085387af3bef1854ef45307aea81704241cbf9ad10717cf4df";
+
+    /// `bls_key(9)` of the node test: the compressed BLS public key of the scalar `[9; 32]`.
+    const NODE_KEY_9: &str = "0xb77ba5d4bf7524aa429f1700dac5ac0a6de363e66ab0ef0aa13f2872c43a6923122ac96b24db2503f7c6ae4f33ae9ab400174206049b6caaba895383af5609ff2cde4d65ce83ba31f9ada80ba83bb47afb60bbc49dd40b9c7b57410bf8bbc525";
+
     /// Every required field of the v1 model by object and name, with values of another type.
     ///
     /// A missing key and each of these values are `snapshot-malformed`.
@@ -862,6 +873,47 @@ mod tests {
             ),
         ]);
         assert_eq!(primary.entries, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn the_node_serialised_schema_example_parses() -> TestResult {
+        let snapshot = parse(value(NODE_SCHEMA_V1)?)?;
+        assert_eq!(snapshot.epoch, 42);
+        assert_eq!(snapshot.swarms.len(), 1);
+        assert_eq!(snapshot.warnings, Warnings::default());
+        let primary = swarm(&snapshot, PRIMARY_SWARM)?;
+        assert!(primary.authoritative);
+        assert_eq!(primary.tracked_epoch, Some(42));
+        let expected = BTreeMap::from([
+            (
+                NODE_KEY_7.parse::<BlsKey>()?,
+                Entry {
+                    slots: BTreeSet::from([Slot::Current, Slot::Eligible]),
+                    ips: BTreeSet::from([v4(203, 0, 113, 10)]),
+                    mismatch: false,
+                },
+            ),
+            (
+                NODE_KEY_9.parse::<BlsKey>()?,
+                Entry {
+                    slots: BTreeSet::from([Slot::Eligible]),
+                    ips: BTreeSet::from([v4(198, 51, 100, 7)]),
+                    mismatch: false,
+                },
+            ),
+        ]);
+        assert_eq!(primary.entries, expected);
+
+        // good.json is the same example with placeholder keys
+        let good = parse(value(GOOD)?)?;
+        assert_eq!(
+            primary.entries.values().collect::<Vec<_>>(),
+            swarm(&good, PRIMARY_SWARM)?
+                .entries
+                .values()
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 
