@@ -54,6 +54,7 @@ usage: tn-p2p-allow-sync [--state-dir DIR] [--nft PATH] COMMAND
 - A flag value or a `capture-floor` file that is empty or starts with `-` is a usage error, so a missing value never swallows the next flag; write `./-name` for such a file.
 - `--wait` takes decimal digits only, in seconds.
 - `--state-dir` defaults to `/var/lib/telcoin-p2p-allow`.
+  It loses any trailing `/`; a value whose last component is then `.` or `..`, or that was only slashes, is a usage error, since the kernel follows a symlink behind a trailing `/`, `.` or `..` and the state dir checks must see the dir itself.
 - `--nft` defaults to `/usr/sbin/nft`.
   It must be an absolute path: `sync`, `render`, `check` and `status` refuse a relative one with `error reason=usage` and exit 2.
   An absolute path other than the default is accepted with one `nft-path path=…` warning on every run.
@@ -110,11 +111,14 @@ Grammar, version 1:
   The program lists the ports sorted.
 - `P2P_ALLOW_FROM` is empty or a comma-separated list of IPv4 and IPv6 addresses and networks (`A` or `A/N`).
   A prefix is decimal without a sign or a leading zero (`/0` is fine), at most 32 or 128.
+  An IPv4-mapped address (`::ffff:a.b.c.d`) needs a prefix of at least 96; a shorter one refuses the file, naming the entry: `P2P_ALLOW_FROM entry "::ffff:10.0.0.0/95" is an IPv4-mapped address with a prefix length shorter than 96`.
   A bad entry, a hostname included, refuses the whole file: dropping it would cut the static list and resolving it would be DNS.
 - A host entry (an address, `/32` or `/128`) goes through the same canonicalisation as snapshot addresses: an IPv4-mapped IPv6 host becomes an IPv4 host, and an unspecified, multicast or link-local host refuses the file, naming the entry.
   Host entries go to the allow sets.
 - A network entry is masked to its network address and goes to the static set of its family.
+  An IPv4-mapped network `::ffff:a.b.c.d/N` is the IPv4 network `a.b.c.d/(N-96)`, masked, in `static_v4`, where the covered and catch-all rules apply to it as to any IPv4 network; `::ffff:0.0.0.0/96` is a catch-all.
   A network that a wider network of the same family covers is dropped, since nft refuses overlapping intervals in one set; `sync` and `render` log one `static-covered dropped=N` warning per run.
+  An entry repeated exactly, after canonicalisation and masking, is kept once and is not counted as covered.
 - `0.0.0.0/0` and `::/0` are accepted as the operator's policy, and `sync` and `render` log one `static-catch-all` warning per run.
 
 Every refusal is `config-invalid` and names the line at fault when there is one.
@@ -141,6 +145,7 @@ A wrong `RPC_PORT` fails open: the sync goes stale with `rpc-unreachable` and th
 `capture-floor FILE...` writes it, as root and outside the sync unit's sandbox:
 
 - Each file must be a regular file of at most 16 MiB; symlinks are followed, since the inputs live in `/etc/telcoin`.
+  A file is opened with `O_NONBLOCK` and checked on the open file, so a FIFO is refused, never waited on.
   An unreadable, special or larger file is `floor-invalid` and nothing is written, because a cut input could drop a peer.
 - No YAML or JSON parser is involved.
   Each file is split into runs of the bytes a multiaddr uses (letters, digits and `/.:-_%`), and each run goes through the snapshot's multiaddr parser.
