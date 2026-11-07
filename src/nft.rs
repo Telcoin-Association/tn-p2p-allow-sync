@@ -152,6 +152,11 @@ pub struct Listing {
     pub chain: Option<Chain>,
     /// The expressions of each rule of chain `input`, the rules in chain order.
     pub rules: Vec<Vec<Expr>>,
+    /// Whether the table is dormant, so none of its chains sees a packet: its `table` object has a `flags` key.
+    ///
+    /// The program sets no table flags and nft prints the key only for a table that has some, `dormant` being the one an operator sets by hand.
+    /// Only the key's presence counts: nft 1.1.3 prints `"dormant"`, but 1.0.2 and 1.0.9 print some other string of the same output in its place.
+    pub dormant: bool,
 }
 
 /// Runs nft from one fixed path.
@@ -414,6 +419,14 @@ fn parse_listing(json: &[u8]) -> Result<Listing, NftError> {
     let mut listing = Listing::default();
     for (kind, body) in objects(json)? {
         match kind.as_str() {
+            "table" => {
+                // the key of any type, null included: on nft 1.0.x its value is not the flag
+                let flagged = body.get("flags").is_some();
+                let table: TableObject = typed(&kind, body)?;
+                if ours(&table.family, &table.name) {
+                    listing.dormant |= flagged;
+                }
+            }
             "set" => {
                 let set: SetObject = typed(&kind, body)?;
                 if ours(&set.family, &set.table) && SETS.contains(&set.name.as_str()) {
@@ -663,6 +676,7 @@ mod tests {
                 .collect(),
             chain: Some(program_chain()),
             rules: program_rules(),
+            dormant: false,
         }
     }
 
@@ -720,21 +734,22 @@ mod tests {
         parse_listing(json.as_bytes())
     }
 
-    fn program_listing() -> Listing {
+    /// The sets of `capture/program.nft`: two `allow_v4` addresses and one `static_v4` network.
+    fn program_sets() -> [Vec<Element>; 4] {
         let static_v4 = Element::Cidr {
             net: v4(203, 0, 113, 0),
             prefix: 24,
         };
-        table(
-            [
-                vec![ip4(192, 0, 2, 10), ip4(198, 51, 100, 7)],
-                vec![],
-                vec![static_v4],
-                vec![],
-            ],
-            (0, 0),
-            (0, 0),
-        )
+        [
+            vec![ip4(192, 0, 2, 10), ip4(198, 51, 100, 7)],
+            vec![],
+            vec![static_v4],
+            vec![],
+        ]
+    }
+
+    fn program_listing() -> Listing {
+        table(program_sets(), (0, 0), (0, 0))
     }
 
     fn status(code: i32) -> ExitStatus {
@@ -926,11 +941,110 @@ mod tests {
                 ("tables-other", false),
                 ("tables-present", true),
                 ("tables-both", true),
+                ("dormant-tables", true),
             ] {
                 let json = fixture(&format!("{version}-{case}.json"))?;
                 assert_eq!(parse_tables(&json)?, present, "{version} {case}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_dormant_table_lists_as_dormant_whatever_its_flags_value() -> TestResult {
+        // one datagram from an unlisted source before the flag, two while dormant: only the first was counted
+        let expected = Listing {
+            dormant: true,
+            ..table(program_sets(), (0, 0), (1, 29))
+        };
+        for version in VERSIONS {
+            let json = String::from_utf8(fixture(&format!("{version}-dormant.json"))?)?;
+            // only 1.1.3 prints the flag itself; 1.0.x prints another string of the output
+            let named = json.contains(r#""flags": "dormant""#);
+            assert_eq!(named, version.ends_with("-1.1.3"), "{version}");
+            assert_eq!(listing(version, "dormant")?, expected, "{version}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn re_applying_the_program_wakes_a_dormant_table() -> TestResult {
+        // two more datagrams after the reload, both counted again
+        let expected = table(program_sets(), (0, 0), (3, 87));
+        for version in VERSIONS {
+            assert_eq!(
+                listing(version, "dormant-reapplied")?,
+                expected,
+                "{version}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_dormant_listing_cut_short_by_nft_is_a_parse_error() -> TestResult {
+        // nft 1.0.9 stops right after `"flags": ` for this table and still exits 0
+        let json = fixture("ubuntu-24.04-1.0.9-dormant-forms.json")?;
+        assert!(
+            String::from_utf8(json.clone())?
+                .trim_end()
+                .ends_with(r#""flags":"#)
+        );
+        let result = parse_listing(&json);
+        assert!(
+            matches!(&result, Err(NftError::Parse(why)) if why.starts_with("not JSON: ")),
+            "{result:?}"
+        );
+        // the versions that print it whole list the forms table, dormant
+        for version in ["debian-13-1.1.3", "ubuntu-22.04-1.0.2"] {
+            assert_eq!(
+                listing(version, "dormant-forms")?,
+                Listing {
+                    dormant: true,
+                    ..listing(REFERENCE, "forms")?
+                },
+                "{version}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_flags_key_of_any_type_on_our_table_is_dormant() -> TestResult {
+        let document = |table: &str| {
+            format!(r#"{{"nftables": [{{"metainfo": {{"version": "1.0.9"}}}}, {table}]}}"#)
+        };
+        for flags in [
+            r#""dormant""#,
+            r#""Old Doc Yak #3""#,
+            r#"["dormant"]"#,
+            "[]",
+            "1",
+            "null",
+            "{}",
+        ] {
+            let json = document(&format!(
+                r#"{{"table": {{"family": "inet", "name": "tn_p2p_allow", "handle": 13, "flags": {flags}}}}}"#
+            ));
+            assert!(parse_listing(json.as_bytes())?.dormant, "{flags}");
+            assert!(parse_tables(json.as_bytes())?, "{flags}");
+        }
+        for table in [
+            r#"{"table": {"family": "inet", "name": "tn_p2p_allow", "handle": 13}}"#,
+            r#"{"table": {"family": "ip", "name": "tn_p2p_allow", "handle": 2, "flags": "dormant"}}"#,
+            r#"{"table": {"family": "inet", "name": "filter", "handle": 3, "flags": "dormant"}}"#,
+        ] {
+            assert!(
+                !parse_listing(document(table).as_bytes())?.dormant,
+                "{table}"
+            );
+        }
+        // a table object nft would never print is a parse error, as for every known kind
+        let nameless = document(r#"{"table": {"family": "inet", "flags": "dormant"}}"#);
+        assert!(matches!(
+            parse_listing(nameless.as_bytes()),
+            Err(NftError::Parse(_))
+        ));
         Ok(())
     }
 

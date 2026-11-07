@@ -1046,6 +1046,7 @@ mod tests {
                 .collect(),
             chain: Some(program_chain()),
             rules: program_rules(&ports()),
+            dormant: false,
         };
         for (name, elements) in sets.elements() {
             listing.sets.insert(name.to_owned(), elements);
