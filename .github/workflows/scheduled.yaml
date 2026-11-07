@@ -147,6 +147,14 @@ jobs:
           tool: cargo-deny@0.20.2
           fallback: none
 
+      # the corpus directories are not committed, so the structured targets start from the
+      # repository's own fixtures, as `make fuzz` does
+      - name: Seed the corpora from the fixtures
+        run: |
+          mkdir -p fuzz/corpus/snapshot fuzz/corpus/nft_listing
+          cp tests/fixtures/snapshot/*.json fuzz/corpus/snapshot/
+          cp tests/fixtures/nft/*.json fuzz/corpus/nft_listing/
+
       # every target runs even after one fails; the step fails at the end if any did
       - name: Fuzz each target for 5 minutes
         id: fuzz
