@@ -575,8 +575,22 @@ mod tests {
     type TestResult = Result<(), Box<dyn Error>>;
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/nft");
-    const VERSIONS: [&str; 2] = ["ubuntu-24.04-1.0.9", "ubuntu-22.04-1.0.2"];
-    const LISTINGS: [&str; 5] = ["program", "ipv6", "empty", "traffic", "forms"];
+    const VERSIONS: [&str; 3] = [
+        "debian-13-1.1.3",
+        "ubuntu-24.04-1.0.9",
+        "ubuntu-22.04-1.0.2",
+    ];
+    /// The version every other one is compared with.
+    const REFERENCE: &str = "ubuntu-24.04-1.0.9";
+    const LISTINGS: [&str; 7] = [
+        "program",
+        "ipv6",
+        "empty",
+        "traffic",
+        "forms",
+        "adjacent",
+        "single-port",
+    ];
 
     fn fixture(name: &str) -> io::Result<Vec<u8>> {
         std::fs::read(Path::new(FIXTURES).join(name))
@@ -648,7 +662,12 @@ mod tests {
 
     /// The five rules of the reference program, on ports 49590 and 49594.
     fn program_rules() -> Vec<Vec<Expr>> {
-        let ports = || Expr::UdpDport(BTreeSet::from([49590, 49594]));
+        rules_on(&[49590, 49594])
+    }
+
+    /// The five rules of the reference program on `ports`.
+    fn rules_on(ports: &[u16]) -> Vec<Vec<Expr>> {
+        let ports = || Expr::UdpDport(ports.iter().copied().collect());
         let accept = |protocol: &str, set: &str| {
             vec![
                 ports(),
@@ -827,10 +846,58 @@ mod tests {
     }
 
     #[test]
-    fn both_nft_versions_list_the_same_table() -> TestResult {
-        let [newer, older] = VERSIONS;
-        for case in LISTINGS {
-            assert_eq!(listing(newer, case)?, listing(older, case)?, "{case}");
+    fn every_nft_version_lists_the_same_table() -> TestResult {
+        for version in VERSIONS {
+            for case in LISTINGS {
+                assert_eq!(
+                    listing(version, case)?,
+                    listing(REFERENCE, case)?,
+                    "{version} {case}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adjacent_networks_list_as_separate_prefixes() -> TestResult {
+        let net = |net: IpAddr, prefix: u8| Element::Cidr { net, prefix };
+        let expected = table(
+            [
+                vec![],
+                vec![],
+                vec![
+                    net(v4(10, 0, 0, 0), 24),
+                    net(v4(10, 0, 1, 0), 24),
+                    net(v4(10, 0, 3, 0), 24),
+                ],
+                vec![
+                    net(v6([0x2001, 0xdb8, 1, 0, 0, 0, 0, 0]), 48),
+                    net(v6([0x2001, 0xdb8, 2, 0, 0, 0, 0, 0]), 48),
+                    net(v6([0x2001, 0xdb8, 4, 0, 0, 0, 0, 0]), 48),
+                ],
+            ],
+            (0, 0),
+            (0, 0),
+        );
+        for version in VERSIONS {
+            assert_eq!(listing(version, "adjacent")?, expected, "{version}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_port_lists_as_the_one_port_rule_form() -> TestResult {
+        let expected = Listing {
+            rules: rules_on(&[49590]),
+            ..program_listing()
+        };
+        for version in VERSIONS {
+            let json = String::from_utf8(fixture(&format!("{version}-single-port.json"))?)?;
+            // a bare number, never an anonymous set of one
+            assert!(json.contains(r#""right": 49590}"#), "{version}");
+            assert!(!json.contains(r#""set": [49590]"#), "{version}");
+            assert_eq!(listing(version, "single-port")?, expected, "{version}");
         }
         Ok(())
     }
@@ -1208,11 +1275,14 @@ mod tests {
                 "{version}: {result:?}"
             );
         }
-        let newer = fixture("ubuntu-24.04-1.0.9-eperm-load.stderr")?;
-        assert_eq!(
-            outcome(finished(1, &newer), Ok(())).map(drop),
-            Err(NftError::Permission)
-        );
+        for newer in ["debian-13-1.1.3", "ubuntu-24.04-1.0.9"] {
+            let load = fixture(&format!("{newer}-eperm-load.stderr"))?;
+            assert_eq!(
+                outcome(finished(1, &load), Ok(())).map(drop),
+                Err(NftError::Permission),
+                "{newer}"
+            );
+        }
         // nft 1.0.2 refuses -f and -c without a word
         let older = fixture("ubuntu-22.04-1.0.2-eperm-load.stderr")?;
         assert!(older.is_empty());
