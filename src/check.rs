@@ -27,7 +27,7 @@ use serde_json::Value;
 use crate::cli::Exit;
 use crate::config;
 use crate::fsutil::StateDir;
-use crate::log::{Log, Priority};
+use crate::log::{Line, Log, Priority};
 use crate::memory;
 use crate::nft::{Element, Listing, Nft};
 use crate::rpc::RpcClient;
@@ -229,14 +229,18 @@ pub fn check<O: Write, E: Write>(
     };
     let listing = match status::live_table(nft) {
         Ok(Some(listing)) => listing,
-        Ok(None) => return print(&Report::bare(Verdict::Absent), out, log),
+        Ok(None) => return print(&Report::bare(Verdict::Absent), out, log, None),
         Err(e) => return error(log, "nft-unavailable", &e),
     };
     let snapshot = match fetch_snapshot(&RpcClient::new(config.rpc_port)) {
         Ok(snapshot) => snapshot,
         Err(reason) => {
-            log.line(Priority::Warning, "stale", &[("reason", &reason)]);
-            return print(&Report::bare(Verdict::Stale), out, log);
+            let stale = Line {
+                priority: Priority::Warning,
+                event: "stale",
+                fields: &[("reason", &reason)],
+            };
+            return print(&Report::bare(Verdict::Stale), out, log, Some(stale));
         }
     };
     let report = judge(&snapshot, applied, synced.as_ref(), &listing);
@@ -246,19 +250,22 @@ pub fn check<O: Write, E: Write>(
         ("snapshot_epoch", snapshot_epoch.as_str()),
         ("applied_epoch", applied_epoch.as_str()),
     ];
-    match report.verdict {
-        Verdict::Stale => {
-            let [shown, last] = epochs;
-            log.line(
-                Priority::Warning,
-                "stale",
-                &[("reason", EPOCH_REGRESSED), shown, last],
-            );
-        }
-        Verdict::Behind => log.line(Priority::Warning, "behind", &epochs),
-        Verdict::Ok | Verdict::Missing | Verdict::Absent => {}
-    }
-    print(&report, out, log)
+    let [shown, last] = epochs;
+    let regressed = [("reason", EPOCH_REGRESSED), shown, last];
+    let closing = match report.verdict {
+        Verdict::Stale => Some(Line {
+            priority: Priority::Warning,
+            event: "stale",
+            fields: &regressed,
+        }),
+        Verdict::Behind => Some(Line {
+            priority: Priority::Warning,
+            event: "behind",
+            fields: &epochs,
+        }),
+        Verdict::Ok | Verdict::Missing | Verdict::Absent => None,
+    };
+    print(&report, out, log, closing)
 }
 
 /// The snapshot from the node, or the stale reason, exactly as `sync` fetches it.
@@ -269,9 +276,9 @@ fn fetch_snapshot(rpc: &RpcClient) -> Result<Snapshot, String> {
     snapshot::parse(result).map_err(|e| e.token())
 }
 
-/// Logs an error that ends the run with nothing judged: exit 2.
+/// Logs an error that ends the run with nothing judged, as its closing line: exit 2.
 fn error<E: Write>(log: &mut Log<E>, reason: &str, detail: &dyn std::fmt::Display) -> Exit {
-    log.line(
+    log.last(
         Priority::Error,
         "error",
         &[("reason", reason), ("detail", &detail.to_string())],
@@ -279,14 +286,31 @@ fn error<E: Write>(log: &mut Log<E>, reason: &str, detail: &dyn std::fmt::Displa
     Exit::Error
 }
 
-/// Prints `report` and exits as its verdict says, or exit 2 when stdout cannot be written.
-fn print<O: Write, E: Write>(report: &Report, out: &mut O, log: &mut Log<E>) -> Exit {
+/// Prints `report` and exits as its verdict says, with `closing` as the run's closing line, or exit 2 when stdout cannot be written.
+///
+/// A failed write ends the run with its own `error` line, and `closing` is logged just before it.
+fn print<O: Write, E: Write>(
+    report: &Report,
+    out: &mut O,
+    log: &mut Log<E>,
+    closing: Option<Line<'_>>,
+) -> Exit {
     match out
         .write_all(report.render().as_bytes())
         .and_then(|()| out.flush())
     {
-        Ok(()) => report.verdict.exit(),
-        Err(e) => error(log, "output-failed", &e),
+        Ok(()) => {
+            if let Some(closing) = closing {
+                log.last(closing.priority, closing.event, closing.fields);
+            }
+            report.verdict.exit()
+        }
+        Err(e) => {
+            if let Some(closing) = closing {
+                log.line(closing.priority, closing.event, closing.fields);
+            }
+            error(log, "output-failed", &e)
+        }
     }
 }
 
@@ -616,5 +640,108 @@ mod tests {
             Report::bare(Verdict::Absent).render(),
             "result=absent missing_total=0 mismatch_total=0\n"
         );
+    }
+
+    /// A stdout that refuses every write.
+    struct Closed;
+
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A log on `err` that already holds ten warnings.
+    fn warned(err: &mut Vec<u8>) -> Log<&mut Vec<u8>> {
+        let mut log = Log::new(err, false);
+        for n in 0..10 {
+            log.line(Priority::Warning, "warning", &[("n", &n.to_string())]);
+        }
+        log
+    }
+
+    #[test]
+    fn ten_warnings_still_end_with_the_closing_line() -> TestResult {
+        use crate::log::MAX_LINES;
+        use crate::support::TempDir;
+
+        let capped = |err: &[u8], dropped: u64| -> Result<String, Box<dyn Error>> {
+            let text = String::from_utf8(err.to_vec())?;
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), MAX_LINES, "{text}");
+            assert_eq!(
+                lines.get(6).copied(),
+                Some(format!("log-capped dropped={dropped}").as_str()),
+                "{text}"
+            );
+            Ok(lines.last().copied().unwrap_or_default().to_owned())
+        };
+
+        // an error: a state dir without a config
+        let temp = TempDir::new("check-closing")?;
+        let mut err = Vec::new();
+        let mut log = warned(&mut err);
+        let exit = check(temp.path(), &Nft::new(None), &mut Vec::new(), &mut log);
+        drop(log);
+        assert_eq!(exit, Exit::Error);
+        let last = capped(&err, 4)?;
+        assert!(last.starts_with("error reason=config-invalid "), "{last}");
+
+        // a stale or behind verdict: its line comes after the report
+        let stale = Line {
+            priority: Priority::Warning,
+            event: "stale",
+            fields: &[("reason", "rpc-unreachable")],
+        };
+        let mut err = Vec::new();
+        let mut log = warned(&mut err);
+        let mut out = Vec::new();
+        let exit = print(
+            &Report::bare(Verdict::Stale),
+            &mut out,
+            &mut log,
+            Some(stale),
+        );
+        drop(log);
+        assert_eq!(exit, Exit::Stale);
+        assert_eq!(
+            String::from_utf8(out)?,
+            "result=stale missing_total=0 mismatch_total=0\n"
+        );
+        assert_eq!(capped(&err, 4)?, "stale reason=rpc-unreachable");
+
+        // a report that cannot be printed: the failure closes the run, after the verdict's line
+        let mut err = Vec::new();
+        let mut log = warned(&mut err);
+        let exit = print(
+            &Report::bare(Verdict::Stale),
+            &mut Closed,
+            &mut log,
+            Some(stale),
+        );
+        drop(log);
+        assert_eq!(exit, Exit::Error);
+        let last = capped(&err, 5)?;
+        assert!(last.starts_with("error reason=output-failed "), "{last}");
+
+        let mut err = Vec::new();
+        let mut log = Log::new(&mut err, false);
+        let exit = print(
+            &Report::bare(Verdict::Stale),
+            &mut Closed,
+            &mut log,
+            Some(stale),
+        );
+        drop(log);
+        assert_eq!(exit, Exit::Error);
+        assert_eq!(
+            String::from_utf8(err)?,
+            "stale reason=rpc-unreachable\nerror reason=output-failed detail=\"broken pipe\"\n"
+        );
+        Ok(())
     }
 }

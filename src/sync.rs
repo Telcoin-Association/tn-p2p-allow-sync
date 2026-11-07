@@ -31,7 +31,7 @@ use crate::addr::{self, Cidr};
 use crate::cli::Exit;
 use crate::config::{self, Config, ConfigError};
 use crate::fsutil::{self, FsError, Lock, StateDir};
-use crate::log::{Log, Priority};
+use crate::log::{Line, Log, Priority};
 use crate::memory::{self, State};
 use crate::nft::{Chain, Element, Expr, Listing, Nft, NftError};
 use crate::render::{self, Program};
@@ -419,9 +419,9 @@ fn log_absorbed<E: Write>(log: &mut Log<E>, warnings: &Warnings) {
     }
 }
 
-/// Logs an error that ends the run before anything was written.
+/// Logs an error that ends the run before anything was written, as its closing line.
 fn untouched<E: Write>(log: &mut Log<E>, reason: &str, detail: &dyn fmt::Display) -> Exit {
-    log.line(
+    log.last(
         Priority::Error,
         "error",
         &[("reason", reason), ("detail", &detail.to_string())],
@@ -675,14 +675,14 @@ impl<O: Write, E: Write> Run<'_, O, E> {
             epoch_duration: self.epoch_duration.unwrap_or(self.previous.epoch_duration),
             ..counts(&sets, &floor, &state, &snap.warnings)
         };
-        self.finish(status, Exit::Fresh)
+        self.finish(status, Exit::Fresh, None)
     }
 
     /// A stale reason: the stale path, or a refusal under `--require-authoritative`.
     fn stale(self, reason: &str) -> Exit {
         if self.require_authoritative {
             self.log
-                .line(Priority::Warning, "refused", &[("reason", reason)]);
+                .last(Priority::Warning, "refused", &[("reason", reason)]);
             let status = Status {
                 stale_reason: reason.to_owned(),
                 ..self.previous.clone()
@@ -723,17 +723,26 @@ impl<O: Write, E: Write> Run<'_, O, E> {
         if let Some(detail) = detail {
             fields.push(("detail", detail));
         }
-        self.log.line(priority, event, &fields);
-        let (result, reason) = match &reload_error {
-            Some(error) => {
-                self.log.line(
-                    Priority::Error,
-                    "error",
-                    &[("reason", "reload-failed"), ("detail", error)],
-                );
-                (RunResult::Error, "reload-failed")
+        let kept = Line {
+            priority,
+            event,
+            fields: &fields,
+        };
+        let reload_fields = reload_error
+            .as_deref()
+            .map(|error| [("reason", "reload-failed"), ("detail", error)]);
+        // a failed reload ends the run, right after the line that led to it
+        let (result, reason, closing) = match &reload_fields {
+            Some(fields) => {
+                self.log.line(kept.priority, kept.event, kept.fields);
+                let failed = Line {
+                    priority: Priority::Error,
+                    event: "error",
+                    fields,
+                };
+                (RunResult::Error, "reload-failed", failed)
             }
-            None => (result, reason),
+            None => (result, reason, kept),
         };
         let status = Status {
             tool_version: status::TOOL_VERSION.to_owned(),
@@ -748,7 +757,7 @@ impl<O: Write, E: Write> Run<'_, O, E> {
             RunResult::Stale => Exit::Stale,
             _ => Exit::Error,
         };
-        self.finish(status, exit)
+        self.finish(status, exit, Some(closing))
     }
 
     /// The stale path's care of the table: a present table is kept as it is, and an absent one is reloaded from `current.nft` when that exists.
@@ -787,8 +796,11 @@ impl<O: Write, E: Write> Run<'_, O, E> {
         }
     }
 
-    /// Writes `status`, then prints its summary line; a failed write turns the run into `state-io-failed`, exit 2.
-    fn finish(self, mut status: Status, mut exit: Exit) -> Exit {
+    /// Writes `status`, logs `closing`, then prints its summary line; a failed write turns the run into `state-io-failed`, exit 2.
+    ///
+    /// `closing` is the line the run ends with, if it has one.
+    /// When the write fails, its `error` line ends the run instead, with `closing` logged just before it.
+    fn finish(self, mut status: Status, mut exit: Exit, closing: Option<Line<'_>>) -> Exit {
         match status.save(self.dir) {
             Ok(invalid) => {
                 for key in invalid {
@@ -796,9 +808,17 @@ impl<O: Write, E: Write> Run<'_, O, E> {
                     self.log
                         .line(Priority::Warning, "status-value-invalid", &[("key", key)]);
                 }
+                if let Some(closing) = closing {
+                    self.log
+                        .last(closing.priority, closing.event, closing.fields);
+                }
             }
             Err(e) => {
-                self.log.line(
+                if let Some(closing) = closing {
+                    self.log
+                        .line(closing.priority, closing.event, closing.fields);
+                }
+                self.log.last(
                     Priority::Error,
                     "error",
                     &[("reason", e.token()), ("detail", &e.to_string())],
@@ -837,6 +857,7 @@ pub struct RenderOptions<'a> {
 /// Memory comes from `state.json` and is updated in memory only.
 /// A snapshot that is not authoritative, a regressed epoch and an empty dynamic set are refused with exit 1 and no program; the summary then says `result=stale` with the reason, and its epoch and counts are those of memory as `state.json` holds it.
 /// The summary of a printed program says `result=rendered`.
+/// The summary is the run's closing line, so the log's cap never drops it.
 /// With `--check`, nft must list its tables before anything else happens and must accept the program, or the run exits 2 without printing it.
 pub fn render<O: Write, E: Write>(
     options: &RenderOptions<'_>,
@@ -883,20 +904,20 @@ pub fn render<O: Write, E: Write>(
     let snap = match snap {
         Ok(snap) => snap,
         Err(reason) => {
-            log.plain(&refused(&reason, &state, &Warnings::default()));
+            log.last_plain(&refused(&reason, &state, &Warnings::default()));
             return Exit::Refused;
         }
     };
     // a refusal reports memory as state.json holds it, as the stale path of sync keeps it
     let stored = state.clone();
     if let Err(e) = memory::apply(&mut state, &snap) {
-        log.plain(&refused(e.token(), &stored, &snap.warnings));
+        log.last_plain(&refused(e.token(), &stored, &snap.warnings));
         return Exit::Refused;
     }
     log_absorbed(log, &snap.warnings);
     let dynamic = memory::allow_ips(&state);
     if dynamic.is_empty() {
-        log.plain(&refused(EMPTY_SET, &stored, &snap.warnings));
+        log.last_plain(&refused(EMPTY_SET, &stored, &snap.warnings));
         return Exit::Refused;
     }
     let sets = Sets::build(&dynamic, &floor, &config);
@@ -909,7 +930,7 @@ pub fn render<O: Write, E: Write>(
     if let Err(e) = out.write_all(program.as_bytes()).and_then(|()| out.flush()) {
         return untouched(log, "output-failed", &e);
     }
-    log.plain(&summary(
+    log.last_plain(&summary(
         "rendered",
         &counts(&sets, &floor, &state, &snap.warnings),
     ));
