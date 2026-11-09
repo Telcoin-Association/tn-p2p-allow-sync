@@ -1,6 +1,6 @@
 [package]
 name = "tn-p2p-allow-sync"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # keep in step with rust-toolchain.toml
 rust-version = "1.94.1"
