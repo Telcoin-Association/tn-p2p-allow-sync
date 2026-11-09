@@ -25,6 +25,9 @@ const FAMILY: &str = "inet";
 const TABLE: &str = "tn_p2p_allow";
 const CHAIN: &str = "input";
 
+/// The sets the program declares, the only ones whose elements the listing reads.
+const SETS: [&str; 4] = ["allow_v4", "allow_v6", "static_v4", "static_v6"];
+
 /// Why a call to nft did not succeed.
 ///
 /// Every variant is exit 2 for the caller, which picks the token by what it was doing: `nft-unavailable`, `nft-apply-failed` or `reload-failed`.
@@ -139,7 +142,9 @@ pub enum Expr {
 /// What `nft -j list table inet tn_p2p_allow` says about the table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Listing {
-    /// Every set of the table by name, its elements sorted; a set without elements maps to an empty list.
+    /// The program's sets `allow_v4`, `allow_v6`, `static_v4` and `static_v6` that the table holds, by name, their elements sorted; a set without elements maps to an empty list.
+    ///
+    /// Any other set of the table, like a map, is not read: its elements need not be addresses.
     pub sets: BTreeMap<String, Vec<Element>>,
     /// Every named counter of the table by name.
     pub counters: BTreeMap<String, Counter>,
@@ -147,6 +152,11 @@ pub struct Listing {
     pub chain: Option<Chain>,
     /// The expressions of each rule of chain `input`, the rules in chain order.
     pub rules: Vec<Vec<Expr>>,
+    /// Whether the table is dormant, so none of its chains sees a packet: its `table` object has a `flags` key.
+    ///
+    /// The program sets no table flags and nft prints the key only for a table that has some, `dormant` being the one an operator sets by hand.
+    /// Only the key's presence counts: nft 1.1.3 prints `"dormant"`, but 1.0.2 and 1.0.9 print some other string of the same output in its place.
+    pub dormant: bool,
 }
 
 /// Runs nft from one fixed path.
@@ -287,9 +297,10 @@ struct SetObject {
     family: String,
     table: String,
     name: String,
-    // nft leaves the key out when the set is empty
+    // nft leaves the key out when the set is empty; read only for the program's sets, so
+    // another set's elements may take any form
     #[serde(default)]
-    elem: Vec<Value>,
+    elem: Value,
 }
 
 #[derive(Deserialize)]
@@ -403,21 +414,27 @@ fn parse_tables(json: &[u8]) -> Result<bool, NftError> {
     Ok(present)
 }
 
-/// Reads `nft -j list table inet tn_p2p_allow` output; objects of other kinds, or of other tables, are skipped.
-fn parse_listing(json: &[u8]) -> Result<Listing, NftError> {
+/// Reads `nft -j list table inet tn_p2p_allow` output; objects of other kinds, or of other tables, and sets the program does not declare are skipped.
+///
+/// Every failure is [`NftError::Parse`].
+/// Public for the fuzz targets in `fuzz/`; the program reads a listing only through [`Nft::list_table`].
+pub fn parse_listing(json: &[u8]) -> Result<Listing, NftError> {
     let mut listing = Listing::default();
     for (kind, body) in objects(json)? {
         match kind.as_str() {
+            "table" => {
+                // the key of any type, null included: on nft 1.0.x its value is not the flag
+                let flagged = body.get("flags").is_some();
+                let table: TableObject = typed(&kind, body)?;
+                if ours(&table.family, &table.name) {
+                    listing.dormant |= flagged;
+                }
+            }
             "set" => {
                 let set: SetObject = typed(&kind, body)?;
-                if ours(&set.family, &set.table) {
-                    let mut elements = set
-                        .elem
-                        .into_iter()
-                        .map(parse_element)
-                        .collect::<Result<Vec<_>, _>>()
+                if ours(&set.family, &set.table) && SETS.contains(&set.name.as_str()) {
+                    let elements = parse_elements(set.elem)
                         .map_err(|why| NftError::Parse(format!("set {}: {why}", set.name)))?;
-                    elements.sort_unstable();
                     listing.sets.insert(set.name, elements);
                 }
             }
@@ -512,6 +529,21 @@ fn parse_match(found: MatchObject) -> Expr {
     }
 }
 
+/// A set's `elem` array, sorted; `null`, for a key nft left out, is an empty set.
+fn parse_elements(elem: Value) -> Result<Vec<Element>, String> {
+    let entries = match elem {
+        Value::Null => Vec::new(),
+        Value::Array(entries) => entries,
+        other => return Err(format!("elem is not an array: {other}")),
+    };
+    let mut elements = entries
+        .into_iter()
+        .map(parse_element)
+        .collect::<Result<Vec<_>, _>>()?;
+    elements.sort_unstable();
+    Ok(elements)
+}
+
 /// One entry of a set's `elem` array: a value, or an `elem` object wrapping one with extras such as a comment or a counter.
 fn parse_element(entry: Value) -> Result<Element, String> {
     let value = match entry {
@@ -565,6 +597,9 @@ fn parse_ip(text: &str) -> Result<IpAddr, String> {
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use std::error::Error;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::os::unix::process::ExitStatusExt;
@@ -575,8 +610,22 @@ mod tests {
     type TestResult = Result<(), Box<dyn Error>>;
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/nft");
-    const VERSIONS: [&str; 2] = ["ubuntu-24.04-1.0.9", "ubuntu-22.04-1.0.2"];
-    const LISTINGS: [&str; 5] = ["program", "ipv6", "empty", "traffic", "forms"];
+    const VERSIONS: [&str; 3] = [
+        "debian-13-1.1.3",
+        "ubuntu-24.04-1.0.9",
+        "ubuntu-22.04-1.0.2",
+    ];
+    /// The version every other one is compared with.
+    const REFERENCE: &str = "ubuntu-24.04-1.0.9";
+    const LISTINGS: [&str; 7] = [
+        "program",
+        "ipv6",
+        "empty",
+        "traffic",
+        "forms",
+        "adjacent",
+        "single-port",
+    ];
 
     fn fixture(name: &str) -> io::Result<Vec<u8>> {
         std::fs::read(Path::new(FIXTURES).join(name))
@@ -633,6 +682,7 @@ mod tests {
                 .collect(),
             chain: Some(program_chain()),
             rules: program_rules(),
+            dormant: false,
         }
     }
 
@@ -648,7 +698,12 @@ mod tests {
 
     /// The five rules of the reference program, on ports 49590 and 49594.
     fn program_rules() -> Vec<Vec<Expr>> {
-        let ports = || Expr::UdpDport(BTreeSet::from([49590, 49594]));
+        rules_on(&[49590, 49594])
+    }
+
+    /// The five rules of the reference program on `ports`.
+    fn rules_on(ports: &[u16]) -> Vec<Vec<Expr>> {
+        let ports = || Expr::UdpDport(ports.iter().copied().collect());
         let accept = |protocol: &str, set: &str| {
             vec![
                 ports(),
@@ -685,21 +740,22 @@ mod tests {
         parse_listing(json.as_bytes())
     }
 
-    fn program_listing() -> Listing {
+    /// The sets of `capture/program.nft`: two `allow_v4` addresses and one `static_v4` network.
+    fn program_sets() -> [Vec<Element>; 4] {
         let static_v4 = Element::Cidr {
             net: v4(203, 0, 113, 0),
             prefix: 24,
         };
-        table(
-            [
-                vec![ip4(192, 0, 2, 10), ip4(198, 51, 100, 7)],
-                vec![],
-                vec![static_v4],
-                vec![],
-            ],
-            (0, 0),
-            (0, 0),
-        )
+        [
+            vec![ip4(192, 0, 2, 10), ip4(198, 51, 100, 7)],
+            vec![],
+            vec![static_v4],
+            vec![],
+        ]
+    }
+
+    fn program_listing() -> Listing {
+        table(program_sets(), (0, 0), (0, 0))
     }
 
     fn status(code: i32) -> ExitStatus {
@@ -827,10 +883,58 @@ mod tests {
     }
 
     #[test]
-    fn both_nft_versions_list_the_same_table() -> TestResult {
-        let [newer, older] = VERSIONS;
-        for case in LISTINGS {
-            assert_eq!(listing(newer, case)?, listing(older, case)?, "{case}");
+    fn every_nft_version_lists_the_same_table() -> TestResult {
+        for version in VERSIONS {
+            for case in LISTINGS {
+                assert_eq!(
+                    listing(version, case)?,
+                    listing(REFERENCE, case)?,
+                    "{version} {case}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adjacent_networks_list_as_separate_prefixes() -> TestResult {
+        let net = |net: IpAddr, prefix: u8| Element::Cidr { net, prefix };
+        let expected = table(
+            [
+                vec![],
+                vec![],
+                vec![
+                    net(v4(10, 0, 0, 0), 24),
+                    net(v4(10, 0, 1, 0), 24),
+                    net(v4(10, 0, 3, 0), 24),
+                ],
+                vec![
+                    net(v6([0x2001, 0xdb8, 1, 0, 0, 0, 0, 0]), 48),
+                    net(v6([0x2001, 0xdb8, 2, 0, 0, 0, 0, 0]), 48),
+                    net(v6([0x2001, 0xdb8, 4, 0, 0, 0, 0, 0]), 48),
+                ],
+            ],
+            (0, 0),
+            (0, 0),
+        );
+        for version in VERSIONS {
+            assert_eq!(listing(version, "adjacent")?, expected, "{version}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_port_lists_as_the_one_port_rule_form() -> TestResult {
+        let expected = Listing {
+            rules: rules_on(&[49590]),
+            ..program_listing()
+        };
+        for version in VERSIONS {
+            let json = String::from_utf8(fixture(&format!("{version}-single-port.json"))?)?;
+            // a bare number, never an anonymous set of one
+            assert!(json.contains(r#""right": 49590}"#), "{version}");
+            assert!(!json.contains(r#""set": [49590]"#), "{version}");
+            assert_eq!(listing(version, "single-port")?, expected, "{version}");
         }
         Ok(())
     }
@@ -843,11 +947,110 @@ mod tests {
                 ("tables-other", false),
                 ("tables-present", true),
                 ("tables-both", true),
+                ("dormant-tables", true),
             ] {
                 let json = fixture(&format!("{version}-{case}.json"))?;
                 assert_eq!(parse_tables(&json)?, present, "{version} {case}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_dormant_table_lists_as_dormant_whatever_its_flags_value() -> TestResult {
+        // one datagram from an unlisted source before the flag, two while dormant: only the first was counted
+        let expected = Listing {
+            dormant: true,
+            ..table(program_sets(), (0, 0), (1, 29))
+        };
+        for version in VERSIONS {
+            let json = String::from_utf8(fixture(&format!("{version}-dormant.json"))?)?;
+            // only 1.1.3 prints the flag itself; 1.0.x prints another string of the output
+            let named = json.contains(r#""flags": "dormant""#);
+            assert_eq!(named, version.ends_with("-1.1.3"), "{version}");
+            assert_eq!(listing(version, "dormant")?, expected, "{version}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn re_applying_the_program_wakes_a_dormant_table() -> TestResult {
+        // two more datagrams after the reload, both counted again
+        let expected = table(program_sets(), (0, 0), (3, 87));
+        for version in VERSIONS {
+            assert_eq!(
+                listing(version, "dormant-reapplied")?,
+                expected,
+                "{version}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_dormant_listing_cut_short_by_nft_is_a_parse_error() -> TestResult {
+        // nft 1.0.9 stops right after `"flags": ` for this table and still exits 0
+        let json = fixture("ubuntu-24.04-1.0.9-dormant-forms.json")?;
+        assert!(
+            String::from_utf8(json.clone())?
+                .trim_end()
+                .ends_with(r#""flags":"#)
+        );
+        let result = parse_listing(&json);
+        assert!(
+            matches!(&result, Err(NftError::Parse(why)) if why.starts_with("not JSON: ")),
+            "{result:?}"
+        );
+        // the versions that print it whole list the forms table, dormant
+        for version in ["debian-13-1.1.3", "ubuntu-22.04-1.0.2"] {
+            assert_eq!(
+                listing(version, "dormant-forms")?,
+                Listing {
+                    dormant: true,
+                    ..listing(REFERENCE, "forms")?
+                },
+                "{version}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_flags_key_of_any_type_on_our_table_is_dormant() -> TestResult {
+        let document = |table: &str| {
+            format!(r#"{{"nftables": [{{"metainfo": {{"version": "1.0.9"}}}}, {table}]}}"#)
+        };
+        for flags in [
+            r#""dormant""#,
+            r#""Old Doc Yak #3""#,
+            r#"["dormant"]"#,
+            "[]",
+            "1",
+            "null",
+            "{}",
+        ] {
+            let json = document(&format!(
+                r#"{{"table": {{"family": "inet", "name": "tn_p2p_allow", "handle": 13, "flags": {flags}}}}}"#
+            ));
+            assert!(parse_listing(json.as_bytes())?.dormant, "{flags}");
+            assert!(parse_tables(json.as_bytes())?, "{flags}");
+        }
+        for table in [
+            r#"{"table": {"family": "inet", "name": "tn_p2p_allow", "handle": 13}}"#,
+            r#"{"table": {"family": "ip", "name": "tn_p2p_allow", "handle": 2, "flags": "dormant"}}"#,
+            r#"{"table": {"family": "inet", "name": "filter", "handle": 3, "flags": "dormant"}}"#,
+        ] {
+            assert!(
+                !parse_listing(document(table).as_bytes())?.dormant,
+                "{table}"
+            );
+        }
+        // a table object nft would never print is a parse error, as for every known kind
+        let nameless = document(r#"{"table": {"family": "inet", "flags": "dormant"}}"#);
+        assert!(matches!(
+            parse_listing(nameless.as_bytes()),
+            Err(NftError::Parse(_))
+        ));
         Ok(())
     }
 
@@ -881,6 +1084,26 @@ mod tests {
             .sets
             .insert("allow_v4".to_owned(), vec![ip4(192, 0, 2, 10)]);
         expected.rules = vec![vec![Expr::Other]];
+        assert_eq!(parse_listing(json)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn sets_the_program_does_not_declare_are_skipped_whatever_they_hold() -> TestResult {
+        // what nft prints for `set ports { type inet_service; elements = { 80 } }`, an ifname
+        // set, a concat set and others an operator could add to the table by hand
+        let json = br#"{"nftables": [
+            {"set": {"family": "inet", "name": "allow_v4", "table": "tn_p2p_allow", "type": "ipv4_addr", "handle": 3, "elem": ["192.0.2.10"]}},
+            {"set": {"family": "inet", "name": "ports", "table": "tn_p2p_allow", "type": "inet_service", "handle": 9, "elem": [80]}},
+            {"set": {"family": "inet", "name": "links", "table": "tn_p2p_allow", "type": "ifname", "handle": 10, "elem": ["eth0", "lo"]}},
+            {"set": {"family": "inet", "name": "pairs", "table": "tn_p2p_allow", "type": ["ipv4_addr", "inet_service"], "handle": 11, "elem": [{"concat": ["192.0.2.1", 80]}]}},
+            {"set": {"family": "inet", "name": "odd", "table": "tn_p2p_allow", "type": "mark", "handle": 12, "elem": "not an array"}},
+            {"set": {"family": "inet", "name": "allow_v4_old", "table": "tn_p2p_allow", "type": "ipv4_addr", "handle": 13, "elem": [null]}}
+        ]}"#;
+        let mut expected = Listing::default();
+        expected
+            .sets
+            .insert("allow_v4".to_owned(), vec![ip4(192, 0, 2, 10)]);
         assert_eq!(parse_listing(json)?, expected);
         Ok(())
     }
@@ -987,7 +1210,8 @@ mod tests {
     fn a_malformed_known_object_is_a_parse_error() {
         for body in [
             r#"{"set": {"family": "inet", "table": "tn_p2p_allow"}}"#,
-            r#"{"set": {"family": "inet", "table": "tn_p2p_allow", "name": "s", "elem": "192.0.2.10"}}"#,
+            r#"{"set": {"family": "inet", "table": "tn_p2p_allow", "name": "allow_v4", "elem": "192.0.2.10"}}"#,
+            r#"{"set": {"family": "inet", "table": "tn_p2p_allow", "name": "static_v6", "elem": {}}}"#,
             r#"{"counter": {"family": "inet", "table": "tn_p2p_allow", "name": "c", "packets": -1, "bytes": 0}}"#,
             r#"{"counter": {"family": "inet", "table": "tn_p2p_allow", "name": "c", "bytes": 0}}"#,
             r#"{"chain": {"family": "inet", "name": "input"}}"#,
@@ -1021,15 +1245,42 @@ mod tests {
             r#"{"range": ["192.0.2.1", "192.0.2.2", "192.0.2.3"]}"#,
             r#"{"range": ["192.0.2.1"]}"#,
         ] {
-            let json = format!(
-                r#"{{"nftables": [{{"set": {{"family": "inet", "table": "tn_p2p_allow", "name": "allow_v4", "elem": [{element}]}}}}]}}"#
-            );
-            let result = parse_listing(json.as_bytes());
-            assert!(
-                matches!(&result, Err(NftError::Parse(why)) if why.starts_with("set allow_v4: ")),
-                "{element}: {result:?}"
+            // the program's sets stay strict: a form the comparison cannot read fails the listing
+            for set in SETS {
+                let json = format!(
+                    r#"{{"nftables": [{{"set": {{"family": "inet", "table": "tn_p2p_allow", "name": "{set}", "elem": ["192.0.2.10", {element}]}}}}]}}"#
+                );
+                let result = parse_listing(json.as_bytes());
+                assert!(
+                    matches!(&result, Err(NftError::Parse(why)) if why.starts_with(&format!("set {set}: "))),
+                    "{set} {element}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_length_prefix_object_is_read() -> TestResult {
+        // the longest prefix of each family is in range; one past it is refused above
+        for (element, net, prefix) in [
+            (
+                r#"{"prefix": {"addr": "192.0.2.10", "len": 32}}"#,
+                v4(192, 0, 2, 10),
+                32,
+            ),
+            (
+                r#"{"prefix": {"addr": "2001:db8::1", "len": 128}}"#,
+                v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]),
+                128,
+            ),
+        ] {
+            assert_eq!(
+                parse_value(serde_json::from_str(element)?),
+                Ok(Element::Cidr { net, prefix }),
+                "{element}"
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -1167,11 +1418,14 @@ mod tests {
     #[test]
     fn a_missing_program_is_unavailable() {
         let path = Path::new(FIXTURES).join("no-such-nft");
-        let result = Nft::new(Some(&path)).table_present();
-        assert!(
-            matches!(&result, Err(NftError::Unavailable(why)) if why.starts_with(&format!("{}: ", path.display()))),
-            "{result:?}"
-        );
+        let nft = Nft::new(Some(&path));
+        // delete_table too: it runs nft like every other call, so it cannot succeed without one
+        for result in [nft.table_present().map(drop), nft.delete_table()] {
+            assert!(
+                matches!(&result, Err(NftError::Unavailable(why)) if why.starts_with(&format!("{}: ", path.display()))),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
@@ -1208,11 +1462,14 @@ mod tests {
                 "{version}: {result:?}"
             );
         }
-        let newer = fixture("ubuntu-24.04-1.0.9-eperm-load.stderr")?;
-        assert_eq!(
-            outcome(finished(1, &newer), Ok(())).map(drop),
-            Err(NftError::Permission)
-        );
+        for newer in ["debian-13-1.1.3", "ubuntu-24.04-1.0.9"] {
+            let load = fixture(&format!("{newer}-eperm-load.stderr"))?;
+            assert_eq!(
+                outcome(finished(1, &load), Ok(())).map(drop),
+                Err(NftError::Permission),
+                "{newer}"
+            );
+        }
         // nft 1.0.2 refuses -f and -c without a word
         let older = fixture("ubuntu-22.04-1.0.2-eperm-load.stderr")?;
         assert!(older.is_empty());

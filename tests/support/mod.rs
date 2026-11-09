@@ -6,8 +6,11 @@
 //! [`fake_rpc`] and [`FakeNft`] stand in for the node and for nft in the tests that run the built binary.
 
 #![allow(dead_code)]
+// test helpers build fixtures with std::fs and serve a loopback listener directly
+#![allow(clippy::disallowed_methods)]
 
 pub mod fake_rpc;
+pub mod rng;
 
 use std::fs;
 use std::io;
@@ -141,10 +144,40 @@ impl FakeNft {
         fs::remove_file(self.state("table"))
     }
 
-    /// Sets the knob `name`: `fail-next` or `eperm`.
+    /// Sets the knob `name`, an empty file in the script's `state/`; the header of `fake-nft.sh` gives the exact messages.
+    ///
+    /// - `fail-next`: the next `-f` exits 1, then the knob is gone.
+    /// - `eperm`: every call prints nft's "Operation not permitted" and exits 1.
+    /// - `list-fails`: while the table exists, every `-j list table` exits 1 with a netlink error, while `-j list tables` still lists the table.
+    /// - `list-garbage`: while the table exists, every `-j list table` prints the listing cut off right after `"flags": `, exits 0 and leaves stderr empty, as nft 1.0.x lists a dormant table; `list-fails` wins over it.
+    /// - `check-fails`: the next `-c -f -` records all of stdin, then exits 1 with a syntax error, then the knob is gone.
+    /// - `dormant`: both `-j list` calls give the table `"flags": "dormant"`, as nft 1.1.3 lists a dormant table, until a `-f` loads and removes the knob.
+    ///
+    /// The others stay until [`FakeNft::clear_knob`]. `tables-fail-nth` holds a count; see [`FakeNft::knob_with`].
     pub fn knob(&self, name: &str) -> io::Result<()> {
+        self.knob_with(name, "")
+    }
+
+    /// Sets the knob `name` holding `contents`.
+    ///
+    /// - `tables-fail-nth`: a count N from 1; the Nth `-j list tables inet` from now exits 1 with a netlink error and removes the knob, and the calls before and after it list as usual.
+    ///   A sync run lists the tables once after reading its inputs and once more on the stale path, so `"2"` fails only the stale path's listing; `fake-nft.sh` gives the whole order.
+    pub fn knob_with(&self, name: &str, contents: &str) -> io::Result<()> {
         fs::create_dir_all(self.dir.join("state"))?;
-        fs::write(self.state(name), "")
+        fs::write(self.state(name), contents)
+    }
+
+    /// Whether the knob `name` is set, so a test sees a one-shot knob used or `dormant` woken.
+    pub fn has_knob(&self, name: &str) -> bool {
+        self.state(name).exists()
+    }
+
+    /// Removes the knob `name`; a knob that is not set is no error.
+    pub fn clear_knob(&self, name: &str) -> io::Result<()> {
+        match fs::remove_file(self.state(name)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 }
 

@@ -1,0 +1,240 @@
+# Weekly reports on main: mutation testing with cargo-mutants and fuzzing with cargo-fuzz on
+# Saturdays, cargo deny and cargo audit on Mondays.
+#
+# No job here is a gate. They run on main once a week and on dispatch, never on a pull
+# request, and none is or may become a required check; no job here may share its name with
+# one either, because GitHub matches a required check by name on a commit, whatever workflow
+# reported it, and the release gate of release.conf reads the newest run of each name. Hence
+# `deny-weekly` and `audit-weekly`, not ci.yaml's `deny` and `audit`. What they report is the
+# run and its artifacts: each `mutants` shard uploads cargo-mutants' output, with the mutants
+# no test caught, and stays green; `fuzz` turns red when a target finds an input that crashes
+# it and uploads that input; `deny-weekly` and `audit-weekly` turn red when an advisory has
+# been published against a dependency of the program since the last pull request.
+# .github/ACTIONS.md says how to read them and how to reproduce them locally.
+#
+# A schedule runs only on the default branch, and GitHub disables it after 60 days without
+# activity in the repository. Each job runs on one of the two crons: its `if:` leaves it out
+# of the other, where it reports a skipped run that no gate reads, since no name here is a
+# required check. A dispatch runs every job on the branch it is started on.
+#
+# Every action is pinned to a full commit SHA, as in ci.yaml (.github/ACTIONS.md, "Action pins").
+name: Scheduled
+
+on:
+  schedule:
+    # mutants and fuzz
+    - cron: "41 3 * * 6"
+    # deny-weekly and audit-weekly
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+# nothing here writes; each job asks for read access to the repository and no more
+permissions: {}
+
+# one run per branch at a time; a running one is never cancelled
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# No RUSTFLAGS=-D warnings here, unlike ci.yaml: a mutant that leaves a value unused must
+# still build and be tested rather than be counted as unviable, and a warning in a fuzz
+# target is ci.yaml's business, not a reason to skip fuzzing.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Every mutant cargo-mutants can make of the crate, each built and tested with the suite of
+  # `cargo test`. A missed mutant is a change to the code that no test notices. The mutants are
+  # split into four shards on four runners, since one runner could need longer than a job may
+  # run; the step's own timeout ends a slow shard early enough for the summary and the upload.
+  mutants:
+    name: mutants (${{ matrix.shard }}/4)
+    if: github.event.schedule != '23 5 * * 1'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # the pin and the fallback rule of ci.yaml's cargo-deny
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-mutants@27.1.0
+          fallback: none
+
+      # report-only: cargo mutants exits non-zero for a missed or timed-out mutant, which marks
+      # the step and leaves the job green; --cargo-arg passes --locked to every cargo call
+      - name: cargo mutants
+        continue-on-error: true
+        timeout-minutes: 300
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: cargo mutants --cargo-arg=--locked --jobs 2 --shard "$SHARD/4" --output target/mutants
+
+      - name: Summary
+        if: always()
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          out=target/mutants/mutants.out
+          {
+            echo "### cargo mutants, shard $SHARD/4"
+            for outcome in caught missed timeout unviable; do
+              if [ -f "$out/$outcome.txt" ]; then
+                echo "- $outcome: $(wc -l < "$out/$outcome.txt")"
+              else
+                echo "- $outcome: no file"
+              fi
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo
+              echo "Missed (first 50; all of them are in the artifact \`mutants-$SHARD\`):"
+              echo '```'
+              head -n 50 "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the cargo-mutants output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-${{ matrix.shard }}
+          path: target/mutants
+
+  # Each target of the fuzz/ crate for 5 minutes, from its corpus in fuzz/corpus/<target>,
+  # then cargo deny over the fuzz crate's own dependencies with fuzz/deny.toml. The fuzz crate
+  # is not a dependency of the program and is never built by ci.yaml or the release build.
+  fuzz:
+    if: github.event.schedule != '23 5 * * 1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      # cargo fuzz needs a nightly compiler; a dated one, so that a run is repeatable and the
+      # compiler moves only by an edit here (.github/ACTIONS.md, "How a pin moves")
+      FUZZ_TOOLCHAIN: nightly-2026-10-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `cargo +<toolchain>` below overrides rust-toolchain.toml for every call, nested ones
+      # included, so the stable toolchain is not installed here
+      - name: Install the nightly toolchain
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+
+      # the install-action manifest has no cargo-fuzz, so it is built from crates.io with the
+      # Cargo.lock it was published with
+      - name: Install cargo-fuzz
+        run: cargo "+$FUZZ_TOOLCHAIN" install --locked cargo-fuzz@0.13.2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      # the corpus directories are not committed, so the structured targets start from the
+      # repository's own fixtures, as `make fuzz` does
+      - name: Seed the corpora from the fixtures
+        run: |
+          mkdir -p fuzz/corpus/snapshot fuzz/corpus/nft_listing
+          cp tests/fixtures/snapshot/*.json fuzz/corpus/snapshot/
+          cp tests/fixtures/nft/*.json fuzz/corpus/nft_listing/
+
+      # every target runs even after one fails; the step fails at the end if any did
+      - name: Fuzz each target for 5 minutes
+        id: fuzz
+        working-directory: fuzz
+        run: |
+          failed=""
+          for target in multiaddr cidr_or_host config snapshot nft_listing http_response; do
+            echo "::group::cargo fuzz run $target"
+            if ! cargo "+$FUZZ_TOOLCHAIN" fuzz run "$target" -- -max_total_time=300; then
+              failed="$failed $target"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error title=fuzz::failing input found by:$failed (artifact fuzz-artifacts)"
+            exit 1
+          fi
+
+      # the crashing inputs libFuzzer wrote, one directory per target
+      - name: Upload the failing inputs
+        if: failure() && steps.fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
+      # also after a failed fuzz step; deny.toml in the working directory is fuzz/deny.toml
+      - name: cargo deny (fuzz/)
+        if: ${{ !cancelled() }}
+        working-directory: fuzz
+        run: cargo "+$FUZZ_TOOLCHAIN" deny --config deny.toml check
+
+  # ci.yaml's deny and audit, step for step, on main's tip once a week: both fetch their
+  # advisory database when they run, so an advisory published against a dependency of the
+  # program turns them red with no pull request open. Red here holds nothing back; it says to
+  # update the dependency on main, whose own deny and audit then fail until it is fixed.
+  deny-weekly:
+    if: github.event.schedule != '41 3 * * 6'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # the pin and the fallback rule of ci.yaml's cargo-deny
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - name: cargo deny
+        run: cargo deny check
+
+  audit-weekly:
+    if: github.event.schedule != '41 3 * * 6'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # the pin and the fallback rule of ci.yaml's cargo-deny
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
+      - name: cargo audit
+        run: cargo audit

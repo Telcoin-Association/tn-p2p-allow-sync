@@ -496,12 +496,26 @@ fn count(value: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
+
+    /// `unix_now` reads the wall clock: a constant stand-in (0 or 1) would freeze `LAST_RUN`
+    /// and every age in the status file.
+    #[test]
+    fn unix_now_is_the_wall_clock() {
+        let now = unix_now();
+        // 2025-11-01 00:00:00 UTC; any earlier value means a broken clock or a constant
+        assert!(now > 1_761_955_200, "unix_now gave {now}");
+        assert!(now < 4_102_444_800, "unix_now gave {now}"); // 2100-01-01
+    }
     use crate::support::TempDir;
 
     fn full() -> Status {
         Status {
-            tool_version: "0.1.0".to_owned(),
+            // not this build's version, which is the default a load that skipped the key would leave
+            tool_version: "0.0.9".to_owned(),
             result: Some(RunResult::Stale),
             last_run: Some(1_762_300_000),
             last_good: Some(1_762_299_700),

@@ -55,18 +55,22 @@ cargo build --locked --release --target x86_64-unknown-linux-musl
 cargo run -- --version
 ```
 
-The gates CI runs on every pull request:
+CI runs these jobs; [.github/ACTIONS.md](.github/ACTIONS.md) has each one's command and what it stops:
+
+- `ci.yaml`, on every pull request and every push to `main`: `fmt`, `clippy`, `test`, `coverage`, `deny`, `audit` and `release-dry-run`.
+- `nft-real.yaml`, on every push to `main` and every pull request that touches the code it covers: the real-kernel test, on Ubuntu 24.04 and 22.04 runners and in a Debian 13 container.
+- `scheduled.yaml`, weekly on `main`: `deny-weekly` and `audit-weekly` on Mondays, so a new advisory shows without a pull request, and report-only mutation testing and fuzzing on Saturdays.
+
+Locally, `make ci` runs `fmt`, `clippy`, `test`, `deny` and `audit` as CI does, `make nft-real-docker DISTRO=<image>` runs the real-kernel test in a container of `ubuntu:24.04`, `ubuntu:22.04` or `debian:13` without sudo, and `RELEASE_BUILD_STUB=1` makes the release dry run quick by swapping its Docker build for a stub:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
-cargo deny check
-cargo audit
+make ci
+make nft-real-docker DISTRO=debian:13
+RELEASE_BUILD_STUB=1 bash etc/tests/release_dry_run.sh
 ```
 
 The tests run rootless: the integration tests drive the built binary against a fake JSON-RPC server and a fake nft (`tests/support/`), and `tests/golden/` pins the program text byte for byte.
-The real-kernel job loads the program into nftables on Ubuntu 22.04 and 24.04 runners, sends traffic from a listed and an unlisted source and checks the counters.
+The real-kernel test loads the program into nftables, sends traffic from a listed and an unlisted source and checks the counters.
 
 ## Documentation
 

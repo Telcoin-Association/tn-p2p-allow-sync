@@ -19,8 +19,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -56,7 +55,7 @@ pub struct Config {
     pub p2p_ports: BTreeSet<u16>,
     /// IPv4 entries of `P2P_ALLOW_FROM`: hosts as /32 and networks masked to their network address.
     ///
-    /// A host was passed through [`addr::canonical_ip`], so an IPv4-mapped IPv6 host is here as IPv4; [`Cidr::is_host`] tells hosts from networks.
+    /// A host was passed through [`addr::canonical_ip`] and a network through [`Cidr::unmapped`], so an IPv4-mapped IPv6 entry is here as IPv4; [`Cidr::is_host`] tells hosts from networks.
     /// No network here lies inside another one: see [`Config::covered_dropped`].
     pub static_v4: BTreeSet<Cidr>,
     /// IPv6 entries of `P2P_ALLOW_FROM`: hosts as /128 and networks masked to their network address.
@@ -334,7 +333,8 @@ fn parse_allow_from(value: &str) -> Result<(BTreeSet<Cidr>, BTreeSet<Cidr>), Str
             })?;
             host(ip)
         } else {
-            entry
+            // a mapped network, like a mapped host, only matches as the IPv4 network it names
+            entry.unmapped()
         };
         let family = match entry.net {
             IpAddr::V4(_) => &mut v4,
@@ -461,18 +461,10 @@ const fn is_multiaddr_byte(b: u8) -> bool {
 }
 
 /// Reads one `capture-floor` input: a regular file, symlinks followed, at most [`MAX_CAPTURE_INPUT`] bytes.
+///
+/// [`fsutil::read_bounded`] checks the type before the open and again on the file it opens non-blocking, so a special file is never opened and a FIFO swapped in for the file is refused at once instead of blocking the run.
 fn read_capture_input(path: &Path) -> io::Result<Vec<u8>> {
-    // checked before the open, so that a FIFO cannot block the run
-    if !std::fs::metadata(path)?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "is not a regular file",
-        ));
-    }
-    let file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_CAPTURE_INPUT.saturating_add(1))
-        .read_to_end(&mut bytes)?;
+    let bytes = fsutil::read_bounded(path, MAX_CAPTURE_INPUT)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CAPTURE_INPUT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -484,12 +476,20 @@ fn read_capture_input(path: &Path) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use crate::support::TempDir;
     use std::error::Error;
     use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::os::unix::fs::{MetadataExt, symlink};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -528,6 +528,47 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
     fn refusal(text: &str) -> (Option<usize>, String) {
         parse_config(text.as_bytes())
             .map_or_else(|e| e, |config| (None, format!("accepted: {config:?}")))
+    }
+
+    /// Makes a FIFO at `path`, or returns `false` when `mkfifo` is not on PATH and the test should skip.
+    fn mkfifo(path: &Path) -> Result<bool, Box<dyn Error>> {
+        // std makes no FIFO without libc and the tests take no dependency, so the coreutils tool makes it
+        #[allow(clippy::disallowed_methods)]
+        let status = match std::process::Command::new("mkfifo").arg(path).status() {
+            Ok(status) => status,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if !status.success() {
+            return Err(format!("mkfifo {path:?}: {status}").into());
+        }
+        Ok(true)
+    }
+
+    /// Runs `f` on a thread of its own and waits for it at most 10 s, so a call that blocks fails the test instead of hanging the suite.
+    fn without_blocking<T, F>(f: F) -> Result<T, Box<dyn Error>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (done, result) = mpsc::channel();
+        thread::spawn(move || done.send(f()));
+        Ok(result
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("the call blocked: {e}"))?)
+    }
+
+    /// Writes a file of exactly `len` bytes at `path`: a hole, then `tail` as its last bytes.
+    fn sparse_file(path: &Path, len: u64, tail: &[u8]) -> TestResult {
+        let start = len
+            .checked_sub(u64::try_from(tail.len())?)
+            .ok_or("the tail is longer than the file")?;
+        let mut file = fs::File::create(path)?;
+        file.set_len(len)?;
+        file.seek(SeekFrom::Start(start))?;
+        file.write_all(tail)?;
+        assert_eq!(file.metadata()?.len(), len);
+        Ok(())
     }
 
     #[test]
@@ -772,6 +813,14 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
                 "::ffff:169.254.1.1",
                 "P2P_ALLOW_FROM entry \"::ffff:169.254.1.1\" is an unspecified, multicast or link-local address, never a peer's source",
             ),
+            (
+                "10.0.0.0/8,::ffff:10.0.0.0/95",
+                "P2P_ALLOW_FROM entry \"::ffff:10.0.0.0/95\" is an IPv4-mapped address with a prefix length shorter than 96",
+            ),
+            (
+                "::ffff:0.0.0.0/0",
+                "P2P_ALLOW_FROM entry \"::ffff:0.0.0.0/0\" is an IPv4-mapped address with a prefix length shorter than 96",
+            ),
         ] {
             let text = format!(
                 "CONFIG_VERSION=1\nRPC_PORT=8545\nP2P_PORTS=49590\nP2P_ALLOW_FROM={value}\n"
@@ -788,6 +837,7 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
         assert_eq!(
             config.static_v4,
             cidrs(&[
+                "192.0.2.0/24",
                 "198.51.100.9",
                 "198.51.100.10",
                 "203.0.113.0/24",
@@ -796,7 +846,7 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
         );
         assert_eq!(
             config.static_v6,
-            cidrs(&["::ffff:192.0.2.0/120", "2001:db8::/64", "2001:db8:1::7"])?
+            cidrs(&["2001:db8::/64", "2001:db8:1::7"])?
         );
         assert!(config.static_v4.iter().filter(|c| c.is_host()).count() == 2);
         assert!(!config.catch_all);
@@ -844,11 +894,57 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
         assert_eq!(config.static_v6, cidrs(&["2001:db8::/32"])?);
         assert_eq!(config.covered_dropped, 4);
 
-        // a mapped network is IPv6 and never covers or is covered by an IPv4 one
+        // a mapped network is the IPv4 network it names, so it covers and is covered as one
         let config = with_allow_from("::ffff:10.0.0.0/104,10.3.0.0/16")?;
-        assert_eq!(config.static_v4, cidrs(&["10.3.0.0/16"])?);
-        assert_eq!(config.static_v6, cidrs(&["::ffff:10.0.0.0/104"])?);
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert!(config.static_v6.is_empty());
+        assert_eq!(config.covered_dropped, 1);
+
+        let config = with_allow_from("10.0.0.0/8,::ffff:10.3.0.0/112")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert!(config.static_v6.is_empty());
+        assert_eq!(config.covered_dropped, 1);
+
+        // the same network in both spellings is one entry, deduplicated as any repeated network is, not covered
+        let config = with_allow_from("10.0.0.0/8,::ffff:10.0.0.0/104")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert!(config.static_v6.is_empty());
         assert_eq!(config.covered_dropped, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_networks_become_ipv4_networks() -> TestResult {
+        let config = with_allow_from("::ffff:10.0.0.0/104")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert!(config.static_v6.is_empty());
+        assert!(!config.catch_all);
+
+        // masked as usual
+        let config = with_allow_from("::ffff:10.1.2.3/104,::ffff:192.0.2.77/127")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8", "192.0.2.76/31"])?);
+
+        // the whole mapped range is every IPv4 source
+        let config = with_allow_from("::ffff:0.0.0.0/96")?;
+        assert_eq!(config.static_v4, cidrs(&["0.0.0.0/0"])?);
+        assert!(config.static_v6.is_empty());
+        assert!(config.catch_all);
+
+        // a /128 is a host: it goes through the host canonicalisation and on to the allow set
+        let config = with_allow_from("::ffff:198.51.100.9/128,::ffff:198.51.100.10")?;
+        assert_eq!(config.static_v4, cidrs(&["198.51.100.9", "198.51.100.10"])?);
+        assert!(config.static_v4.iter().all(Cidr::is_host));
+        assert!(config.static_v6.is_empty());
+
+        // only the mapped form is converted: a wider IPv6 network around the mapped range stays IPv6
+        // and never covers the IPv4 network a mapped entry gives
+        let config = with_allow_from("::/80,::ffff:10.0.0.0/104")?;
+        assert_eq!(config.static_v4, cidrs(&["10.0.0.0/8"])?);
+        assert_eq!(config.static_v6, cidrs(&["::/80"])?);
+        assert_eq!(config.covered_dropped, 0);
+        let config = with_allow_from("::fffe:0:0/95")?;
+        assert!(config.static_v4.is_empty());
+        assert_eq!(config.static_v6, cidrs(&["::fffe:0:0/95"])?);
         Ok(())
     }
 
@@ -899,6 +995,41 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
                 temp.join(CONFIG_FILE)
             ))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_fifo_or_a_socket_at_config_or_floor_is_refused_without_blocking() -> TestResult {
+        let temp = TempDir::new("special-files")?;
+        let socket = temp.join("socket");
+        let _listener = UnixListener::bind(&socket)?;
+        let mut specials = vec![socket];
+        let fifo = temp.join("fifo");
+        if mkfifo(&fifo)? {
+            specials.push(fifo);
+        } else {
+            println!("FIFO case skipped: mkfifo is not on PATH");
+        }
+        for path in specials {
+            let at = path.clone();
+            let config = without_blocking(move || load_config(&at))?;
+            assert_eq!(
+                config.map_err(|e| (e.token(), e.to_string())).err(),
+                Some((
+                    "config-invalid",
+                    format!("{path:?}: cannot read: is not a regular file")
+                ))
+            );
+            let at = path.clone();
+            let floor = without_blocking(move || load_floor(&at))?;
+            assert_eq!(
+                floor.map_err(|e| (e.token(), e.to_string())).err(),
+                Some((
+                    "floor-invalid",
+                    format!("{path:?}: cannot read: is not a regular file")
+                ))
+            );
+        }
         Ok(())
     }
 
@@ -1233,6 +1364,97 @@ num_workers: 1
                 "{message}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn capture_floor_refuses_a_fifo_without_blocking() -> TestResult {
+        let temp = TempDir::new("capture-fifo")?;
+        let fifo = temp.join("bootstrap-peers.yaml");
+        if !mkfifo(&fifo)? {
+            println!("skipped: mkfifo is not on PATH");
+            return Ok(());
+        }
+        // a symlink is followed, and what it reaches is checked
+        let link = temp.join("committee.yaml");
+        symlink(&fifo, &link)?;
+        for bad in [fifo, link] {
+            let input = bad.clone();
+            let error = without_blocking(move || capture_floor(&[input]))?;
+            assert_eq!(
+                error.map_err(|e| (e.token(), e.to_string())).err(),
+                Some((
+                    "floor-invalid",
+                    format!("{bad:?}: cannot read: is not a regular file")
+                ))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capture_floor_refuses_a_socket_file() -> TestResult {
+        let temp = TempDir::new("capture-socket")?;
+        let socket = temp.join("bootstrap-peers.yaml");
+        let _listener = UnixListener::bind(&socket)?;
+        let input = socket.clone();
+        let error = without_blocking(move || capture_floor(&[input]))?
+            .map_err(|e| (e.token(), e.line(), e.to_string()));
+        // refused by the check before the open, so the socket is never opened
+        let Err((token, line, message)) = error else {
+            return Err("the socket was accepted".into());
+        };
+        assert_eq!((token, line), ("floor-invalid", None));
+        assert_eq!(
+            message,
+            format!("{socket:?}: cannot read: is not a regular file")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capture_floor_follows_a_symlinked_input() -> TestResult {
+        let temp = TempDir::new("capture-link")?;
+        let real = temp.join("committee.yaml");
+        fs::write(&real, COMMITTEE_YAML)?;
+        let link = temp.join("link.yaml");
+        symlink(&real, &link)?;
+        assert_eq!(
+            capture_floor(&[link])?,
+            ips(&["35.203.41.59", "35.203.41.60", "2001:db8::34"])?
+        );
+
+        let dangling = temp.join("dangling.yaml");
+        symlink(temp.join("nowhere.yaml"), &dangling)?;
+        let error = capture_floor(&[dangling]).map_err(|e| e.token());
+        assert_eq!(error.err(), Some("floor-invalid"));
+        Ok(())
+    }
+
+    #[test]
+    fn capture_floor_reads_16_mib_and_refuses_one_byte_more() -> TestResult {
+        let temp = TempDir::new("capture-size")?;
+        let tail = b"the last bytes\n";
+        let exact = temp.join("exact.yaml");
+        sparse_file(&exact, MAX_CAPTURE_INPUT, tail)?;
+        // read directly: scanning 16 MiB of zeros takes seconds in a debug build, and the scan has tests of its own
+        let bytes = read_capture_input(&exact)?;
+        assert_eq!(u64::try_from(bytes.len())?, MAX_CAPTURE_INPUT);
+        assert!(bytes.ends_with(tail));
+
+        let larger = temp.join("larger.yaml");
+        let len = MAX_CAPTURE_INPUT.checked_add(1).ok_or("overflow")?;
+        sparse_file(&larger, len, tail)?;
+        let error = capture_floor(std::slice::from_ref(&larger))
+            .map_err(|e| (e.token(), e.line(), e.to_string()));
+        assert_eq!(
+            error.err(),
+            Some((
+                "floor-invalid",
+                None,
+                format!("{larger:?}: cannot read: is larger than 16777216 bytes")
+            ))
+        );
         Ok(())
     }
 }

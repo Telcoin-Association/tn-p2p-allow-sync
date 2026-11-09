@@ -2,13 +2,23 @@
 # Every target runs the command CI or the release procedure runs, so a local pass means a CI
 # pass (.github/ACTIONS.md) and a release step behaves the same from make or by hand.
 
-.PHONY: help ci nft-real release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
+.PHONY: help ci fuzz mutants nft-real nft-real-docker release-prep release-tag release-check-tag release-notes release-draft release-build release-sign release-verify release-publish release-setup-remote release-prep-remote release-tag-remote release-build-remote release-sign-remote release-verify-remote release-publish-remote
 
 .DEFAULT_GOAL := help
 
 help:
-	@echo "make ci                        the five gates of ci.yaml: fmt, clippy, test, deny, audit"
+	@echo "make ci                        five of the seven gates of ci.yaml: fmt, clippy, test, deny, audit;"
+	@echo "                               coverage (cargo llvm-cov) runs in CI only, release-dry-run locally"
+	@echo "                               with bash etc/tests/release_dry_run.sh"
+	@echo "make mutants [MUTANTS_JOBS=4]  the mutants job of scheduled.yaml in one piece: cargo mutants over the"
+	@echo "                               whole crate, report-only, results under target/mutants/ (about an hour)"
+	@echo "make fuzz [FUZZ_SECONDS=300]   the fuzz job of scheduled.yaml: each target of fuzz/ for FUZZ_SECONDS"
+	@echo "                               (default 300) with its pinned nightly; failing inputs land in"
+	@echo "                               fuzz/artifacts/ (fuzz/README.md)"
 	@echo "make nft-real                  the real-kernel nft test (tests/real_nft.rs) under sudo"
+	@echo "make nft-real-docker [DISTRO=ubuntu:24.04|ubuntu:22.04|debian:13]"
+	@echo "                               the same test without sudo, as root in a privileged container of"
+	@echo "                               DISTRO (default ubuntu:24.04): its nft and ip, this machine's kernel"
 	@echo "make release-<step> TAG=vX.Y.Z[-rcN]"
 	@echo "                               one step of release/release.sh: prep, tag, check-tag, notes,"
 	@echo "                               draft, build, sign, verify or publish (release/docs/signing.md)"
@@ -30,6 +40,29 @@ ci:
 	cargo deny check
 	cargo audit
 
+# the fuzz job of scheduled.yaml: every target runs, even after one fails, and the target fails at
+# the end if any did; the nightly is the job's FUZZ_TOOLCHAIN and moves with it. The snapshot and
+# nft_listing corpora are seeded from the test fixtures first, which only adds starting points
+FUZZ_TOOLCHAIN = nightly-2026-10-15
+FUZZ_TARGETS = multiaddr cidr_or_host config snapshot nft_listing http_response
+# the weekly mutants job of scheduled.yaml, unsharded: every mutant of src/ is built and tested
+# in a copy of the tree; a missed mutant is a test gap to close or to justify in the review
+# notes, never a CI gate; cargo-mutants is installed with cargo install cargo-mutants --locked
+mutants: MUTANTS_JOBS ?= 4
+mutants:
+	cargo mutants --cargo-arg=--locked --jobs $(MUTANTS_JOBS) --output target/mutants
+
+fuzz: FUZZ_SECONDS ?= 300
+fuzz:
+	mkdir -p fuzz/corpus/snapshot fuzz/corpus/nft_listing
+	cp tests/fixtures/snapshot/*.json fuzz/corpus/snapshot/
+	cp tests/fixtures/nft/*.json fuzz/corpus/nft_listing/
+	cd fuzz && failed="" && \
+	for target in $(FUZZ_TARGETS); do \
+		cargo +$(FUZZ_TOOLCHAIN) fuzz run "$$target" -- -max_total_time=$(FUZZ_SECONDS) || failed="$$failed $$target"; \
+	done; \
+	test -z "$$failed" || { echo "failing input found by:$$failed (fuzz/artifacts/<target>/)" >&2; exit 1; }
+
 # the test binary is built as the invoking user and only that binary runs as root, as in
 # nft-real.yaml; TN_REAL_NFT_REQUIRED=1 turns a skip (no root, nft or ip) into a failure
 nft-real:
@@ -38,6 +71,27 @@ nft-real:
 		jq -r 'select(.reason == "compiler-artifact" and .target.name == "real_nft" and .profile.test) | .executable') && \
 	test -x "$$bin" && \
 	TN_REAL_NFT_REQUIRED=1 sudo -E "$$bin" --ignored --exact real_kernel_nft --nocapture --test-threads=1
+
+# the same test without sudo: the test binary is built as the invoking user for the musl target,
+# so it runs on any distro's libc, and only a throwaway container of DISTRO runs it as root, with
+# that distro's nftables and iproute2 against this machine's kernel; --privileged is for the
+# network namespace and the veth pair, and the table lives in the container's network namespace,
+# not the host's. Only the checkout is mounted, read-write and at its own path, because the
+# binary writes target/real-nft/ under the path it was compiled at; that directory is made first,
+# as the user, so the files root leaves in it can be removed. CI (nft-real.yaml) is the
+# authority, on GitHub's runner kernels and with debian:13 pinned by digest; this is the
+# local, sudo-free way to run it
+nft-real-docker: DISTRO ?= ubuntu:24.04
+nft-real-docker:
+	cargo test --locked --no-run --test real_nft --target x86_64-unknown-linux-musl
+	bin=$$(cargo test --locked --no-run --test real_nft --target x86_64-unknown-linux-musl --message-format=json | \
+		jq -r 'select(.reason == "compiler-artifact" and .target.name == "real_nft" and .profile.test) | .executable') && \
+	test -x "$$bin" && \
+	case "$$bin" in "$(CURDIR)"/*) ;; *) echo "$$bin is outside $(CURDIR), all the container sees" >&2; exit 2;; esac && \
+	mkdir -p target/real-nft && \
+	docker run --rm --privileged -e DEBIAN_FRONTEND=noninteractive -e TN_REAL_NFT_REQUIRED=1 \
+		-v "$(CURDIR):$(CURDIR)" -w "$(CURDIR)" "$(DISTRO)" \
+		sh -c 'apt-get -qq update && apt-get -qq install -y --no-install-recommends nftables iproute2 >/dev/null && exec "$$0" --ignored --exact real_kernel_nft --nocapture --test-threads=1' "$$bin"
 
 # verify rebuilds the program from the tag and compares it with the release's, unless
 # TN_P2P_ALLOW_REBUILD=0 is given; sign rebuilds only with TN_P2P_ALLOW_REBUILD=1

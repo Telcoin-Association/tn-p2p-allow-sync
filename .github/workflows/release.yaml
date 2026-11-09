@@ -18,14 +18,20 @@
 # and release.sh and the maintainer keys from the tn-release-signing commit that main's
 # pointer names: release.sh reads the keys out of the submodule's object store at that
 # commit, never from checked-out files. A tag on a commit that edits a hook, moves the
-# pointer or adds a key would otherwise be judged by its own edit. The rebuild in
-# verify-release takes etc/Dockerfile and the image pin from the tagged commit instead,
-# because the question there is whether that commit gives the published program.
+# pointer or adds a key would otherwise be judged by its own edit. The builds in rebuild
+# and verify-release take etc/Dockerfile and the image pin from the tagged commit instead,
+# because the question there is whether that commit gives the program being released.
 # This file itself is not covered by that. GitHub reads the job definitions from the
 # tagged commit (for a dispatch, from the branch it is run on), so who may push a `v*`
 # tag is decided by the tag ruleset, a repository setting (.github/ACTIONS.md, "Release
 # workflow"). The ruleset limits who can create, move or delete a `v*` tag and nothing
 # else; it does not limit who can write releases.
+#
+# On the push of a tag, `rebuild` builds the tagged commit once more on the runner, with the
+# tag's etc/Dockerfile and BUILD_IMAGE exactly as the build server does, and keeps the
+# program's sha256 as the artifact rebuild-<tag>. It is the one build before publish on a
+# host the build server does not control, for the maintainer's sign step to compare the
+# draft's program with.
 #
 # The post-publish check (`verify-release`) is detective only. The release is already
 # public when it runs, so a failure is an alarm for a maintainer, not a gate.
@@ -66,9 +72,9 @@ on:
         options: [validate, verify]
         default: validate
 
-# Everything here reads the repository; validate-tag also reads its own workflow run, and
-# draft-release alone adds the write it needs to create the draft (least privilege, CodeQL
-# actions/missing-workflow-permissions).
+# Everything here reads the repository; validate-tag also reads its own workflow run and the
+# check runs of the tagged commit, and draft-release alone adds the write it needs to create
+# the draft (least privilege, CodeQL actions/missing-workflow-permissions).
 permissions:
   contents: read
 
@@ -101,7 +107,9 @@ jobs:
     # actions: read lets the check read when GitHub created this run. On the push of a tag
     # the first run compares the tag with every release tag in the checkout; a re-run
     # compares it with the tags created before that time, the time of the push, whatever
-    # date the tag itself carries.
+    # date the tag itself carries. The tag gate of release.conf reads the jobs of the
+    # push-to-main runs of ci.yaml and nft-real.yaml on the tagged commit through the same
+    # actions: read; it reads no check runs.
     permissions:
       contents: read
       actions: read
@@ -160,6 +168,44 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./release/release.sh draft "$RELEASE_TAG"
+
+  # Proves: the tagged commit, built on a GitHub runner with the tag's etc/Dockerfile in the
+  # tag's BUILD_IMAGE, the way `make release-build` builds it on the build server, gives the
+  # program whose sha256 is in the step summary and in the artifact rebuild-<tag>, as the one
+  # line `<sha256>  tn-p2p-allow-sync` of program.sha256. It runs on the tag push only,
+  # before anything is signed or published, so the run that holds rebuild-<tag> is the push
+  # of that tag.
+  # Does not prove anything about the draft by itself: comparing the draft's program with
+  # this sha256 is the maintainer's sign step.
+  rebuild:
+    needs: validate-tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # read-only: the build runs the build code of every dependency, inside a container that
+    # receives no token
+    permissions:
+      contents: read
+    steps:
+      # main and its release/ submodule, as in validate-tag; etc/ci-rebuild.sh fetches the tag
+      # and takes etc/Dockerfile and BUILD_IMAGE from the tagged tree, as verify-release does.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Rebuild the program from the tag
+        run: bash etc/ci-rebuild.sh "$RELEASE_TAG" "$RUNNER_TEMP/rebuild"
+
+      # validate-tag has passed, so RELEASE_TAG matches TAG_RE and is a valid artifact name
+      - name: Upload the program's sha256
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rebuild-${{ env.RELEASE_TAG }}
+          path: ${{ runner.temp }}/rebuild/program.sha256
+          if-no-files-found: error
 
   # Proves: the published release is still what `make release-publish` verified, which
   # re-checks the asset set after its prompt and again after publishing. It repeats the

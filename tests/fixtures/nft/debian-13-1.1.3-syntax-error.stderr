@@ -1,0 +1,6 @@
+/dev/stdin:1:27-31: Error: syntax error, unexpected string
+table inet tn_p2p_allow { bogus }
+                          ^^^^^
+/dev/stdin:2:1-1: Error: syntax error, unexpected end of file
+table inet tn_p2p_allow { bogus }
+^

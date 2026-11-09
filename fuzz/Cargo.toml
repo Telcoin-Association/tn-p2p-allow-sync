@@ -1,0 +1,72 @@
+# The cargo-fuzz crate: one libFuzzer target per parser the program feeds outside input to.
+# README.md says how to run, reproduce and minimise; scheduled.yaml runs every target weekly.
+[package]
+name = "tn-p2p-allow-sync-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own, so the root crate's `--locked` builds, its Cargo.lock and its
+# `cargo deny check` never see this crate or libfuzzer-sys; fuzz/Cargo.lock is this one's.
+[workspace]
+members = ["."]
+
+[dependencies]
+# exact: libfuzzer-sys builds libFuzzer's C++ from source, so a bump is a deliberate edit
+libfuzzer-sys = "=0.4.13"
+# the version in the root crate's Cargo.lock, so the graph holds one serde_json
+serde_json = "1.0.154"
+
+[dependencies.tn-p2p-allow-sync]
+path = ".."
+
+# cargo fuzz builds with --release and turns on debug assertions and overflow checks itself;
+# line tables make a crash's backtrace name the file and line
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "multiaddr"
+path = "fuzz_targets/multiaddr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cidr_or_host"
+path = "fuzz_targets/cidr_or_host.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nft_listing"
+path = "fuzz_targets/nft_listing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false

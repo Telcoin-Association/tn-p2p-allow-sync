@@ -7,13 +7,15 @@
 //!
 //! 1. An unsafe state dir, an invalid config or nft failing to list the table is an error, exit 2, as for `sync`.
 //! 2. No table is `absent`, exit 1; the node is not asked.
-//! 3. A snapshot that is not authoritative, or whose epoch is below the applied `EPOCH`, is `stale`, exit 3: the run cannot judge.
-//! 4. A snapshot newer than the applied `EPOCH`, or any snapshot before the first good sync, is `behind`, exit 3: the next sync catches up, so a gap now is no fault.
+//! 3. A dormant table, one whose chains see no packet, is `dormant`, exit 1, whatever the snapshot says: the table enforces nothing.
+//!    The node is still asked, so the lines below show what the table lacks as well.
+//! 4. A snapshot that is not authoritative, or whose epoch is below the applied `EPOCH`, is `stale`, exit 3: the run cannot judge.
+//! 5. A snapshot newer than the applied `EPOCH`, or any snapshot before the first good sync, is `behind`, exit 3: the next sync catches up, so a gap now is no fault.
 //!    So is a gap made only of addresses `state.json` does not hold, such as a record republished at a new address since the last sync.
-//! 5. A current committee address of the primary swarm that the allow sets lack is `missing`, exit 1, when `state.json` holds it or cannot be read.
-//! 6. Otherwise `ok`, exit 0.
+//! 6. A current committee address of the primary swarm that the allow sets lack is `missing`, exit 1, when `state.json` holds it or cannot be read.
+//! 7. Otherwise `ok`, exit 0.
 //!
-//! Whenever a snapshot was compared, up to [`MAX_LINES`] `missing IP` lines and up to [`MAX_LINES`] `mismatch 0x<first 16 hex>` lines come first, then one `result=` line with both totals.
+//! Whenever a snapshot was compared, `dormant` included, up to [`MAX_LINES`] `missing IP` lines and up to [`MAX_LINES`] `mismatch 0x<first 16 hex>` lines come first, then one `result=` line with both totals.
 //! A mismatch is a key whose signed record lists other IPs than the addresses the node dials; both are allowed, so it never changes the verdict.
 
 use std::collections::BTreeSet;
@@ -27,7 +29,7 @@ use serde_json::Value;
 use crate::cli::Exit;
 use crate::config;
 use crate::fsutil::StateDir;
-use crate::log::{Log, Priority};
+use crate::log::{Line, Log, Priority};
 use crate::memory;
 use crate::nft::{Element, Listing, Nft};
 use crate::rpc::RpcClient;
@@ -53,6 +55,8 @@ pub enum Verdict {
     Missing,
     /// The table does not exist: `absent`, exit 1.
     Absent,
+    /// The table exists but is dormant, so it enforces nothing: `dormant`, exit 1.
+    Dormant,
     /// The snapshot is newer than the applied epoch, or every missing address is one the last good sync never held: `behind`, exit 3.
     Behind,
     /// No authoritative snapshot to judge by: `stale`, exit 3.
@@ -66,6 +70,7 @@ impl Verdict {
             Self::Ok => "ok",
             Self::Missing => "missing",
             Self::Absent => "absent",
+            Self::Dormant => "dormant",
             Self::Behind => "behind",
             Self::Stale => "stale",
         }
@@ -75,7 +80,7 @@ impl Verdict {
     pub const fn exit(self) -> Exit {
         match self {
             Self::Ok => Exit::Fresh,
-            Self::Missing | Self::Absent => Exit::Refused,
+            Self::Missing | Self::Absent | Self::Dormant => Exit::Refused,
             Self::Behind | Self::Stale => Exit::Stale,
         }
     }
@@ -136,7 +141,26 @@ fn shown(key: &BlsKey) -> String {
 /// Judges an authoritative `snapshot` against the live table `listing`, with `applied` the `EPOCH` of `status` and `synced` the addresses `state.json` holds, `None` when it is absent or unreadable.
 ///
 /// A snapshot below `applied` is not authoritative under rule 1 and compares nothing; every other snapshot is compared, `behind` included, so the lines show what the next sync adds.
+/// A dormant `listing` makes the verdict `dormant` whatever the snapshot says, with the lines and totals as they would be for the table awake.
 pub fn judge(
+    snapshot: &Snapshot,
+    applied: Option<u64>,
+    synced: Option<&BTreeSet<IpAddr>>,
+    listing: &Listing,
+) -> Report {
+    let report = compare(snapshot, applied, synced, listing);
+    if listing.dormant {
+        Report {
+            verdict: Verdict::Dormant,
+            ..report
+        }
+    } else {
+        report
+    }
+}
+
+/// [`judge`] for a table that is not dormant.
+fn compare(
     snapshot: &Snapshot,
     applied: Option<u64>,
     synced: Option<&BTreeSet<IpAddr>>,
@@ -229,14 +253,23 @@ pub fn check<O: Write, E: Write>(
     };
     let listing = match status::live_table(nft) {
         Ok(Some(listing)) => listing,
-        Ok(None) => return print(&Report::bare(Verdict::Absent), out, log),
+        Ok(None) => return print(&Report::bare(Verdict::Absent), out, log, None),
         Err(e) => return error(log, "nft-unavailable", &e),
     };
     let snapshot = match fetch_snapshot(&RpcClient::new(config.rpc_port)) {
         Ok(snapshot) => snapshot,
+        // the table enforces nothing whether or not the node answers; like `absent`, no line
+        // closes the run
+        Err(_) if listing.dormant => {
+            return print(&Report::bare(Verdict::Dormant), out, log, None);
+        }
         Err(reason) => {
-            log.line(Priority::Warning, "stale", &[("reason", &reason)]);
-            return print(&Report::bare(Verdict::Stale), out, log);
+            let stale = Line {
+                priority: Priority::Warning,
+                event: "stale",
+                fields: &[("reason", &reason)],
+            };
+            return print(&Report::bare(Verdict::Stale), out, log, Some(stale));
         }
     };
     let report = judge(&snapshot, applied, synced.as_ref(), &listing);
@@ -246,19 +279,22 @@ pub fn check<O: Write, E: Write>(
         ("snapshot_epoch", snapshot_epoch.as_str()),
         ("applied_epoch", applied_epoch.as_str()),
     ];
-    match report.verdict {
-        Verdict::Stale => {
-            let [shown, last] = epochs;
-            log.line(
-                Priority::Warning,
-                "stale",
-                &[("reason", EPOCH_REGRESSED), shown, last],
-            );
-        }
-        Verdict::Behind => log.line(Priority::Warning, "behind", &epochs),
-        Verdict::Ok | Verdict::Missing | Verdict::Absent => {}
-    }
-    print(&report, out, log)
+    let [shown, last] = epochs;
+    let regressed = [("reason", EPOCH_REGRESSED), shown, last];
+    let closing = match report.verdict {
+        Verdict::Stale => Some(Line {
+            priority: Priority::Warning,
+            event: "stale",
+            fields: &regressed,
+        }),
+        Verdict::Behind => Some(Line {
+            priority: Priority::Warning,
+            event: "behind",
+            fields: &epochs,
+        }),
+        Verdict::Ok | Verdict::Missing | Verdict::Absent | Verdict::Dormant => None,
+    };
+    print(&report, out, log, closing)
 }
 
 /// The snapshot from the node, or the stale reason, exactly as `sync` fetches it.
@@ -269,9 +305,9 @@ fn fetch_snapshot(rpc: &RpcClient) -> Result<Snapshot, String> {
     snapshot::parse(result).map_err(|e| e.token())
 }
 
-/// Logs an error that ends the run with nothing judged: exit 2.
+/// Logs an error that ends the run with nothing judged, as its closing line: exit 2.
 fn error<E: Write>(log: &mut Log<E>, reason: &str, detail: &dyn std::fmt::Display) -> Exit {
-    log.line(
+    log.last(
         Priority::Error,
         "error",
         &[("reason", reason), ("detail", &detail.to_string())],
@@ -279,19 +315,39 @@ fn error<E: Write>(log: &mut Log<E>, reason: &str, detail: &dyn std::fmt::Displa
     Exit::Error
 }
 
-/// Prints `report` and exits as its verdict says, or exit 2 when stdout cannot be written.
-fn print<O: Write, E: Write>(report: &Report, out: &mut O, log: &mut Log<E>) -> Exit {
+/// Prints `report` and exits as its verdict says, with `closing` as the run's closing line, or exit 2 when stdout cannot be written.
+///
+/// A failed write ends the run with its own `error` line, and `closing` is logged just before it.
+fn print<O: Write, E: Write>(
+    report: &Report,
+    out: &mut O,
+    log: &mut Log<E>,
+    closing: Option<Line<'_>>,
+) -> Exit {
     match out
         .write_all(report.render().as_bytes())
         .and_then(|()| out.flush())
     {
-        Ok(()) => report.verdict.exit(),
-        Err(e) => error(log, "output-failed", &e),
+        Ok(()) => {
+            if let Some(closing) = closing {
+                log.last(closing.priority, closing.event, closing.fields);
+            }
+            report.verdict.exit()
+        }
+        Err(e) => {
+            if let Some(closing) = closing {
+                log.line(closing.priority, closing.event, closing.fields);
+            }
+            error(log, "output-failed", &e)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use std::collections::BTreeMap;
     use std::error::Error;
@@ -605,6 +661,7 @@ mod tests {
             (Verdict::Ok, "ok", 0),
             (Verdict::Missing, "missing", 1),
             (Verdict::Absent, "absent", 1),
+            (Verdict::Dormant, "dormant", 1),
             (Verdict::Behind, "behind", 3),
             (Verdict::Stale, "stale", 3),
         ];
@@ -616,5 +673,192 @@ mod tests {
             Report::bare(Verdict::Absent).render(),
             "result=absent missing_total=0 mismatch_total=0\n"
         );
+    }
+
+    #[test]
+    fn a_dormant_table_is_never_ok_and_still_shows_what_it_lacks() -> TestResult {
+        let snap = primary(vec![
+            entry(1, &["current"], &["203.0.113.10"], None),
+            entry(2, &["current"], &["198.51.100.7"], Some(&["198.51.100.8"])),
+        ])?;
+        let asleep = |listing: &Listing| Listing {
+            dormant: true,
+            ..listing.clone()
+        };
+        let full = hosts(&["203.0.113.10", "198.51.100.7", "198.51.100.8"])?;
+        let gap = hosts(&["203.0.113.10"])?;
+        // ok or missing while awake; dormant while not, with the same lines and totals
+        for (listing, awake) in [(&full, Verdict::Ok), (&gap, Verdict::Missing)] {
+            let report = judge(&snap, Some(42), None, listing);
+            assert_eq!(report.verdict, awake);
+            assert_eq!(
+                judge(&snap, Some(42), None, &asleep(listing)),
+                Report {
+                    verdict: Verdict::Dormant,
+                    ..report
+                }
+            );
+        }
+        let report = judge(&snap, Some(42), None, &asleep(&gap));
+        assert_eq!(
+            report.render().lines().collect::<Vec<_>>(),
+            [
+                "missing 198.51.100.7",
+                "missing 198.51.100.8",
+                "mismatch 0x0200000000000000",
+                "result=dormant missing_total=2 mismatch_total=1",
+            ]
+        );
+        assert_eq!(report.verdict.exit().code(), 1);
+        // a snapshot that makes the awake table behind or stale does not hide it either
+        for applied in [None, Some(41)] {
+            let report = judge(&snap, applied, None, &asleep(&gap));
+            assert_eq!(report.verdict, Verdict::Dormant, "{applied:?}");
+            assert_eq!(report.missing.len(), 2, "{applied:?}");
+        }
+        assert_eq!(
+            judge(&snap, Some(43), None, &asleep(&gap)),
+            Report::bare(Verdict::Dormant)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_is_decided_before_the_listing_that_could_say_dormant() -> TestResult {
+        use crate::support::{FakeNft, TempDir, fake_rpc::FakeRpc};
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("check-absent-first")?;
+        let fake = FakeNft::install(temp.path())?;
+        let rpc = FakeRpc::start(Vec::new())?;
+        let state = temp.join("state");
+        std::fs::create_dir(&state)?;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+        let config = state.join(config::CONFIG_FILE);
+        std::fs::write(
+            &config,
+            format!(
+                "CONFIG_VERSION=1\nRPC_PORT={}\nP2P_PORTS=49590,49594\nP2P_ALLOW_FROM=\n",
+                rpc.port()
+            ),
+        )?;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))?;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut log = Log::new(&mut err, false);
+        let exit = check(&state, &Nft::new(Some(&fake.path())), &mut out, &mut log);
+        drop(log);
+        assert_eq!(exit, Exit::Refused);
+        assert_eq!(
+            String::from_utf8(out)?,
+            "result=absent missing_total=0 mismatch_total=0\n"
+        );
+        // only the tables were listed: a table that is not there has no flags to read, and the
+        // node was not asked
+        assert_eq!(fake.argv()?, ["-j list tables inet"]);
+        assert!(rpc.requests().is_empty());
+        Ok(())
+    }
+
+    /// A stdout that refuses every write.
+    struct Closed;
+
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A log on `err` that already holds ten warnings.
+    fn warned(err: &mut Vec<u8>) -> Log<&mut Vec<u8>> {
+        let mut log = Log::new(err, false);
+        for n in 0..10 {
+            log.line(Priority::Warning, "warning", &[("n", &n.to_string())]);
+        }
+        log
+    }
+
+    #[test]
+    fn ten_warnings_still_end_with_the_closing_line() -> TestResult {
+        use crate::log::MAX_LINES;
+        use crate::support::TempDir;
+
+        let capped = |err: &[u8], dropped: u64| -> Result<String, Box<dyn Error>> {
+            let text = String::from_utf8(err.to_vec())?;
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), MAX_LINES, "{text}");
+            assert_eq!(
+                lines.get(6).copied(),
+                Some(format!("log-capped dropped={dropped}").as_str()),
+                "{text}"
+            );
+            Ok(lines.last().copied().unwrap_or_default().to_owned())
+        };
+
+        // an error: a state dir without a config
+        let temp = TempDir::new("check-closing")?;
+        let mut err = Vec::new();
+        let mut log = warned(&mut err);
+        let exit = check(temp.path(), &Nft::new(None), &mut Vec::new(), &mut log);
+        drop(log);
+        assert_eq!(exit, Exit::Error);
+        let last = capped(&err, 4)?;
+        assert!(last.starts_with("error reason=config-invalid "), "{last}");
+
+        // a stale or behind verdict: its line comes after the report
+        let stale = Line {
+            priority: Priority::Warning,
+            event: "stale",
+            fields: &[("reason", "rpc-unreachable")],
+        };
+        let mut err = Vec::new();
+        let mut log = warned(&mut err);
+        let mut out = Vec::new();
+        let exit = print(
+            &Report::bare(Verdict::Stale),
+            &mut out,
+            &mut log,
+            Some(stale),
+        );
+        drop(log);
+        assert_eq!(exit, Exit::Stale);
+        assert_eq!(
+            String::from_utf8(out)?,
+            "result=stale missing_total=0 mismatch_total=0\n"
+        );
+        assert_eq!(capped(&err, 4)?, "stale reason=rpc-unreachable");
+
+        // a report that cannot be printed: the failure closes the run, after the verdict's line
+        let mut err = Vec::new();
+        let mut log = warned(&mut err);
+        let exit = print(
+            &Report::bare(Verdict::Stale),
+            &mut Closed,
+            &mut log,
+            Some(stale),
+        );
+        drop(log);
+        assert_eq!(exit, Exit::Error);
+        let last = capped(&err, 5)?;
+        assert!(last.starts_with("error reason=output-failed "), "{last}");
+
+        let mut err = Vec::new();
+        let mut log = Log::new(&mut err, false);
+        let exit = print(
+            &Report::bare(Verdict::Stale),
+            &mut Closed,
+            &mut log,
+            Some(stale),
+        );
+        drop(log);
+        assert_eq!(exit, Exit::Error);
+        assert_eq!(
+            String::from_utf8(err)?,
+            "stale reason=rpc-unreachable\nerror reason=output-failed detail=\"broken pipe\"\n"
+        );
+        Ok(())
     }
 }

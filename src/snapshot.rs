@@ -8,6 +8,10 @@
 //!
 //! The model ignores unknown fields at every level, so a v1 node can add fields without breaking this parser.
 //! A change that an old parser must not read raises `version` instead.
+//!
+//! A nullable field the decision reads is present, possibly null: `tracked_epoch`, `admission`, `admission.epoch` and `admission.fallback`.
+//! A missing one is `snapshot-malformed`, because reading it as null would trust a snapshot that never said it could be trusted.
+//! Only `record_multiaddrs`, the top-level `epoch`, `worker_id`, `peer_id`, `network_pubkey` and `record_timestamp` may be absent.
 
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,7 +47,7 @@ const BLS_KEY_HEX_DIGITS: usize = 192;
 pub struct RawSnapshot {
     /// The schema version; [`parse`] reads only [`SNAPSHOT_VERSION`].
     pub version: u32,
-    /// The primary swarm's accepted admission epoch, or `None` before one is accepted.
+    /// The primary swarm's accepted admission epoch, or `None` before one is accepted; may be absent, and is not used.
     pub epoch: Option<u64>,
     /// One report per swarm: the primary and each worker.
     pub swarms: Vec<RawSwarm>,
@@ -54,13 +58,19 @@ pub struct RawSnapshot {
 pub struct RawSwarm {
     /// The swarm's name: `primary`, or `worker-N` for worker `N`.
     pub network: String,
-    /// The worker id of a worker swarm, or `None` for the primary.
+    /// The worker id of a worker swarm, or `None` for the primary; may be absent.
     pub worker_id: Option<u16>,
     /// Whether the swarm answered the node in time.
     pub available: bool,
     /// The epoch of the latest scheduled and eligible key publication the swarm accepted, or `None` before the first.
+    ///
+    /// Present, possibly null: a missing key is `snapshot-malformed`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub tracked_epoch: Option<u64>,
     /// The swarm's admission status, `None` exactly when `available` is false.
+    ///
+    /// Present, possibly null: a missing key is `snapshot-malformed`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub admission: Option<RawAdmission>,
     /// Every key the swarm tracks.
     pub entries: Vec<RawEntry>,
@@ -74,8 +84,14 @@ pub struct RawAdmission {
     /// The mode applied to connections, below `configured` while a fallback holds.
     pub effective: String,
     /// The latest accepted committee window epoch, or `None` before one is accepted.
+    ///
+    /// Present, possibly null: a missing key is `snapshot-malformed`, since a null one skips the pool-behind check.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub epoch: Option<u64>,
     /// Why `Closed` cannot be enforced (`Missing`, `Stale`, `Contradictory` or `Unresolved`), or `None` when nothing prevents it.
+    ///
+    /// Present, possibly null: a missing key is `snapshot-malformed`, since a null one reads as authoritative.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub fallback: Option<String>,
     /// Current committee identities with authenticated records, the local one included.
     pub resolved_current: u64,
@@ -94,15 +110,15 @@ pub struct RawEntry {
     pub bls_pubkey: String,
     /// The slots the key holds in the swarm, by name.
     pub slots: Vec<String>,
-    /// The base58 PeerId of the held record, or `None` while no record is held.
+    /// The base58 PeerId of the held record, or `None` while no record is held; may be absent.
     pub peer_id: Option<String>,
-    /// The network public key of the held record, as `tn_info` serialises it, or `None` while no record is held.
+    /// The network public key of the held record, as `tn_info` serialises it, or `None` while no record is held; may be absent.
     pub network_pubkey: Option<Value>,
     /// The addresses the swarm uses for the key.
     pub multiaddrs: Vec<String>,
-    /// The signed record's own addresses, present only when a configured address replaces them in `multiaddrs`.
+    /// The signed record's own addresses, present only when a configured address replaces them in `multiaddrs`; the node omits the key otherwise.
     pub record_multiaddrs: Option<Vec<String>>,
-    /// The signed record's timestamp in seconds since the Unix epoch, or `None` while no signed record is held.
+    /// The signed record's timestamp in seconds since the Unix epoch, or `None` while no signed record is held; may be absent.
     pub record_timestamp: Option<u64>,
     /// Where `multiaddrs` came from: `record`, `config`, `stub` or `unresolved`.
     pub source: String,
@@ -315,7 +331,7 @@ pub struct Warnings {
 /// Why a snapshot is not authoritative; [`SnapshotError::token`] is the `STALE_REASON`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotError {
-    /// `snapshot-malformed`: `result` is not an object, `version` is missing or not an unsigned integer, the fields do not fit the v1 model, or the available primary has no admission status.
+    /// `snapshot-malformed`: `result` is not an object, `version` is missing or not an unsigned integer, the fields do not fit the v1 model (a required key missing, a present-possibly-null key missing, or a value of another type), or the available primary has no admission status.
     Malformed,
     /// `snapshot-version-<n>`: a version other than [`SNAPSHOT_VERSION`].
     Version(u64),
@@ -578,6 +594,85 @@ mod tests {
     const ABSORBED: &str = include_str!("../tests/fixtures/snapshot/absorbed.json");
     const WORKER_BEHIND: &str = include_str!("../tests/fixtures/snapshot/worker-behind.json");
 
+    /// The node's schema example as the node serialises it: telcoin-network 250843edc, the JSON
+    /// `admission_snapshot_serves_the_schema_example` asserts (crates/execution/tn-rpc/src/rpc_ext.rs:2177-2291),
+    /// in its wire form (compact, struct field order) with the keys of seeds 7 and 9 that the test derives.
+    const NODE_SCHEMA_V1: &str = include_str!("../tests/fixtures/snapshot/node-schema-v1.json");
+
+    /// `bls_key(7)` of the node test: the compressed BLS public key of the scalar `[7; 32]`.
+    const NODE_KEY_7: &str = "0xaecb3fe3d22a958237df2fdb9c6932c837687151bf8b819f18296cce5c5967fb215f16445486c93dbf6a2c933969a93601c2fda599ece5eb4f44c7a311f061d1390e8337230c72085387af3bef1854ef45307aea81704241cbf9ad10717cf4df";
+
+    /// `bls_key(9)` of the node test: the compressed BLS public key of the scalar `[9; 32]`.
+    const NODE_KEY_9: &str = "0xb77ba5d4bf7524aa429f1700dac5ac0a6de363e66ab0ef0aa13f2872c43a6923122ac96b24db2503f7c6ae4f33ae9ab400174206049b6caaba895383af5609ff2cde4d65ce83ba31f9ada80ba83bb47afb60bbc49dd40b9c7b57410bf8bbc525";
+
+    /// Every required field of the v1 model by object and name, with values of another type.
+    ///
+    /// A missing key and each of these values are `snapshot-malformed`.
+    /// The four present-possibly-null fields take null, so their mistypes are not null.
+    const REQUIRED: &[(&str, &str, &[&str])] = &[
+        ("", "version", &[r#""1""#, "null"]),
+        ("", "swarms", &["null", "{}", r#"["primary"]"#]),
+        ("/swarms/0", "network", &["null", "0"]),
+        ("/swarms/0", "available", &["null", r#""true""#]),
+        ("/swarms/0", "tracked_epoch", &[r#""0x2a""#]),
+        ("/swarms/0", "admission", &[r#""Closed""#, "[]"]),
+        ("/swarms/0", "entries", &["null", "{}", r#"["0x8f3a"]"#]),
+        ("/swarms/0/admission", "configured", &["null", "3"]),
+        ("/swarms/0/admission", "effective", &["null", "3"]),
+        ("/swarms/0/admission", "epoch", &[r#""0x2a""#]),
+        ("/swarms/0/admission", "fallback", &["false"]),
+        (
+            "/swarms/0/admission",
+            "resolved_current",
+            &["null", r#""4""#],
+        ),
+        (
+            "/swarms/0/admission",
+            "required_current",
+            &["null", r#""3""#],
+        ),
+        (
+            "/swarms/0/admission",
+            "connected_current",
+            &["null", r#""3""#],
+        ),
+        ("/swarms/0/admission", "contradicted", &["null", r#""0""#]),
+        ("/swarms/0/entries/0", "bls_pubkey", &["null", "0"]),
+        (
+            "/swarms/0/entries/0",
+            "slots",
+            &["null", r#""current""#, "[1]"],
+        ),
+        (
+            "/swarms/0/entries/0",
+            "multiaddrs",
+            &["null", r#""/ip4/203.0.113.10/udp/49590/quic-v1""#, "[1]"],
+        ),
+        ("/swarms/0/entries/0", "source", &["null", "1"]),
+        ("/swarms/0/entries/0", "admitted", &["null", r#""true""#]),
+    ];
+
+    /// Every optional field of the v1 model by object and name, with values of another type.
+    ///
+    /// The field may be null or absent; each of these values is `snapshot-malformed`.
+    /// `network_pubkey` is read as any JSON value, so no value mistypes it.
+    const OPTIONAL: &[(&str, &str, &[&str])] = &[
+        ("", "epoch", &[r#""0x2a""#]),
+        ("/swarms/0", "worker_id", &[r#""0""#]),
+        ("/swarms/0/entries/0", "peer_id", &["1"]),
+        ("/swarms/0/entries/0", "network_pubkey", &[]),
+        (
+            "/swarms/0/entries/0",
+            "record_multiaddrs",
+            &[r#""/ip4/203.0.113.10/udp/49590/quic-v1""#],
+        ),
+        (
+            "/swarms/0/entries/0",
+            "record_timestamp",
+            &[r#""1793750400""#],
+        ),
+    ];
+
     /// Every stored fixture that fails, with the token it must give.
     const FAILING: &[(&str, &str, &str)] = &[
         (
@@ -680,6 +775,16 @@ mod tests {
         Ok(())
     }
 
+    /// Removes `field` from the object at `object`; fails when the field is not there, so no case passes by removing nothing.
+    fn remove(result: &mut Value, object: &str, field: &str) -> TestResult {
+        at(result, object)?
+            .as_object_mut()
+            .ok_or_else(|| format!("{object} is not an object"))?
+            .remove(field)
+            .ok_or_else(|| format!("no {object}/{field} in the fixture"))?;
+        Ok(())
+    }
+
     fn push_swarm(result: &mut Value, swarm: &str) -> TestResult {
         at(result, "/swarms")?
             .as_array_mut()
@@ -768,6 +873,47 @@ mod tests {
             ),
         ]);
         assert_eq!(primary.entries, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn the_node_serialised_schema_example_parses() -> TestResult {
+        let snapshot = parse(value(NODE_SCHEMA_V1)?)?;
+        assert_eq!(snapshot.epoch, 42);
+        assert_eq!(snapshot.swarms.len(), 1);
+        assert_eq!(snapshot.warnings, Warnings::default());
+        let primary = swarm(&snapshot, PRIMARY_SWARM)?;
+        assert!(primary.authoritative);
+        assert_eq!(primary.tracked_epoch, Some(42));
+        let expected = BTreeMap::from([
+            (
+                NODE_KEY_7.parse::<BlsKey>()?,
+                Entry {
+                    slots: BTreeSet::from([Slot::Current, Slot::Eligible]),
+                    ips: BTreeSet::from([v4(203, 0, 113, 10)]),
+                    mismatch: false,
+                },
+            ),
+            (
+                NODE_KEY_9.parse::<BlsKey>()?,
+                Entry {
+                    slots: BTreeSet::from([Slot::Eligible]),
+                    ips: BTreeSet::from([v4(198, 51, 100, 7)]),
+                    mismatch: false,
+                },
+            ),
+        ]);
+        assert_eq!(primary.entries, expected);
+
+        // good.json is the same example with placeholder keys
+        let good = parse(value(GOOD)?)?;
+        assert_eq!(
+            primary.entries.values().collect::<Vec<_>>(),
+            swarm(&good, PRIMARY_SWARM)?
+                .entries
+                .values()
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 
@@ -909,6 +1055,38 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_nullable_decision_field_is_malformed_in_any_swarm() -> TestResult {
+        // present, possibly null: a null keeps its meaning (see worker_doubts_are_not_fatal and
+        // a_pool_behind_the_admission_window_is_unpublished), but a missing key never reads as null
+        for (object, field) in [
+            ("", "tracked_epoch"),
+            ("", "admission"),
+            ("/admission", "epoch"),
+            ("/admission", "fallback"),
+        ] {
+            let mut result = value(GOOD)?;
+            remove(&mut result, &format!("/swarms/0{object}"), field)?;
+            assert_eq!(
+                token_of(result).as_deref(),
+                Some("snapshot-malformed"),
+                "primary{object}/{field}"
+            );
+
+            let mut result = value(GOOD)?;
+            let mut worker = at(&mut result, "/swarms/0")?.clone();
+            set(&mut worker, "", "network", "worker-3".into())?;
+            remove(&mut worker, object, field)?;
+            push_swarm(&mut result, &worker.to_string())?;
+            assert_eq!(
+                token_of(result).as_deref(),
+                Some("snapshot-malformed"),
+                "worker-3{object}/{field}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn the_epoch_is_the_primary_tracked_epoch() -> TestResult {
         let mut result = value(GOOD)?;
         *at(&mut result, "/epoch")? = Value::Null;
@@ -1033,6 +1211,53 @@ mod tests {
     }
 
     #[test]
+    fn every_required_field_is_required_and_every_optional_one_may_be_absent() -> TestResult {
+        let malformed = Some("snapshot-malformed");
+        for (object, field, mistypes) in REQUIRED {
+            let mut missing = value(GOOD)?;
+            remove(&mut missing, object, field)?;
+            assert_eq!(
+                token_of(missing).as_deref(),
+                malformed,
+                "{object}/{field} missing"
+            );
+            for mistyped in *mistypes {
+                let mut result = value(GOOD)?;
+                set(&mut result, object, field, value(mistyped)?)?;
+                assert_eq!(
+                    token_of(result).as_deref(),
+                    malformed,
+                    "{object}/{field}: {mistyped}"
+                );
+            }
+        }
+
+        // an unused optional field changes nothing, whether null or absent
+        let good = parse(value(GOOD)?)?;
+        for (object, field, mistypes) in OPTIONAL {
+            let mut result = value(GOOD)?;
+            set(&mut result, object, field, Value::Null)?;
+            assert_eq!(
+                parse(result.clone()),
+                Ok(good.clone()),
+                "{object}/{field}: null"
+            );
+            remove(&mut result, object, field)?;
+            assert_eq!(parse(result), Ok(good.clone()), "{object}/{field} absent");
+            for mistyped in *mistypes {
+                let mut result = value(GOOD)?;
+                set(&mut result, object, field, value(mistyped)?)?;
+                assert_eq!(
+                    token_of(result).as_deref(),
+                    malformed,
+                    "{object}/{field}: {mistyped}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn unknown_fields_are_ignored_at_every_level() -> TestResult {
         let mut result = value(GOOD)?;
         for (pointer, field) in [
@@ -1128,6 +1353,117 @@ mod tests {
             assert_eq!(stub.mismatch, mismatch, "{record:?}");
             assert_eq!(stub.ips, ips.into_iter().collect(), "{record:?}");
         }
+        Ok(())
+    }
+
+    /// `count` IPv4 quic multiaddrs, `192.0.2.1` upwards.
+    fn quic_addrs(count: u8) -> Value {
+        (1..=count)
+            .map(|d| Value::from(format!("/ip4/192.0.2.{d}/udp/49590/quic-v1")))
+            .collect()
+    }
+
+    #[test]
+    fn record_multiaddrs_past_32_are_truncated_and_counted_per_list() -> TestResult {
+        assert_eq!(MAX_MULTIADDRS_PER_LIST, 32);
+        // record_multiaddrs length, multiaddrs length, truncated lists
+        for (record, listed, truncated) in [(32, 1, 0), (33, 1, 1), (33, 33, 2)] {
+            let mut result = value(GOOD)?;
+            *at(&mut result, "/swarms/0/entries/0/source")? = "stub".into();
+            if listed > 1 {
+                *at(&mut result, "/swarms/0/entries/0/multiaddrs")? = quic_addrs(listed);
+            }
+            set(
+                &mut result,
+                "/swarms/0/entries/0",
+                "record_multiaddrs",
+                quic_addrs(record),
+            )?;
+            let case = format!("record {record} listed {listed}");
+            let snapshot = parse(result)?;
+            assert_eq!(
+                snapshot.warnings,
+                Warnings {
+                    truncated_lists: truncated,
+                    ..Warnings::default()
+                },
+                "{case}"
+            );
+            // the first 32 record addresses are read, and the listed address beside them
+            let mut expected = (1..=32).map(|d| v4(192, 0, 2, d)).collect::<BTreeSet<_>>();
+            if listed == 1 {
+                expected.insert(v4(203, 0, 113, 10));
+            }
+            let stub = entry(
+                swarm(&snapshot, PRIMARY_SWARM)?,
+                &example_key("8f3a", "c21d"),
+            )?;
+            assert_eq!(stub.ips, expected, "{case}");
+            assert!(!stub.ips.contains(&v4(192, 0, 2, 33)), "{case}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn absorbed_faults_are_counted_over_every_swarm() -> TestResult {
+        let mut result = value(GOOD)?;
+        let mut worker = at(&mut result, "/swarms/0")?.clone();
+        set(&mut worker, "", "network", "worker-1".into())?;
+        set(&mut worker, "", "worker_id", 1.into())?;
+        // each kind of fault in the worker: an uppercase key with an unknown slot, a dns and an
+        // unparsed multiaddr, and a second listing of a key with 33 addresses
+        *at(&mut worker, "/entries/0/bls_pubkey")? = example_key("8F3A", "C21D").into();
+        *at(&mut worker, "/entries/0/slots")? = value(r#"["current", "observer"]"#)?;
+        *at(&mut worker, "/entries/1/multiaddrs")? = value(
+            r#"["/dns4/validator.example/udp/49590/quic-v1", "not-a-multiaddr",
+                "/ip4/198.51.100.7/udp/49590/quic-v1"]"#,
+        )?;
+        let mut second = at(&mut worker, "/entries/1")?.clone();
+        *at(&mut second, "/multiaddrs")? = quic_addrs(33);
+        at(&mut worker, "/entries")?
+            .as_array_mut()
+            .ok_or("entries is not an array")?
+            .push(second);
+        push_swarm(&mut result, &worker.to_string())?;
+        // and one fault in the primary too, so the dns count is a sum over the swarms
+        at(&mut result, "/swarms/0/entries/1/multiaddrs")?
+            .as_array_mut()
+            .ok_or("multiaddrs is not an array")?
+            .push("/dns6/validator.example/udp/49590/quic-v1".into());
+
+        let snapshot = parse(result)?;
+        // the same keys in the primary and the worker are not duplicates: those are per swarm
+        assert_eq!(
+            snapshot.warnings,
+            Warnings {
+                unknown_slots: 1,
+                uppercase_keys: 1,
+                duplicate_keys: 1,
+                dns_skipped: 2,
+                unparsed: 1,
+                truncated_lists: 1,
+                pool_ahead: 0,
+            }
+        );
+        // the skipped dns address leaves the primary as good.json reads it
+        let good = parse(value(GOOD)?)?;
+        assert_eq!(
+            swarm(&snapshot, PRIMARY_SWARM)?,
+            swarm(&good, PRIMARY_SWARM)?
+        );
+        let worker = swarm(&snapshot, "worker-1")?;
+        assert!(worker.authoritative);
+        assert_eq!(
+            entry(worker, &example_key("8f3a", "c21d"))?.slots,
+            BTreeSet::from([Slot::Current, Slot::Unknown])
+        );
+        assert_eq!(
+            entry(worker, &example_key("a71e", "09b4"))?.ips,
+            (1..=32)
+                .map(|d| v4(192, 0, 2, d))
+                .chain([v4(198, 51, 100, 7)])
+                .collect::<BTreeSet<_>>()
+        );
         Ok(())
     }
 
@@ -1259,6 +1595,29 @@ mod tests {
             format!("{good} "),
         ] {
             assert_eq!(text.parse::<BlsKey>(), Err(BlsKeyError), "{text:?}");
+        }
+        // the run maps the error to a token, so the text shows only where a caller prints it
+        assert_eq!(
+            BlsKeyError.to_string(),
+            "not a BLS public key: expected 0x and 192 hex digits"
+        );
+    }
+
+    #[test]
+    fn a_mismatch_in_any_listing_of_a_key_marks_the_merged_entry() {
+        let listing = |mismatch| Entry {
+            mismatch,
+            ..Entry::default()
+        };
+        for (first, second, merged) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let mut entry = listing(first);
+            entry.merge(listing(second));
+            assert_eq!(entry.mismatch, merged, "{first} then {second}");
         }
     }
 

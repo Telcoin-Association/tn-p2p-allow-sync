@@ -89,7 +89,9 @@ impl RpcClient {
     pub fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let started = Instant::now();
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), self.port);
-        // the deadline bounds the connect as well, so the whole call ends within it
+        // the one connection the tool opens: to a literal 127.0.0.1 SocketAddr, so nothing is
+        // resolved; the deadline bounds the connect as well, so the whole call ends within it
+        #[allow(clippy::disallowed_methods)]
         let mut stream = TcpStream::connect_timeout(&addr, self.connect_timeout.min(self.deadline))
             .map_err(io_error)?;
         stream
@@ -209,7 +211,10 @@ fn request(port: u16, method: &str, params: Value) -> Vec<u8> {
 }
 
 /// Reads one response and returns its decoded body.
-fn read_response<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
+///
+/// The head is capped at [`MAX_HEADER_BYTES`] and the decoded body at [`MAX_BODY_BYTES`], and every failure is the [`RpcError`] that [`RpcClient::call`] returns for it.
+/// Public for the fuzz targets in `fuzz/`; the program reads a response only through [`RpcClient::call`].
+pub fn read_response<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
     // a server that closes before its first byte never answered: the connection broke, not the framing
     if reader.fill_buf().map_err(io_error)?.is_empty() {
         return Err(RpcError::Unreachable);
@@ -458,8 +463,12 @@ fn to_u64(n: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    // tests serve the client from their own loopback listeners
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
+    use std::collections::VecDeque;
     use std::error::Error;
     use std::net::TcpListener;
     use std::thread::{self, JoinHandle};
@@ -538,6 +547,33 @@ mod tests {
         Ok(request)
     }
 
+    /// How long a test server waits for the client to connect.
+    const ACCEPT_WINDOW: Duration = Duration::from_secs(3);
+
+    /// The first connection to `listener` within [`ACCEPT_WINDOW`]: a client that never connects fails the test rather than hanging it.
+    fn accept(listener: &TcpListener) -> io::Result<TcpStream> {
+        listener.set_nonblocking(true)?;
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false)?;
+                    return Ok(stream);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= ACCEPT_WINDOW {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "the client never connected",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Accepts one connection on a fresh loopback port, reads the request and hands the stream to `respond`.
     fn serve<F>(respond: F) -> io::Result<(u16, Server)>
     where
@@ -546,7 +582,7 @@ mod tests {
         let listener = TcpListener::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))?;
         let port = listener.local_addr()?.port();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept()?;
+            let mut stream = accept(&listener)?;
             let request = read_request(&mut stream)?;
             // the client hangs up early on every refused response, so a failed write is expected
             let _ = respond(&mut stream);
@@ -748,14 +784,15 @@ mod tests {
 
     #[test]
     fn head_at_the_cap_is_read() -> TestResult {
-        let response = padded_head(MAX_HEADER_BYTES, &success_json())?;
+        // 16 KiB written out, so the test pins the cap rather than restating it
+        let response = padded_head(16_384, &success_json())?;
         assert_eq!(call_against(response)?, Ok(expected_result()?));
         Ok(())
     }
 
     #[test]
     fn head_over_the_cap_is_too_large() -> TestResult {
-        let response = padded_head(MAX_HEADER_BYTES.saturating_add(1), &success_json())?;
+        let response = padded_head(16_385, &success_json())?;
         assert_eq!(call_against(response)?, Err(RpcError::BodyTooLarge));
         // a status line alone past the cap
         let response = format!("HTTP/1.1 200 {}\r\n\r\n", "a".repeat(MAX_HEADER_BYTES));
@@ -766,14 +803,35 @@ mod tests {
         Ok(())
     }
 
+    /// A 200 response with `body` in two chunks, split at its middle.
+    fn chunked_in_two(body: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let (first, second) = body.split_at_checked(body.len() / 2).ok_or("short body")?;
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            first.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(first);
+        response.extend_from_slice(format!("\r\n{:x}\r\n", second.len()).as_bytes());
+        response.extend_from_slice(second);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        Ok(response)
+    }
+
     #[test]
     fn body_at_the_cap_is_read() -> TestResult {
-        let (json, expected) = padded_json(MAX_BODY_BYTES);
+        // 8 MiB written out, so the test pins the cap rather than restating it
+        let (json, expected) = padded_json(8_388_608);
         assert_eq!(json.len(), MAX_BODY_BYTES);
         assert_eq!(call_against(with_length(&json))?, Ok(expected.clone()));
         let mut eof = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
         eof.extend_from_slice(json.as_bytes());
-        assert_eq!(call_against(eof)?, Ok(expected));
+        assert_eq!(call_against(eof)?, Ok(expected.clone()));
+        // the second chunk fills exactly what the first left of the cap
+        assert_eq!(
+            call_against(chunked_in_two(json.as_bytes())?)?,
+            Ok(expected)
+        );
         Ok(())
     }
 
@@ -807,21 +865,34 @@ mod tests {
         );
 
         // two chunks that pass the cap only together
-        let (first, second) = json
-            .as_bytes()
-            .split_at_checked(MAX_BODY_BYTES / 2)
-            .ok_or("short json")?;
-        let mut chunked = format!(
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
-            first.len()
-        )
-        .into_bytes();
-        chunked.extend_from_slice(first);
-        chunked.extend_from_slice(format!("\r\n{:x}\r\n", second.len()).as_bytes());
-        chunked.extend_from_slice(second);
-        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-        assert_eq!(call_against(chunked)?, Err(RpcError::BodyTooLarge));
+        assert_eq!(
+            call_against(chunked_in_two(json.as_bytes())?)?,
+            Err(RpcError::BodyTooLarge)
+        );
         Ok(())
+    }
+
+    /// A stream that ends after each part and then goes on with the next: an end that is not final, which TCP never gives.
+    struct EndsAfterEachPart(VecDeque<&'static [u8]>);
+
+    impl Read for EndsAfterEachPart {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.front_mut() {
+                Some(part) if !part.is_empty() => part.read(buf),
+                // the part is used up: one end of stream, then the next part
+                _ => {
+                    self.0.pop_front();
+                    Ok(0)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_under_the_cap_ends_at_the_first_end_of_stream() {
+        // only a body that fills the cap is probed for one byte more; a shorter one is never read past its end
+        let mut stream = EndsAfterEachPart(VecDeque::from([b"abc".as_slice(), b"x".as_slice()]));
+        assert_eq!(read_to_eof(&mut stream), Ok(b"abc".to_vec()));
     }
 
     #[test]

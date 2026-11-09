@@ -1,4 +1,5 @@
-# The real-kernel nft test, tests/real_nft.rs, on the two Ubuntu releases validators run.
+# The real-kernel nft test, tests/real_nft.rs, on the two Ubuntu releases validators run and
+# with Debian 13's nft in a container.
 #
 # The test loads the rendered program into the runner's kernel with the system's nft, sends
 # UDP through a veth pair from a listed and an unlisted source, and checks the two named
@@ -8,7 +9,10 @@
 # binary is built as the runner user and only that binary runs under sudo.
 #
 # The runners are pinned by release, not ubuntu-latest, because the question is about kernels
-# and nft versions: 22.04 ships nft 1.0.2 and 24.04 ships nft 1.0.9.
+# and nft versions: 22.04 ships nft 1.0.2 and 24.04 ships nft 1.0.9. The debian:13 leg runs
+# on ubuntu-24.04 and starts the static (musl) test binary in a privileged debian:13
+# container with that release's nftables and iproute2 (`make nft-real-docker`). A container
+# shares the runner's kernel, so that leg answers for Debian's nft, not for Debian's kernel.
 #
 # The job reports on every pull request, because GitHub keeps a pull request waiting forever
 # on a required check that never reported. Its first step decides from the pull request's diff
@@ -21,6 +25,13 @@ on:
   push:
     branches: [main]
 
+# A new push to a pull request cancels the run for its previous head. Every other run is a
+# group of its own, so a push to main is never displaced by a later one and always runs the
+# suite (the same rule as ci.yaml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # nothing here writes; the job asks for read access to the repository and no more
 permissions: {}
 
@@ -31,12 +42,27 @@ env:
 
 jobs:
   nft-real:
-    name: nft-real (${{ matrix.runner }})
+    # the check names are what branch protection requires: nft-real (ubuntu-24.04),
+    # nft-real (ubuntu-22.04) and nft-real (debian:13); keep in step with .github/ACTIONS.md
+    name: nft-real (${{ matrix.name }})
     strategy:
-      # each runner answers for its own kernel and nft, so one failing must not cancel the other
+      # each leg answers for its own kernel or nft, so one failing must not cancel another
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-22.04]
+        # runner: the GitHub runner; distro: the image the test runs in, none for the runner
+        # itself, pinned by its index digest (how it moves: .github/ACTIONS.md); artifact: the
+        # name suffix of the listings, since an artifact name has no `:`
+        include:
+          - name: ubuntu-24.04
+            runner: ubuntu-24.04
+            artifact: ubuntu-24.04
+          - name: ubuntu-22.04
+            runner: ubuntu-22.04
+            artifact: ubuntu-22.04
+          - name: debian:13
+            runner: ubuntu-24.04
+            distro: debian:13@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
+            artifact: debian-13
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
@@ -54,7 +80,7 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           # the paths whose behaviour only a real kernel can check; keep in step with .github/ACTIONS.md
-          watched='^(src/(render|nft|sync|addr)\.rs|tests/real_nft\.rs|tests/(golden|fixtures/nft|support)/.*|\.github/workflows/nft-real\.yaml|Cargo\.(toml|lock)|rust-toolchain\.toml)$'
+          watched='^(src/(render|nft|sync|addr|config|cli|check|status|fsutil)\.rs|tests/real_nft\.rs|tests/(golden|fixtures/nft|fixtures/state|support)/.*|\.github/workflows/nft-real\.yaml|Cargo\.(toml|lock)|rust-toolchain\.toml|Makefile)$'
           if [ "$EVENT" != pull_request ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -68,7 +94,7 @@ jobs:
           if grep -E "$watched" <<< "$changed"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice title=nft-real::the pull request touches none of render, nft, sync or addr (paths in .github/ACTIONS.md); the real-kernel suite is not needed"
+            echo "::notice title=nft-real::the pull request touches none of the paths the real-kernel suite watches (.github/ACTIONS.md); the suite is not needed"
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -77,7 +103,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install nftables and iproute2
-        if: steps.scope.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true' && !matrix.distro
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends nftables iproute2
@@ -85,7 +111,7 @@ jobs:
 
       # as the runner user: nothing but the built test binary runs as root
       - name: Build the test binary
-        if: steps.scope.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true' && !matrix.distro
         run: |
           cargo test --locked --no-run --test real_nft --message-format=json > "$RUNNER_TEMP/build.json"
           bin=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "real_nft" and .profile.test) | .executable' "$RUNNER_TEMP/build.json")
@@ -93,18 +119,27 @@ jobs:
           echo "REAL_NFT_BIN=$bin" >> "$GITHUB_ENV"
 
       - name: Run the real-kernel test as root
-        if: steps.scope.outputs.run == 'true'
+        if: steps.scope.outputs.run == 'true' && !matrix.distro
         env:
           # without root, nft or ip the test would skip and pass; here that is a failure
           TN_REAL_NFT_REQUIRED: "1"
         run: sudo -E "$REAL_NFT_BIN" --ignored --exact real_kernel_nft --nocapture --test-threads=1
+
+      # builds the musl test binary as the runner user (rust-toolchain.toml lists the target)
+      # and runs it in a privileged container of the image with nftables and iproute2 and
+      # TN_REAL_NFT_REQUIRED=1, writing target/real-nft/ as the steps above do
+      - name: Run the real-kernel test in ${{ matrix.name }}
+        if: steps.scope.outputs.run == 'true' && matrix.distro
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: make nft-real-docker DISTRO="$DISTRO"
 
       # the raw nft -j listings of each step and the summary, kept even when the test fails
       - name: Upload the nft listings
         if: always() && steps.scope.outputs.run == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: real-nft-${{ matrix.runner }}
+          name: real-nft-${{ matrix.artifact }}
           path: |
             target/real-nft/*.json
             target/real-nft/summary.txt

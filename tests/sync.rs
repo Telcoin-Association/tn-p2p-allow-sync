@@ -3,6 +3,9 @@
 //! Each test gets its own directory holding the state dir, mode 0700, and a link to `tests/support/fake-nft.sh`, whose files, kept next to the link, show every call the tool made and the table it left loaded.
 //! The node is a [`FakeRpc`] that answers each call with the next canned response.
 
+// tests build fixtures with std::fs directly
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::collections::BTreeMap;
@@ -1556,60 +1559,122 @@ fn a_catch_all_static_entry_is_loaded_with_a_warning() -> TestResult {
 
 #[test]
 fn stderr_never_exceeds_eight_lines() -> TestResult {
+    /// A snapshot holding every kind of absorbed fault, its addresses written by `address`.
+    fn faulty(address: fn(&str) -> String) -> Res<Value> {
+        let long: Vec<String> = (1..=33_u8)
+            .map(|n| address(&format!("192.0.2.{n}")))
+            .collect();
+        let mut odd = entry(
+            0x11,
+            &[
+                address("198.51.100.1"),
+                "/dns4/validator.example/udp/49590/quic-v1".to_owned(),
+                "not-a-multiaddr".to_owned(),
+            ],
+        );
+        odd.as_object_mut()
+            .ok_or("not an object")?
+            .insert("slots".to_owned(), json!(["current", "observer"]));
+        Ok(primary_only(
+            42,
+            vec![
+                odd,
+                entry(0x22, &long),
+                entry(0x22, &[address("198.51.100.2")]),
+                json!({
+                    "bls_pubkey": format!("0x{:02X}{}", 0xab, "0".repeat(190)),
+                    "slots": ["eligible"],
+                    "multiaddrs": [address("198.51.100.3")],
+                    "source": "record",
+                    "admitted": true,
+                }),
+            ],
+        ))
+    }
+    // more lines were logged than fit: six are written, the seventh says how many were dropped,
+    // and the eighth is the line the run ends with
+    let closing = |ran: &Ran| {
+        let lines: Vec<&str> = ran.stderr.lines().collect();
+        assert_eq!(lines.len(), 8, "{ran:?}");
+        assert!(
+            lines
+                .get(6)
+                .is_some_and(|line| line.starts_with("log-capped dropped=")),
+            "{ran:?}"
+        );
+        lines.last().copied().unwrap_or_default().to_owned()
+    };
+
     let mut bed = Bed::new("log-cap")?;
     // the static list warns twice: a catch-all, and the two networks it covers
     bed.config("0.0.0.0/0,10.0.0.0/8,10.3.0.0/16")?;
-    let long: Vec<String> = (1..=33_u8).map(|n| ip4(&format!("192.0.2.{n}"))).collect();
-    let mut odd = entry(
-        0x11,
-        &[
-            ip4("198.51.100.1"),
-            "/dns4/validator.example/udp/49590/quic-v1".to_owned(),
-            "not-a-multiaddr".to_owned(),
-        ],
-    );
-    odd.as_object_mut()
-        .ok_or("not an object")?
-        .insert("slots".to_owned(), json!(["current", "observer"]));
-    let snap = primary_only(
-        42,
-        vec![
-            odd,
-            entry(0x22, &long),
-            entry(0x22, &[ip4("198.51.100.2")]),
-            json!({
-                "bls_pubkey": format!("0x{:02X}{}", 0xab, "0".repeat(190)),
-                "slots": ["eligible"],
-                "multiaddrs": [ip4("198.51.100.3")],
-                "source": "record",
-                "admitted": true,
-            }),
-        ],
-    );
+    let snap = faulty(ip4)?;
     // and the epoch info fails, one more warning
-    let ran = bed.sync(vec![
-        fake_rpc::result(&snap.to_string()),
-        fake_rpc::error(-32601),
-    ])?;
+    let answers = |snap: &Value| vec![fake_rpc::result(&snap.to_string()), fake_rpc::error(-32601)];
+
+    // only names, so memory holds nothing: the stale line closes the run
+    let names = faulty(|ip: &str| format!("/dns4/{ip}.example/udp/49590/quic-v1"))?;
+    let ran = bed.sync(answers(&names))?;
+    assert_eq!(ran.code, Some(3), "{ran:?}");
+    assert!(
+        ran.stdout.starts_with("result=stale reason=empty-set "),
+        "{ran:?}"
+    );
+    assert_eq!(closing(&ran), "stale reason=empty-set action=none");
+
+    // a failed load: the error line closes the run with nft's own words
+    bed.nft.knob("fail-next")?;
+    let ran = bed.sync(answers(&snap))?;
+    assert_eq!(ran.code, Some(2), "{ran:?}");
+    let last = closing(&ran);
+    assert!(
+        last.starts_with(
+            "error reason=nft-apply-failed action=none detail=\"nft exited with status 1: "
+        ),
+        "{ran:?}"
+    );
+
+    // a run that applies has no closing line, so its last line is the cap's
+    let ran = bed.sync(answers(&snap))?;
     assert_eq!(ran.code, Some(0), "{ran:?}");
     assert!(ran.stdout.starts_with("result=applied "), "{ran:?}");
     for warning in [
         "nft-path ",
+        "floor-missing ",
         "static-catch-all ",
         "static-covered dropped=2",
         "absorbed kind=unknown-slots count=1",
         "absorbed kind=uppercase-keys count=1",
-        "absorbed kind=duplicate-keys count=1",
     ] {
         assert!(ran.logged(warning), "{warning}: {ran:?}");
     }
-    // nine or more lines were logged: seven are written and the eighth says how many were dropped
     let lines: Vec<&str> = ran.stderr.lines().collect();
-    assert_eq!(lines.len(), 8, "{ran:?}");
+    assert_eq!(lines.len(), 7, "{ran:?}");
     assert!(
         lines
             .last()
             .is_some_and(|last| last.starts_with("log-capped dropped=")),
+        "{ran:?}"
+    );
+
+    // a failed reload closes the run, right after the stale line that led to it
+    bed.nft.delete_table()?;
+    bed.nft.knob("fail-next")?;
+    let ran = bed.sync(vec![fake_rpc::error(-32601)])?;
+    assert_eq!(ran.code, Some(2), "{ran:?}");
+    assert!(
+        ran.stdout.starts_with("result=error reason=reload-failed "),
+        "{ran:?}"
+    );
+    let lines: Vec<&str> = ran.stderr.lines().rev().take(2).collect();
+    assert_eq!(
+        lines.get(1).copied(),
+        Some("stale reason=rpc-method-missing action=reload-failed"),
+        "{ran:?}"
+    );
+    assert!(
+        lines.first().is_some_and(|last| last
+            .starts_with("error reason=reload-failed detail=\"nft exited with status 1: ")),
         "{ran:?}"
     );
     Ok(())

@@ -8,7 +8,7 @@
 //! 4. The snapshot is fetched, validated and folded into memory; a snapshot that is not authoritative, a regressed epoch and an empty dynamic set are stale (exit 3).
 //! 5. The program is rendered.
 //!    When it equals `current.nft` and the live table holds exactly the desired sets, chain `input` as the program declares it with the program's five rules, and both counters, nft is not run; otherwise the program is staged in `.current.nft.new`, loaded with `nft -f` and renamed to `current.nft`.
-//!    A table that is gone by the time it is listed, deleted while the node was being asked, is loaded again the same way.
+//!    A table that is gone by the time it is listed, deleted while the node was being asked, is loaded again the same way, and so is one whose listing the parser cannot read, with a `listing-unreadable` warning.
 //! 6. `state.json` is written whenever its canonical bytes changed, once the program is loaded, then `status`.
 //!
 //! The stale path, which every exit 3 and every local error takes, lists the tables again unless the run has just loaded the program, keeps a present table as it is, reloads `current.nft` when the table is gone, never writes `state.json` or `current.nft`, and records the reason in `status` with `STALE_SINCE` set only once.
@@ -18,10 +18,8 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{self, Read, Write};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,7 +29,7 @@ use crate::addr::{self, Cidr};
 use crate::cli::Exit;
 use crate::config::{self, Config, ConfigError};
 use crate::fsutil::{self, FsError, Lock, StateDir};
-use crate::log::{Log, Priority};
+use crate::log::{Line, Log, Priority};
 use crate::memory::{self, State};
 use crate::nft::{Chain, Element, Expr, Listing, Nft, NftError};
 use crate::render::{self, Program};
@@ -63,7 +61,7 @@ pub const INPUT_RULES: usize = 5;
 /// The named counters the program declares.
 pub const COUNTERS: [&str; 2] = ["tn_accept_p2p_listed", "tn_drop_p2p_unlisted"];
 
-/// The protocol keyword and the set of each accept rule of the program, in chain order, as [`render`] writes them.
+/// The protocol keyword and the set of each accept rule of the program, in chain order, as [`render::render`] writes them.
 const ACCEPT_RULES: [(&str, &str); 4] = [
     ("ip", "allow_v4"),
     ("ip", "static_v4"),
@@ -227,10 +225,11 @@ fn program_rules(ports: &BTreeSet<u16>) -> Vec<Vec<Expr>> {
 /// Whether the live table, as `listing` shows it, is the loaded program for `sets` and `ports`.
 ///
 /// The four sets must hold exactly the desired elements, compared as parsed values after [`normalise`] and never as text.
-/// Chain `input` must have the program's type, hook, priority and policy and hold exactly its [`INPUT_RULES`] rules in order, each with its ports, its source set, its counter and its verdict; both [`COUNTERS`] must exist.
-/// A set, a rule or a counter deleted by hand, and a verdict, a policy or a port list changed by hand, make this false, so the next run re-applies and heals it.
+/// Chain `input` must have the program's type, hook, priority and policy and hold exactly its [`INPUT_RULES`] rules in order, each with its ports, its source set, its counter and its verdict; both [`COUNTERS`] must exist; the table must not be dormant.
+/// A set, a rule or a counter deleted by hand, a verdict, a policy or a port list changed by hand, and a table made dormant by hand make this false, so the next run re-applies and heals it: the program declares the table without flags, which wakes it.
 pub fn listing_matches(listing: &Listing, sets: &Sets, ports: &BTreeSet<u16>) -> bool {
-    listing.chain.as_ref() == Some(&program_chain())
+    !listing.dormant
+        && listing.chain.as_ref() == Some(&program_chain())
         && listing.rules == program_rules(ports)
         && COUNTERS
             .iter()
@@ -419,9 +418,9 @@ fn log_absorbed<E: Write>(log: &mut Log<E>, warnings: &Warnings) {
     }
 }
 
-/// Logs an error that ends the run before anything was written.
+/// Logs an error that ends the run before anything was written, as its closing line.
 fn untouched<E: Write>(log: &mut Log<E>, reason: &str, detail: &dyn fmt::Display) -> Exit {
-    log.line(
+    log.last(
         Priority::Error,
         "error",
         &[("reason", reason), ("detail", &detail.to_string())],
@@ -472,50 +471,15 @@ fn fetch_epoch_duration<E: Write>(rpc: &RpcClient, log: &mut Log<E>) -> Option<u
 
 /// Writes the program to [`STAGED_FILE`] with mode 0600 and syncs it, removing a leftover of a run that died first.
 ///
-/// Creating with `O_CREAT|O_EXCL|O_NOFOLLOW` never follows a symlink, so the program cannot be written through one.
+/// [`StateDir::create`] creates it with `O_CREAT|O_EXCL|O_NOFOLLOW`, which never follows a symlink, so the program cannot be written through one.
 /// The caller holds the lock, which is what makes removing a leftover safe.
 fn stage(dir: &StateDir, program: &[u8]) -> Result<PathBuf, FsError> {
-    let path = dir.file(STAGED_FILE)?;
-    let io_error = |action, source| FsError::Io {
-        path: path.clone(),
-        action,
-        source,
-    };
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io_error("remove the leftover", e)),
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(FILE_MODE)
-        .custom_flags(fsutil::O_NOFOLLOW)
-        .open(&path)
-        .map_err(|e| io_error("create", e))?;
-    // the mode given at creation is masked by the umask
-    let written = file
-        .set_permissions(Permissions::from_mode(FILE_MODE))
-        .and_then(|()| file.write_all(program))
-        .and_then(|()| file.sync_all());
-    if let Err(e) = written {
-        // best effort: the error that matters is the one returned
-        let _ = fs::remove_file(&path);
-        return Err(io_error("write", e));
-    }
-    Ok(path)
+    dir.create(STAGED_FILE, program, FILE_MODE)
 }
 
 /// Renames the loaded [`STAGED_FILE`] to [`CURRENT_FILE`] and syncs the directory, so the rename survives a crash.
 fn place(dir: &StateDir) -> Result<(), FsError> {
-    let staged = dir.file(STAGED_FILE)?;
-    let current = dir.file(CURRENT_FILE)?;
-    fs::rename(&staged, &current).map_err(|source| FsError::Io {
-        path: current,
-        action: "rename into place",
-        source,
-    })?;
-    dir.sync()
+    dir.rename(STAGED_FILE, CURRENT_FILE)
 }
 
 /// What `sync` was asked to do.
@@ -628,6 +592,16 @@ impl<O: Write, E: Write> Run<'_, O, E> {
         let listing = if present && current.as_deref() == Some(program.as_bytes()) {
             match self.nft.list_table() {
                 Ok(listing) => Some(listing),
+                // nft listed the table but in a form the comparison cannot read: applying the
+                // program again is the only way back to a table it can
+                Err(NftError::Parse(detail)) => {
+                    self.log.line(
+                        Priority::Warning,
+                        "listing-unreadable",
+                        &[("detail", &detail)],
+                    );
+                    None
+                }
                 // gone while the node was being asked: no listing, so the program is applied again
                 Err(e) => match self.nft.table_present() {
                     Ok(false) => None,
@@ -652,7 +626,7 @@ impl<O: Write, E: Write> Run<'_, O, E> {
             };
             if let Err(e) = self.nft.load_file(&staged) {
                 // the transaction failed whole, so the live table is as it was
-                let _ = fs::remove_file(&staged);
+                let _ = self.dir.remove(STAGED_FILE);
                 return self.local_error(&Failure::new("nft-apply-failed", &e), None);
             }
             if let Err(e) = place(self.dir) {
@@ -675,14 +649,14 @@ impl<O: Write, E: Write> Run<'_, O, E> {
             epoch_duration: self.epoch_duration.unwrap_or(self.previous.epoch_duration),
             ..counts(&sets, &floor, &state, &snap.warnings)
         };
-        self.finish(status, Exit::Fresh)
+        self.finish(status, Exit::Fresh, None)
     }
 
     /// A stale reason: the stale path, or a refusal under `--require-authoritative`.
     fn stale(self, reason: &str) -> Exit {
         if self.require_authoritative {
             self.log
-                .line(Priority::Warning, "refused", &[("reason", reason)]);
+                .last(Priority::Warning, "refused", &[("reason", reason)]);
             let status = Status {
                 stale_reason: reason.to_owned(),
                 ..self.previous.clone()
@@ -723,17 +697,26 @@ impl<O: Write, E: Write> Run<'_, O, E> {
         if let Some(detail) = detail {
             fields.push(("detail", detail));
         }
-        self.log.line(priority, event, &fields);
-        let (result, reason) = match &reload_error {
-            Some(error) => {
-                self.log.line(
-                    Priority::Error,
-                    "error",
-                    &[("reason", "reload-failed"), ("detail", error)],
-                );
-                (RunResult::Error, "reload-failed")
+        let kept = Line {
+            priority,
+            event,
+            fields: &fields,
+        };
+        let reload_fields = reload_error
+            .as_deref()
+            .map(|error| [("reason", "reload-failed"), ("detail", error)]);
+        // a failed reload ends the run, right after the line that led to it
+        let (result, reason, closing) = match &reload_fields {
+            Some(fields) => {
+                self.log.line(kept.priority, kept.event, kept.fields);
+                let failed = Line {
+                    priority: Priority::Error,
+                    event: "error",
+                    fields,
+                };
+                (RunResult::Error, "reload-failed", failed)
             }
-            None => (result, reason),
+            None => (result, reason, kept),
         };
         let status = Status {
             tool_version: status::TOOL_VERSION.to_owned(),
@@ -748,7 +731,7 @@ impl<O: Write, E: Write> Run<'_, O, E> {
             RunResult::Stale => Exit::Stale,
             _ => Exit::Error,
         };
-        self.finish(status, exit)
+        self.finish(status, exit, Some(closing))
     }
 
     /// The stale path's care of the table: a present table is kept as it is, and an absent one is reloaded from `current.nft` when that exists.
@@ -787,8 +770,11 @@ impl<O: Write, E: Write> Run<'_, O, E> {
         }
     }
 
-    /// Writes `status`, then prints its summary line; a failed write turns the run into `state-io-failed`, exit 2.
-    fn finish(self, mut status: Status, mut exit: Exit) -> Exit {
+    /// Writes `status`, logs `closing`, then prints its summary line; a failed write turns the run into `state-io-failed`, exit 2.
+    ///
+    /// `closing` is the line the run ends with, if it has one.
+    /// When the write fails, its `error` line ends the run instead, with `closing` logged just before it.
+    fn finish(self, mut status: Status, mut exit: Exit, closing: Option<Line<'_>>) -> Exit {
         match status.save(self.dir) {
             Ok(invalid) => {
                 for key in invalid {
@@ -796,9 +782,17 @@ impl<O: Write, E: Write> Run<'_, O, E> {
                     self.log
                         .line(Priority::Warning, "status-value-invalid", &[("key", key)]);
                 }
+                if let Some(closing) = closing {
+                    self.log
+                        .last(closing.priority, closing.event, closing.fields);
+                }
             }
             Err(e) => {
-                self.log.line(
+                if let Some(closing) = closing {
+                    self.log
+                        .line(closing.priority, closing.event, closing.fields);
+                }
+                self.log.last(
                     Priority::Error,
                     "error",
                     &[("reason", e.token()), ("detail", &e.to_string())],
@@ -837,6 +831,7 @@ pub struct RenderOptions<'a> {
 /// Memory comes from `state.json` and is updated in memory only.
 /// A snapshot that is not authoritative, a regressed epoch and an empty dynamic set are refused with exit 1 and no program; the summary then says `result=stale` with the reason, and its epoch and counts are those of memory as `state.json` holds it.
 /// The summary of a printed program says `result=rendered`.
+/// The summary is the run's closing line, so the log's cap never drops it.
 /// With `--check`, nft must list its tables before anything else happens and must accept the program, or the run exits 2 without printing it.
 pub fn render<O: Write, E: Write>(
     options: &RenderOptions<'_>,
@@ -864,7 +859,7 @@ pub fn render<O: Write, E: Write>(
         return nft_unavailable(log, &e);
     }
     let snap = match options.snapshot {
-        Some(path) => match read_snapshot_file(path) {
+        Some(path) => match fsutil::read_bounded(path, count(MAX_SNAPSHOT_FILE)) {
             Ok(bytes) => snapshot_from_bytes(&bytes),
             Err(e) => {
                 return untouched(log, "snapshot-unreadable", &format_args!("{path:?}: {e}"));
@@ -883,20 +878,20 @@ pub fn render<O: Write, E: Write>(
     let snap = match snap {
         Ok(snap) => snap,
         Err(reason) => {
-            log.plain(&refused(&reason, &state, &Warnings::default()));
+            log.last_plain(&refused(&reason, &state, &Warnings::default()));
             return Exit::Refused;
         }
     };
     // a refusal reports memory as state.json holds it, as the stale path of sync keeps it
     let stored = state.clone();
     if let Err(e) = memory::apply(&mut state, &snap) {
-        log.plain(&refused(e.token(), &stored, &snap.warnings));
+        log.last_plain(&refused(e.token(), &stored, &snap.warnings));
         return Exit::Refused;
     }
     log_absorbed(log, &snap.warnings);
     let dynamic = memory::allow_ips(&state);
     if dynamic.is_empty() {
-        log.plain(&refused(EMPTY_SET, &stored, &snap.warnings));
+        log.last_plain(&refused(EMPTY_SET, &stored, &snap.warnings));
         return Exit::Refused;
     }
     let sets = Sets::build(&dynamic, &floor, &config);
@@ -909,28 +904,11 @@ pub fn render<O: Write, E: Write>(
     if let Err(e) = out.write_all(program.as_bytes()).and_then(|()| out.flush()) {
         return untouched(log, "output-failed", &e);
     }
-    log.plain(&summary(
+    log.last_plain(&summary(
         "rendered",
         &counts(&sets, &floor, &state, &snap.warnings),
     ));
     Exit::Fresh
-}
-
-/// Reads the file of `render --snapshot`: a regular file, at most one byte past [`MAX_SNAPSHOT_FILE`] read.
-fn read_snapshot_file(path: &Path) -> io::Result<Vec<u8>> {
-    // checked before the open, so a FIFO cannot block the run
-    if !fs::metadata(path)?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    let cap = u64::try_from(MAX_SNAPSHOT_FILE)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut bytes = Vec::new();
-    File::open(path)?.take(cap).read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 /// The snapshot in `bytes`, either a `result` object or a whole JSON-RPC response that holds one, or the stale reason.
@@ -954,9 +932,14 @@ fn snapshot_from_bytes(bytes: &[u8]) -> Result<Snapshot, String> {
 
 #[cfg(test)]
 mod tests {
+    // tests build fixtures with std::fs directly
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use crate::nft::Counter;
     use std::collections::BTreeMap;
+    use std::fs::{self, Permissions};
+    use std::os::unix::fs::PermissionsExt;
     use std::str::FromStr;
 
     fn ip(text: &str) -> IpAddr {
@@ -1019,6 +1002,7 @@ mod tests {
                 .collect(),
             chain: Some(program_chain()),
             rules: program_rules(&ports()),
+            dormant: false,
         };
         for (name, elements) in sets.elements() {
             listing.sets.insert(name.to_owned(), elements);
@@ -1229,6 +1213,40 @@ mod tests {
                 "case {n}"
             );
         }
+    }
+
+    #[test]
+    fn a_dormant_table_re_applies_even_when_everything_else_matches() {
+        let (sets, config) = sample();
+        let program = sets.program(&config.p2p_ports);
+        let ports = &config.p2p_ports;
+        let awake = listing_of(&sets);
+        assert!(is_unchanged(
+            &program,
+            Some(program.as_bytes()),
+            Some(&awake),
+            &sets,
+            ports
+        ));
+        // the same sets, rules and counters, counters with traffic included: the table enforces nothing
+        let mut dormant = Listing {
+            dormant: true,
+            ..awake
+        };
+        for counter in dormant.counters.values_mut() {
+            *counter = Counter {
+                packets: 1,
+                bytes: 29,
+            };
+        }
+        assert!(!listing_matches(&dormant, &sets, ports));
+        assert!(!is_unchanged(
+            &program,
+            Some(program.as_bytes()),
+            Some(&dormant),
+            &sets,
+            ports
+        ));
     }
 
     #[test]
@@ -1512,6 +1530,135 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn staging_removes_an_empty_directory_in_the_way_and_names_a_full_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::support::TempDir;
+
+        let temp = TempDir::new("sync-stage-dir")?;
+        let dir = StateDir::open(temp.path())?;
+        let leftover = temp.join(STAGED_FILE);
+        std::fs::create_dir(&leftover)?;
+        assert_eq!(stage(&dir, b"program\n")?, leftover);
+        assert_eq!(std::fs::read(&leftover)?, b"program\n");
+
+        std::fs::remove_file(&leftover)?;
+        std::fs::create_dir(&leftover)?;
+        std::fs::write(leftover.join("kept"), "kept")?;
+        let error = match stage(&dir, b"program\n") {
+            Err(e) => e,
+            Ok(path) => return Err(format!("staged {path:?} past a full directory").into()),
+        };
+        assert_eq!(error.token(), "state-io-failed");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "{leftover:?}: cannot remove the leftover: a directory is in the way: "
+            )),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(leftover.join("kept"))?, b"kept");
+        Ok(())
+    }
+
+    /// One `sync` of `state` through `nft`, with `rpc` serving the good snapshot: the exit, stdout and stderr.
+    fn sync_once(
+        state: &Path,
+        nft: &Nft,
+        rpc: &mut crate::support::fake_rpc::FakeRpc,
+    ) -> Result<(Exit, String, String), Box<dyn std::error::Error>> {
+        use crate::support::fake_rpc;
+
+        let snapshot = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/snapshot/good.json"
+        ))?;
+        rpc.set(vec![
+            fake_rpc::result(&snapshot),
+            fake_rpc::result(r#"{"epochId":42,"epochDuration":86400}"#),
+        ])?;
+        let options = SyncOptions {
+            state_dir: state,
+            nft,
+            require_authoritative: false,
+            wait: None,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut log = Log::new(&mut err, false);
+        let exit = sync(&options, &mut out, &mut log);
+        log.finish();
+        Ok((exit, String::from_utf8(out)?, String::from_utf8(err)?))
+    }
+
+    #[test]
+    fn a_listing_the_parser_cannot_read_re_applies_the_program()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::support::{FakeNft, TempDir, fake_rpc::FakeRpc};
+
+        let temp = TempDir::new("sync-unreadable")?;
+        let state = temp.join("state");
+        std::fs::create_dir(&state)?;
+        std::fs::set_permissions(&state, Permissions::from_mode(0o700))?;
+        let fake = FakeNft::install(temp.path())?;
+        let nft = Nft::new(Some(&fake.path()));
+        let mut rpc = FakeRpc::start(Vec::new())?;
+        let config = state.join(config::CONFIG_FILE);
+        std::fs::write(
+            &config,
+            format!(
+                "CONFIG_VERSION=1\nRPC_PORT={}\nP2P_PORTS=49590,49594\nP2P_ALLOW_FROM=\n",
+                rpc.port()
+            ),
+        )?;
+        std::fs::set_permissions(&config, Permissions::from_mode(0o600))?;
+        let result = |out: &str| out.split(' ').next().unwrap_or_default().to_owned();
+
+        let (exit, out, err) = sync_once(&state, &nft, &mut rpc)?;
+        assert_eq!(
+            (exit, result(&out)),
+            (Exit::Fresh, "result=applied".to_owned()),
+            "{err}"
+        );
+        let loaded = fake.table()?.ok_or("no table after the first run")?;
+
+        // a set the program does not declare, whatever it holds, is not read and changes nothing
+        fake.set_table(&format!("{loaded}set ports inet_service\nelem ports 80\n"))?;
+        let (exit, out, err) = sync_once(&state, &nft, &mut rpc)?;
+        assert_eq!(
+            (exit, result(&out)),
+            (Exit::Fresh, "result=unchanged".to_owned()),
+            "{err}"
+        );
+
+        // an element of one of the program's sets that the parser cannot read
+        fake.set_table(&format!("{loaded}elem allow_v4 192.0.2.300\n"))?;
+        let (exit, out, err) = sync_once(&state, &nft, &mut rpc)?;
+        assert_eq!(
+            (exit, result(&out)),
+            (Exit::Fresh, "result=applied".to_owned()),
+            "{err}"
+        );
+        let unreadable: Vec<&str> = err
+            .lines()
+            .filter(|line| line.starts_with("listing-unreadable "))
+            .collect();
+        assert_eq!(
+            unreadable,
+            [r#"listing-unreadable detail="set allow_v4: \"192.0.2.300\" is not an IP address""#]
+        );
+        assert_eq!(fake.loaded()?.len(), 2);
+        // the re-apply replaced the table, so the next run finds it as the program left it
+        assert_eq!(fake.table()?.as_deref(), Some(loaded.as_str()));
+        let (exit, out, err) = sync_once(&state, &nft, &mut rpc)?;
+        assert_eq!(
+            (exit, result(&out)),
+            (Exit::Fresh, "result=unchanged".to_owned()),
+            "{err}"
+        );
+        assert!(!err.contains("listing-unreadable"), "{err}");
         Ok(())
     }
 }
