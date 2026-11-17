@@ -7,6 +7,11 @@ Generated from commit messages by git-cliff when a release is cut (`make release
 The commits on `main` since the newest release below; `make release-prep` writes them into the next release's section.
 
 <!-- ANCHOR: releases -->
+## [v0.1.2] - 2026-11-17
+<!-- release-base: 0bc4d11b9fe5d7009dcda8bc71956b5dcfbcd695 -->
+### Build, CI and chores
+- **release**: Move the signing submodule to cbd56ec for grantkee's rotated key
+
 ## [v0.1.1] - 2026-11-09
 <!-- release-base: b7f1798357cc7d3d5f255ffbc6a80c9455c63a45 -->
 ### Features
