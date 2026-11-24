@@ -398,6 +398,10 @@ fn capture_floor<E: Write>(
         Ok(lock) => lock,
         Err(e) => return fs_failure(&e, err),
     };
+    // the lock is free, so the series of busy sync runs, if any, is over; a mark that stays is not this command's failure
+    if let Err(e) = crate::status::clear_busy(&dir) {
+        let _ = writeln!(err, "capture-floor: busy-mark-stuck: {e}");
+    }
     match config::write_floor(&dir, &floor) {
         Ok(()) => Exit::Fresh,
         Err(e) => fs_failure(&e, err),

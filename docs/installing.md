@@ -53,7 +53,7 @@ Until the second lands, a release signed by a new key fails to install, an exten
 | `telcoin-p2p-allow-sync.timer` | every 5 minutes | `OnBootSec=2min`, `OnUnitActiveSec=5min`, `RandomizedDelaySec=30s` |
 
 The boot unit is a no-op until the first sync has written `current.nft`.
-The sync unit treats a stale run (exit 3) and a busy one (exit 4) as success, so a node restart never leaves a failed unit.
+The sync unit treats a stale run (exit 3) and a busy one (exit 4) as success, so a node restart never leaves a failed unit; the third busy run in a row exits 2 as `lock-stuck`, so a lock held for about 15 minutes does fail it.
 `firewall-setup.sh --p2p-committee off` disables the three units, deletes the table and removes the state dir under the state-dir lock, and never runs the binary.
 
 ## Verify a release by hand

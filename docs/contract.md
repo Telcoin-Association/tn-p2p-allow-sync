@@ -87,15 +87,15 @@ nft refusing a call for lack of privilege is exit 2 with `nft: operation not per
 |---|---|---|---|---|---|
 | 0 | applied, or already loaded | `ok` | printed | program printed | `floor` written |
 | 1 | `--require-authoritative` only: any exit-3 reason, nothing written | `missing`, `absent` or `dormant` | never | a stale reason, no program | never |
-| 2 | usage, local error, unsafe state dir, nft unavailable | usage, unsafe state dir, `config-invalid`, `nft-unavailable`, stdout failed | usage, unsafe state dir, stdout failed | usage, unsafe state dir, invalid input, `nft-unavailable` or `nft-check-failed` with `--check`, stdout failed | usage, unsafe state dir, unreadable input, write failed |
+| 2 | usage, local error, unsafe state dir, nft unavailable, lock stuck | usage, unsafe state dir, `config-invalid`, `nft-unavailable`, stdout failed | usage, unsafe state dir, stdout failed | usage, unsafe state dir, invalid input, `nft-unavailable` or `nft-check-failed` with `--check`, stdout failed | usage, unsafe state dir, unreadable input, write failed |
 | 3 | stale, last-good program kept | `stale` or `behind`: cannot judge | never | never | never |
-| 4 | busy: the lock is held | never | never | never | busy after 30 s |
+| 4 | busy: the lock is held, fewer than 3 runs in a row | never | never | never | busy after 30 s |
 | 101 | panic, a bug | panic | panic | panic | panic |
 
 `--version` exits 0, or 2 with no stderr line when stdout cannot be written.
 
 The sync unit lists `SuccessExitStatus=3 4`, so a stale or busy timer run is not a failed unit.
-It also sets `TimeoutStartSec=90`: the tool bounds every RPC call but not the run time of nft, so the unit's timeout is what ends a run whose nft hangs while it holds the lock.
+It also sets `TimeoutStartSec=90`: the tool bounds every RPC call and every nft child, which is killed after 10 s (`nft-unavailable` for a listing, `nft-apply-failed` or `reload-failed` for a load, each with a detail that names the timeout), so a run whose nft hangs ends on its own, well inside the unit's timeout, and writes its status.
 `status` exits 0 whenever the state dir passes its checks: a missing status file reads as the status before the first run, and nft failing to list the table leaves `LOADED` and the counter keys empty with an `nft-unavailable` warning.
 `AGE_SECS` and `STALE` come from the file and the clock, so they are still computed then.
 
@@ -117,7 +117,8 @@ Grammar, version 1:
 
 - Lines end at `\n`; a final newline is optional.
 - An empty line is skipped, and a line whose first byte is `#` is a comment.
-- Every other line is printable ASCII (0x21 to 0x7e): no spaces, tabs, control bytes, non-ASCII bytes, `"` or `'`.
+- Every other line is printable ASCII (0x21 to 0x7e) plus spaces and tabs: no control bytes, non-ASCII bytes, `"` or `'`.
+  Spaces and tabs at either end of a line, around the `=` and around the commas of a list are ignored, and so is a CR before the newline, so a file saved with CRLF line ends or padded by hand parses.
 - Such a line is `KEY=VALUE`, split at the first `=`.
 - Every line is checked against the grammar above first; then `CONFIG_VERSION` is checked before any other key and must be `1`, so a newer file reports its version rather than an unknown key.
 - Each of the four keys appears exactly once; an unknown, duplicate or missing key refuses the whole file.
@@ -268,13 +269,14 @@ It also refuses a path whose last component is empty (a trailing `/`), `.` or `.
 | `state.json` | `sync` | [Memory](#memory) | whenever its canonical bytes change, after the program is loaded or found loaded |
 | `status` | `sync` | [The status file](#the-status-file) | every run that reached a decision |
 | `lock` | every locking run | empty, mode 0600, never deleted | created on the first locked run |
+| `busy` | a busy `sync`, without the lock | [The lock](#the-lock) | every run that found the lock held; removed by the next run that takes it |
 
 Every file the tool writes has mode 0600 whatever the umask; a `lock` found with another mode is set to 0600 by the next locked run.
 The directory is checked once, with `lstat`, when the run starts, and then held by its path: every later file open is by path, each with `O_NOFOLLOW`, which guards the last component only.
 Each sync of the directory opens it with `O_NOFOLLOW|O_DIRECTORY`, so a sync never follows a symlink swapped in for it.
 `state.json`, `status` and `floor` are written atomically: the bytes go to `.<name>.new`, created with `O_CREAT|O_EXCL|O_NOFOLLOW` and synced, then renamed into place, then the directory is synced.
 The program is staged the same way in `.current.nft.new`.
-A leftover `.<name>.new` from a run that died is removed by the next writer, which holds the lock.
+A leftover `.<name>.new` from a run that died is removed by the next writer, which holds the lock; `.busy.new` is written without it and is the exception, see [The lock](#the-lock).
 An empty directory at that name is removed too; one with anything in it is never emptied, and the write is `state-io-failed` with a detail ending `cannot remove the leftover: a directory is in the way: <os error>`.
 Every file is opened without following symlinks, and every read also with `O_NONBLOCK`, so a FIFO is refused, never waited on.
 Reads have no size cap, since every file is in the euid-owned 0700 dir.
@@ -288,7 +290,12 @@ The lock is an exclusive `flock` on `lock`.
   The timer runs without `--wait`; the verbs that run the binary pass `--wait 30`.
 - `capture-floor` waits up to 30 s.
 - `check`, `status` and `render` take no lock and write nothing, so they answer while a sync runs.
-- Busy and a failure to take the lock write nothing, not even `status`.
+- A busy `sync` writes nothing under the lock, not even `status`; it counts itself in `busy` instead, without the lock: `BUSY_SINCE=<unix seconds>`, when the first busy run of the series started, and `BUSY_RUNS=<count>`, the busy runs in a row so far, the current one included.
+  The bytes go to `.busy.new`, created with `O_CREAT|O_EXCL|O_NOFOLLOW` and synced, then renamed into place.
+  A `.busy.new` already there may belong to a busy run still writing, so it is never removed unless it is older than 60 s, left by a run that died; otherwise the mark is skipped with a `busy-mark-skipped` warning and the run still exits 4.
+  The third busy run in a row exits 2 with `error reason=lock-stuck` instead of 4, so a lock held across three timer runs (about 15 minutes) fails the unit, which `check-node.sh` reports; `status` shows the series as `BUSY_SINCE` and `BUSY_RUNS` meanwhile.
+  The next run that takes the lock, `capture-floor` included, removes `busy` and `.busy.new` before anything else; a removal that fails is a `busy-mark-stuck` warning.
+- Any other failure to take the lock is `state-io-failed`, exit 2, with nothing written.
 - `lock` itself is created by the first run that takes the lock, a refused one included.
 
 Bash never holds `lock` while the binary runs, since a second open file description conflicts with the tool's own attempt.
@@ -410,11 +417,13 @@ nft runs from `/usr/sbin/nft` (or `--nft`), never through a shell, with a cleare
 | `nft -c -f -` | `render --check` | checking the program without applying it |
 
 Every `sync` lists the tables before it applies anything, so a missing CAP_NET_ADMIN is caught there; nft 1.0.2 prints nothing on a refused `-f`.
-Any failure of either listing call is `nft-unavailable`, exit 2, nothing touched, with two exceptions in `sync`, which then applies the program:
+Any failure of either listing call is `nft-unavailable`, exit 2, with two exceptions in `sync`, which then applies the program:
 
 - the table listing fails and a second tables listing shows the table gone, deleted while the node was being asked;
 - nft prints the table listing but the tool cannot read it: the run logs one `listing-unreadable detail=…` warning and re-applies, since the comparison needs a listing it can read.
 
+`check`, `status` and `render` touch nothing on `nft-unavailable`.
+`sync` holds the lock by then, so it records the failure like every local error, `RESULT=error` with `STALE_REASON=nft-unavailable`, under the closing line `error reason=nft-unavailable action=none detail=…`; it never asks nft again in that run, and the table is left as it is.
 Only the elements of the four sets are read, so a set or a map added by hand, whatever it holds, never makes the listing unreadable.
 `check` and `status` report an unreadable listing as `nft-unavailable`.
 The tool never deletes the table; `off` does.
@@ -427,16 +436,16 @@ The node's own limits, about 1024 tracked keys per swarm and at most 4 addresses
 
 In the order that decides what a run may touch:
 
-1. The state dir passes its checks (`state-dir-invalid`) and the lock is free (busy, exit 4); otherwise nothing is touched.
+1. The state dir passes its checks (`state-dir-invalid`) and the lock is free (busy, exit 4, or `lock-stuck`, exit 2, on the third busy run in a row); otherwise nothing is touched but the busy mark `busy`.
 2. `config`, `floor` and `state.json` are read; an invalid one is a local error.
-3. nft lists its tables (`nft-unavailable`, exit 2, nothing touched).
+3. nft lists its tables (`nft-unavailable`, exit 2, a local error: `status` is written and the table is not touched).
 4. The snapshot is fetched, validated and folded into memory; a snapshot that is not authoritative, a regressed epoch and an empty dynamic set are stale.
 5. The program is rendered and applied, or found already loaded ([Idempotence](#idempotence)).
 6. `state.json` is written when its bytes changed, then `status`, then the stdout line.
 
 ### The stale path
 
-Every stale reason and every local error after step 1 takes the stale path; `nft-unavailable` does not: it exits 2 with nothing touched.
+Every stale reason and every local error after step 1 takes the stale path, `nft-unavailable` included: that one takes action `none` without asking nft again, writes `status` and exits 2.
 
 - The tables are listed again first, unless the run has just loaded the program, so a table deleted while the node was being asked counts as absent.
   When that listing fails, the run logs one `nft-unavailable detail=…` warning, takes action `none` and goes on: it writes `status` and exits 3, or 2 for a local error.
@@ -483,8 +492,9 @@ Every token below appears as `STALE_REASON` in `status`, as `reason=` on the std
 | `nft-apply-failed` | `nft -f` did not confirm the load: it refused the program, and the transaction is atomic, so the live table is unchanged; or a signal ended it, maybe after it committed; `current.nft` is kept either way, so the next run applies the program again or finds it loaded | 2 | `error` |
 | `reload-failed` | the stale path's `nft -f current.nft` failed | 2 | `error` |
 | `state-dir-invalid` | the state dir failed its checks | 2 | no status written |
-| `nft-unavailable` | nft is missing, failed a listing call or was refused it; a table listing of `sync` that nft printed and the tool cannot read re-applies instead (`listing-unreadable`) | 2 | no status written |
-| `busy` | the lock is held (log line `busy`) | 4 | no status written |
+| `nft-unavailable` | nft is missing, failed a listing call, was refused it or was killed after 10 s; a table listing of `sync` that nft printed and the tool cannot read re-applies instead (`listing-unreadable`) | 2 | `error` from `sync`; no status written by `check`, `status` or `render` |
+| `busy` | the lock is held (log line `busy`), fewer than 3 runs in a row | 4 | no status written; `busy` counts the run |
+| `lock-stuck` | the lock is held for the third `sync` run in a row (log line `error reason=lock-stuck`) | 2 | no status written; `busy` counts the run |
 
 Log-only tokens, never written to `status`: `usage` (a relative `--nft`), `snapshot-unreadable` (`render --snapshot` cannot read its file), `nft-check-failed` (`render --check` and nft rejected the program), `output-failed` (stdout could not be written, or `status --json` could not be serialised) and `no-epoch-duration` (the `epoch-info-failed` reason of an answer without a positive integer `epochDuration`).
 
@@ -511,7 +521,7 @@ result=applied reason= epoch=42 v4=3 v6=1 static=1 floor=2 keys=2 dns_skipped=0 
 The counts come from the status the run wrote, or tried to write.
 A stale or error run keeps every count of the previous status, so its line shows the previous counts: a first run that goes stale prints `floor=0` even with a floor file, and a refusal prints the counts of the last status on disk.
 A run whose write of `status` failed prints `result=error reason=state-io-failed` although no new status reached the disk, with the counts of the status it failed to write.
-No line is printed on a usage error, an unsafe state dir, busy, a lock failure or `nft-unavailable`.
+No line is printed on a usage error, an unsafe state dir, busy, `lock-stuck`, a lock failure or `nft-unavailable`.
 
 ### `check`
 
@@ -572,26 +582,28 @@ When more than one verdict applies, the first of these wins: an error (exit 2), 
 - An empty value means not known yet.
 - A good run writes every key, with `LAST_GOOD=LAST_RUN` and both `STALE_*` keys empty.
 - A stale or failed run changes only `TOOL_VERSION`, `RESULT`, `LAST_RUN`, `STALE_SINCE` (when empty), `STALE_REASON` and `EPOCH_DURATION` (when learned in that run); every count, `EPOCH` and `LAST_GOOD` stay as the last good run left them.
-- Busy runs, usage errors, an unsafe state dir, `nft-unavailable`, a lock failure and refusals write no status.
+- Busy and `lock-stuck` runs, usage errors, an unsafe state dir, a lock failure and refusals write no status; busy and `lock-stuck` runs write the busy mark `busy` instead, and `nft-unavailable` under the lock writes a status like any local error.
 - Runs read the file back only to carry values forward: every value on the stale path, `EPOCH_DURATION` on a good run whose epoch info failed, and the applied `EPOCH` that `check` compares with.
   A file of another `STATUS_VERSION` reads as the status before the first run, and so does an unreadable one, with a `status-unreadable` warning.
 
 ### `status`
 
-`status` prints the status file's 18 lines, then 7 live keys:
+`status` prints the status file's 18 lines, then 9 live keys:
 
 | Key | Value | Meaning |
 |---|---|---|
 | `LOADED` | `true`, `false` or empty | whether the table exists; empty when nft could not list it |
 | `AGE_SECS` | integer or empty | now minus `LAST_GOOD`, 0 when the clock went back; empty before the first good run |
 | `STALE` | `true`, `false` or empty | whether `AGE_SECS` is above 2 × `EPOCH_DURATION`; empty before the first good run |
+| `BUSY_SINCE` | unix seconds or empty | when the current series of busy `sync` runs began, from the busy mark `busy`; empty while there is none |
+| `BUSY_RUNS` | integer or empty | how many `sync` runs in a row found the lock held; empty while there is none |
 | `COUNTER_ACCEPT_PACKETS`, `COUNTER_ACCEPT_BYTES` | integer or empty | counter `tn_accept_p2p_listed` |
 | `COUNTER_DROP_PACKETS`, `COUNTER_DROP_BYTES` | integer or empty | counter `tn_drop_p2p_unlisted` |
 
 The counters are empty when nft could not list the table, the table is absent or the counter is gone.
 `LOADED` is `true` for a dormant table too; `check` is what reports it.
-The 7 live keys are computed on every call and never written to the status file, which has no `STALE` key.
-`status` takes no lock and writes nothing.
+The 9 live keys are computed on every call and never written to the status file, which has no `STALE` key.
+`status` takes no lock and writes nothing; it reads `busy` without the lock, and a mark it cannot read leaves both `BUSY_*` keys empty with a `busy-mark-unreadable` warning.
 
 ### `status --json`
 
@@ -612,6 +624,8 @@ The 7 live keys are computed on every call and never written to the status file,
 | `stale` | bool or null | `STALE` |
 | `stale_since` | integer or null | `STALE_SINCE` |
 | `stale_reason` | string or null | `STALE_REASON`, null when empty |
+| `busy_since` | integer or null | `BUSY_SINCE` |
+| `busy_runs` | integer or null | `BUSY_RUNS` |
 | `counters` | object | `{"accepted": …, "dropped": …}`, the packet counts of the two counters, each an integer or null |
 
 A value that is not known is `null`, never an empty string.
@@ -649,7 +663,7 @@ Every log line goes to stderr, one event per line: the event name, then `key=val
   A run with no closing line (a fresh or busy `sync`, a `check` that ends `ok`, `missing`, `absent` or `dormant`, or `status`) writes at most 7 lines.
 - On the stale path, a failed reload closes the run with `error reason=reload-failed`, and a failed write of `status` with `error reason=state-io-failed`; the stale path's own line comes before it.
 - The closing line is written when the run ends, after its stdout line.
-- The events: `error`, `stale`, `refused`, `busy`, `behind`, `nft-path`, `nft-unavailable`, `listing-unreadable`, `static-catch-all`, `static-covered`, `floor-missing`, `absorbed kind=<kind> count=N`, `epoch-info-failed`, `status-unreadable`, `status-value-invalid` and `log-capped`.
+- The events: `error`, `stale`, `refused`, `busy`, `busy-mark-skipped`, `busy-mark-unreadable`, `busy-mark-stuck`, `behind`, `nft-path`, `nft-unavailable`, `listing-unreadable`, `static-catch-all`, `static-covered`, `floor-missing`, `absorbed kind=<kind> count=N`, `epoch-info-failed`, `status-unreadable`, `status-value-invalid` and `log-capped`.
 - `capture-floor` writes its single failure line without a prefix: `capture-floor: <token>: <detail>`.
 
 The deployment reads exit codes, stdout lines and the status file, never the log lines.

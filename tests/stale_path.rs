@@ -729,12 +729,12 @@ fn a_stale_run_changes_only_the_status_keys_the_contract_names() -> TestResult {
 }
 
 #[test]
-fn a_failing_table_listing_with_the_table_present_is_nft_unavailable_and_touches_nothing()
+fn a_failing_table_listing_with_the_table_present_is_nft_unavailable_and_writes_the_error_status()
 -> TestResult {
     let mut bed = Bed::new("list-fails")?;
     bed.good()?;
     let kept = Kept::now(&bed)?;
-    let status = (bed.stamp("status")?, bed.read("status")?);
+    let last_good = bed.status_value("LAST_GOOD")?;
     let loads = bed.nft.loaded()?.len();
     bed.nft.knob("list-fails")?;
 
@@ -749,9 +749,10 @@ fn a_failing_table_listing_with_the_table_present_is_nft_unavailable_and_touches
     assert_eq!(
         ran.events(),
         [
-            "error reason=nft-unavailable detail=\"nft exited with status 1: netlink: Error: cache initialization failed: No buffer space available\""
+            "error reason=nft-unavailable action=none detail=\"nft exited with status 1: netlink: Error: cache initialization failed: No buffer space available\""
         ]
     );
+    // nft is not asked again in this run, and the table is left as it is
     assert_eq!(bed.calls_since(before)?, [TABLES, TABLE, TABLES]);
     assert_eq!(
         bed.methods_since(asked),
@@ -759,7 +760,11 @@ fn a_failing_table_listing_with_the_table_present_is_nft_unavailable_and_touches
     );
     assert_eq!(bed.nft.loaded()?.len(), loads);
     assert_eq!(Kept::now(&bed)?, kept);
-    assert_eq!((bed.stamp("status")?, bed.read("status")?), status);
+    // docs/contract.md, The stale path: the failure is recorded like every local error
+    assert_eq!(bed.status_value("RESULT")?, "error");
+    assert_eq!(bed.status_value("STALE_REASON")?, "nft-unavailable");
+    assert_ne!(bed.status_value("STALE_SINCE")?, "");
+    assert_eq!(bed.status_value("LAST_GOOD")?, last_good);
     assert_eq!(bed.names()?, AFTER_GOOD);
 
     // a listing that works again finds the program loaded

@@ -35,7 +35,7 @@ use crate::nft::{Chain, Element, Expr, Listing, Nft, NftError};
 use crate::render::{self, Program};
 use crate::rpc::{self, RpcClient, RpcError};
 use crate::snapshot::{self, Snapshot, SnapshotError, Warnings};
-use crate::status::{self, RunResult, Status};
+use crate::status::{self, Busy, RunResult, Status};
 
 /// Name of the memory file inside the state dir.
 pub const STATE_FILE: &str = "state.json";
@@ -332,6 +332,17 @@ impl From<ConfigError> for Failure {
     }
 }
 
+/// What a run that takes the stale path knows about the table's presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Known {
+    /// The presence a load the run just made established.
+    Present(bool),
+    /// Not known: the tables are listed again, since the table may have gone while the node was being asked.
+    Unknown,
+    /// nft failed a listing call in this run: it is not asked again, and the table is left as it is.
+    NftUnavailable,
+}
+
 /// What a run reads from the state dir before it talks to nft or the node.
 struct Inputs {
     config: Config,
@@ -428,9 +439,74 @@ fn untouched<E: Write>(log: &mut Log<E>, reason: &str, detail: &dyn fmt::Display
     Exit::Error
 }
 
-/// nft could not list the table: exit 2 with nothing touched, "run as root" when it was refused.
+/// nft could not list the table outside the lock: exit 2 with nothing touched, "run as root" when it was refused.
 fn nft_unavailable<E: Write>(log: &mut Log<E>, error: &NftError) -> Exit {
     untouched(log, "nft-unavailable", error)
+}
+
+/// The lock is held: counts the run in the busy mark, written without the lock, and exits 4; the run that makes [`MAX_BUSY_RUNS`](status::MAX_BUSY_RUNS) in a row exits 2 as `lock-stuck` instead, which fails the unit.
+///
+/// Nothing else is written: `status` belongs to the lock holder.
+fn mark_busy<E: Write>(dir: &StateDir, log: &mut Log<E>, error: &FsError) -> Exit {
+    let mark = Busy::next(status::read_busy(dir, log), unix_now());
+    write_mark(dir, log, &mark);
+    let detail = error.to_string();
+    let runs = mark.runs().to_string();
+    let since = mark.since().to_string();
+    if mark.runs() < status::MAX_BUSY_RUNS {
+        log.line(
+            Priority::Warning,
+            "busy",
+            &[("detail", &detail), ("runs", &runs), ("since", &since)],
+        );
+        Exit::Busy
+    } else {
+        log.last(
+            Priority::Error,
+            "error",
+            &[
+                ("reason", "lock-stuck"),
+                ("detail", &detail),
+                ("runs", &runs),
+                ("since", &since),
+            ],
+        );
+        Exit::Error
+    }
+}
+
+/// Writes the busy mark through `.busy.new`; a failure is a `busy-mark-skipped` warning, and the run goes on without the mark.
+///
+/// Only busy runs write `.busy.new`, and each is done with it within a second, so one older than [`BUSY_STAGED_MAX_AGE`](status::BUSY_STAGED_MAX_AGE) was left by a run that died: it is removed and the write tried once more.
+fn write_mark<E: Write>(dir: &StateDir, log: &mut Log<E>, mark: &Busy) {
+    let text = mark.render();
+    let written = dir
+        .write_unlocked(status::BUSY_FILE, &text, status::STATUS_MODE)
+        .or_else(|first| {
+            if staged_mark_is_dead(dir) {
+                dir.remove(status::BUSY_STAGED).and_then(|()| {
+                    dir.write_unlocked(status::BUSY_FILE, &text, status::STATUS_MODE)
+                })
+            } else {
+                Err(first)
+            }
+        });
+    if let Err(e) = written {
+        log.line(
+            Priority::Warning,
+            "busy-mark-skipped",
+            &[("detail", &e.to_string())],
+        );
+    }
+}
+
+/// Whether a `.busy.new` exists and is older than [`BUSY_STAGED_MAX_AGE`](status::BUSY_STAGED_MAX_AGE).
+fn staged_mark_is_dead(dir: &StateDir) -> bool {
+    dir.mtime(status::BUSY_STAGED)
+        .ok()
+        .flatten()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= status::BUSY_STAGED_MAX_AGE)
 }
 
 /// The snapshot from the node, or the stale reason.
@@ -505,12 +581,17 @@ pub fn sync<O: Write, E: Write>(options: &SyncOptions<'_>, out: &mut O, log: &mu
     };
     let _lock = match Lock::acquire(&dir, options.wait) {
         Ok(lock) => lock,
-        Err(e @ FsError::Busy { .. }) => {
-            log.line(Priority::Warning, "busy", &[("detail", &e.to_string())]);
-            return Exit::Busy;
-        }
+        Err(e @ FsError::Busy { .. }) => return mark_busy(&dir, log, &e),
         Err(e) => return untouched(log, e.token(), &e),
     };
+    // the lock is free, so the series of busy runs, if any, is over
+    if let Err(e) = status::clear_busy(&dir) {
+        log.line(
+            Priority::Warning,
+            "busy-mark-stuck",
+            &[("detail", &e.to_string())],
+        );
+    }
     let previous = match dir.read(status::STATUS_FILE) {
         Ok(bytes) => Status::load(bytes.as_deref()),
         Err(e) => {
@@ -554,12 +635,12 @@ impl<O: Write, E: Write> Run<'_, O, E> {
     fn sync(mut self) -> Exit {
         let inputs = match read_inputs(self.dir) {
             Ok(inputs) => inputs,
-            Err(failure) => return self.local_error(&failure, None),
+            Err(failure) => return self.local_error(&failure, Known::Unknown),
         };
         warn_inputs(self.log, &inputs);
         let present = match self.nft.table_present() {
             Ok(present) => present,
-            Err(e) => return nft_unavailable(self.log, &e),
+            Err(e) => return self.nft_failed(&e),
         };
         let Inputs {
             config,
@@ -586,7 +667,7 @@ impl<O: Write, E: Write> Run<'_, O, E> {
         let program = sets.program(&config.p2p_ports);
         let current = match self.dir.read(CURRENT_FILE) {
             Ok(current) => current,
-            Err(e) => return self.local_error(&e.into(), None),
+            Err(e) => return self.local_error(&e.into(), Known::Unknown),
         };
         // the listing is one more nft call, needed only when the program itself is unchanged
         let listing = if present && current.as_deref() == Some(program.as_bytes()) {
@@ -605,7 +686,7 @@ impl<O: Write, E: Write> Run<'_, O, E> {
                 // gone while the node was being asked: no listing, so the program is applied again
                 Err(e) => match self.nft.table_present() {
                     Ok(false) => None,
-                    _ => return nft_unavailable(self.log, &e),
+                    _ => return self.nft_failed(&e),
                 },
             }
         } else {
@@ -622,15 +703,15 @@ impl<O: Write, E: Write> Run<'_, O, E> {
         } else {
             let staged = match stage(self.dir, program.as_bytes()) {
                 Ok(staged) => staged,
-                Err(e) => return self.local_error(&e.into(), None),
+                Err(e) => return self.local_error(&e.into(), Known::Unknown),
             };
             if let Err(e) = self.nft.load_file(&staged) {
                 // the transaction failed whole, so the live table is as it was
                 let _ = self.dir.remove(STAGED_FILE);
-                return self.local_error(&Failure::new("nft-apply-failed", &e), None);
+                return self.local_error(&Failure::new("nft-apply-failed", &e), Known::Unknown);
             }
             if let Err(e) = place(self.dir) {
-                return self.local_error(&e.into(), Some(true));
+                return self.local_error(&e.into(), Known::Present(true));
             }
             RunResult::Applied
         };
@@ -640,7 +721,7 @@ impl<O: Write, E: Write> Run<'_, O, E> {
         if state_bytes.as_deref() != Some(bytes.as_slice())
             && let Err(e) = self.dir.write_atomic(STATE_FILE, &bytes, FILE_MODE)
         {
-            return self.local_error(&e.into(), Some(true));
+            return self.local_error(&e.into(), Known::Present(true));
         }
         let status = Status {
             result: Some(result),
@@ -665,30 +746,34 @@ impl<O: Write, E: Write> Run<'_, O, E> {
             return self.print(&line, Exit::Refused);
         }
         // sampled again: the table may have gone while the node was being asked
-        self.keep(RunResult::Stale, reason, None, None)
+        self.keep(RunResult::Stale, reason, None, Known::Unknown)
     }
 
     /// A local error: the stale path with `RESULT=error`, exit 2.
-    fn local_error(self, failure: &Failure, present: Option<bool>) -> Exit {
+    fn local_error(self, failure: &Failure, known: Known) -> Exit {
         self.keep(
             RunResult::Error,
             failure.reason,
             Some(&failure.detail),
-            present,
+            known,
+        )
+    }
+
+    /// nft failed a listing call under the lock: the stale path with `RESULT=error`, `STALE_REASON=nft-unavailable`, action `none` and exit 2.
+    ///
+    /// The run holds the lock, so it writes `status` like every other local error; what it never does is ask nft again or touch the table.
+    fn nft_failed(self, error: &NftError) -> Exit {
+        self.local_error(
+            &Failure::new("nft-unavailable", error),
+            Known::NftUnavailable,
         )
     }
 
     /// The stale path: protects the table, then records `reason` with `STALE_SINCE` set once, leaving every other value of the last status as it was.
     ///
-    /// `present` is the table's presence when the run knows it from a load it just made; `None` lists the tables again, since the table may have gone while the node was being asked.
-    fn keep(
-        mut self,
-        result: RunResult,
-        reason: &str,
-        detail: Option<&str>,
-        present: Option<bool>,
-    ) -> Exit {
-        let (action, reload_error) = self.protect(present);
+    /// `known` is what the run knows about the table's presence; see [`Known`].
+    fn keep(mut self, result: RunResult, reason: &str, detail: Option<&str>, known: Known) -> Exit {
+        let (action, reload_error) = self.protect(known);
         let (priority, event) = match result {
             RunResult::Stale => (Priority::Warning, "stale"),
             _ => (Priority::Error, "error"),
@@ -737,24 +822,38 @@ impl<O: Write, E: Write> Run<'_, O, E> {
     /// The stale path's care of the table: a present table is kept as it is, and an absent one is reloaded from `current.nft` when that exists.
     ///
     /// Returns the action, `kept`, `reloaded`, `none` or `reload-failed`, and why a reload failed.
-    fn protect(&mut self, present: Option<bool>) -> (&'static str, Option<String>) {
-        let present = match present {
-            Some(present) => present,
-            None => match self.nft.table_present() {
-                Ok(present) => present,
-                Err(e) => {
-                    self.log.line(
-                        Priority::Warning,
-                        "nft-unavailable",
-                        &[("detail", &e.to_string())],
-                    );
-                    return ("none", None);
-                }
-            },
+    fn protect(&mut self, known: Known) -> (&'static str, Option<String>) {
+        let present = match known {
+            Known::Present(present) => Some(present),
+            // the closing line carries nft's failure: no second call, the table is left as it is
+            Known::NftUnavailable => None,
+            Known::Unknown => self.sample(),
         };
-        if present {
-            return ("kept", None);
-        }
+        present.map_or(("none", None), |present| {
+            if present {
+                ("kept", None)
+            } else {
+                self.reload()
+            }
+        })
+    }
+
+    /// Lists the tables again on the stale path; `None` with an `nft-unavailable` warning when nft fails.
+    fn sample(&mut self) -> Option<bool> {
+        self.nft
+            .table_present()
+            .map_err(|e| {
+                self.log.line(
+                    Priority::Warning,
+                    "nft-unavailable",
+                    &[("detail", &e.to_string())],
+                );
+            })
+            .ok()
+    }
+
+    /// Reloads the absent table from `current.nft` when that exists: `reloaded`, `none` or `reload-failed` with the reason.
+    fn reload(&mut self) -> (&'static str, Option<String>) {
         let reloaded = match self.dir.mtime(CURRENT_FILE) {
             Ok(None) => return ("none", None),
             Ok(Some(_)) => self
