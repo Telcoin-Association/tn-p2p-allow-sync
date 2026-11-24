@@ -2,16 +2,16 @@
 //!
 //! [`parse`] takes the JSON-RPC `result` and returns either a [`Snapshot`] or the reason the snapshot is not authoritative.
 //! Any such failure makes the whole snapshot stale: the caller keeps the loaded program and records [`SnapshotError::token`] as `STALE_REASON`.
-//! Faults inside an otherwise valid snapshot are absorbed and counted in [`Warnings`]: unknown slot names, uppercase hex in a key, a key listed twice in one swarm, lists longer than [`MAX_MULTIADDRS_PER_LIST`], `dns*` multiaddrs and other multiaddrs without a leading IP.
+//! Faults inside an otherwise valid snapshot are absorbed and counted in [`Warnings`]: unknown slot names, uppercase hex in a key, a key listed twice in one swarm, lists longer than [`MAX_MULTIADDRS_PER_LIST`], `dns*` multiaddrs, other multiaddrs without a leading IP, and entries whose `bls_pubkey` is not a key (skipped; a swarm that lists entries and keeps none is `snapshot-bls`).
 //!
 //! Two stale reasons need the sync's state and are not decided here: `epoch-regressed` (the snapshot's [`Snapshot::epoch`] below the applied one) and `empty-set`.
 //!
-//! The model ignores unknown fields at every level, so a v1 node can add fields without breaking this parser.
+//! The model holds only the fields the decision reads and ignores every other field at every level, whatever its shape, so a v1 node can add, drop or retype a field this tool does not read without freezing the table.
 //! A change that an old parser must not read raises `version` instead.
 //!
 //! A nullable field the decision reads is present, possibly null: `tracked_epoch`, `admission`, `admission.epoch` and `admission.fallback`.
 //! A missing one is `snapshot-malformed`, because reading it as null would trust a snapshot that never said it could be trusted.
-//! Only `record_multiaddrs`, the top-level `epoch`, `worker_id`, `peer_id`, `network_pubkey` and `record_timestamp` may be absent.
+//! Only `record_multiaddrs` may be absent.
 
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,13 +42,11 @@ pub const BLS_KEY_LEN: usize = 96;
 /// Hex digits after the `0x` of a `bls_pubkey`: two per byte.
 const BLS_KEY_HEX_DIGITS: usize = 192;
 
-/// The `tn_admissionSnapshot` result as the node serialises it.
+/// The fields of the `tn_admissionSnapshot` result that the decision reads; the node serialises more, and those are ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawSnapshot {
     /// The schema version; [`parse`] reads only [`SNAPSHOT_VERSION`].
     pub version: u32,
-    /// The primary swarm's accepted admission epoch, or `None` before one is accepted; may be absent, and is not used.
-    pub epoch: Option<u64>,
     /// One report per swarm: the primary and each worker.
     pub swarms: Vec<RawSwarm>,
 }
@@ -58,8 +56,6 @@ pub struct RawSnapshot {
 pub struct RawSwarm {
     /// The swarm's name: `primary`, or `worker-N` for worker `N`.
     pub network: String,
-    /// The worker id of a worker swarm, or `None` for the primary; may be absent.
-    pub worker_id: Option<u16>,
     /// Whether the swarm answered the node in time.
     pub available: bool,
     /// The epoch of the latest scheduled and eligible key publication the swarm accepted, or `None` before the first.
@@ -79,10 +75,6 @@ pub struct RawSwarm {
 /// A swarm's connection admission status in a [`RawSwarm`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawAdmission {
-    /// The mode the operator configured: `Open`, `Grace` or `Closed`.
-    pub configured: String,
-    /// The mode applied to connections, below `configured` while a fallback holds.
-    pub effective: String,
     /// The latest accepted committee window epoch, or `None` before one is accepted.
     ///
     /// Present, possibly null: a missing key is `snapshot-malformed`, since a null one skips the pool-behind check.
@@ -93,37 +85,19 @@ pub struct RawAdmission {
     /// Present, possibly null: a missing key is `snapshot-malformed`, since a null one reads as authoritative.
     #[serde(deserialize_with = "Option::deserialize")]
     pub fallback: Option<String>,
-    /// Current committee identities with authenticated records, the local one included.
-    pub resolved_current: u64,
-    /// The resolved-record quorum `Closed` requires.
-    pub required_current: u64,
-    /// Connected current committee peers, the local identity excluded.
-    pub connected_current: u64,
-    /// Identities whose PeerId another identity also claims, or whose PeerId differs from the configured binding.
-    pub contradicted: u64,
 }
 
 /// One tracked key in a [`RawSwarm`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawEntry {
-    /// The BLS public key: `0x` and 192 hex digits.
+    /// The BLS public key: `0x` and 192 hex digits; an entry whose key is not is skipped and counted in [`Warnings::bad_keys`].
     pub bls_pubkey: String,
     /// The slots the key holds in the swarm, by name.
     pub slots: Vec<String>,
-    /// The base58 PeerId of the held record, or `None` while no record is held; may be absent.
-    pub peer_id: Option<String>,
-    /// The network public key of the held record, as `tn_info` serialises it, or `None` while no record is held; may be absent.
-    pub network_pubkey: Option<Value>,
     /// The addresses the swarm uses for the key.
     pub multiaddrs: Vec<String>,
     /// The signed record's own addresses, present only when a configured address replaces them in `multiaddrs`; the node omits the key otherwise.
     pub record_multiaddrs: Option<Vec<String>>,
-    /// The signed record's timestamp in seconds since the Unix epoch, or `None` while no signed record is held; may be absent.
-    pub record_timestamp: Option<u64>,
-    /// Where `multiaddrs` came from: `record`, `config`, `stub` or `unresolved`.
-    pub source: String,
-    /// Whether the swarm admits the key's PeerId now.
-    pub admitted: bool,
 }
 
 /// A 96-byte compressed BLS public key, the identity a snapshot keys its entries by.
@@ -326,6 +300,10 @@ pub struct Warnings {
     pub truncated_lists: u64,
     /// One when the primary's `tracked_epoch` is above the epoch of its admission window; the pool is accepted as published.
     pub pool_ahead: u64,
+    /// Entries whose `bls_pubkey` is not `0x` and 192 hex digits; each is skipped.
+    ///
+    /// A swarm that lists entries and keeps none is [`SnapshotError::Bls`] instead, since a key encoding this build does not read must not empty a set.
+    pub bad_keys: u64,
 }
 
 /// Why a snapshot is not authoritative; [`SnapshotError::token`] is the `STALE_REASON`.
@@ -339,7 +317,7 @@ pub enum SnapshotError {
     Swarms,
     /// `snapshot-entries`: a swarm with more than [`MAX_ENTRIES_PER_SWARM`] entries.
     Entries,
-    /// `snapshot-bls`: a `bls_pubkey` that is not `0x` and 192 hex digits.
+    /// `snapshot-bls`: a swarm that lists entries and none has a `bls_pubkey` of `0x` and 192 hex digits.
     Bls,
     /// `primary-unavailable`: no primary swarm, or one with `available: false`.
     PrimaryUnavailable,
@@ -349,8 +327,10 @@ pub enum SnapshotError {
     FallbackMissing,
     /// `fallback-stale`: the primary's fallback is `Stale`.
     FallbackStale,
-    /// `fallback-contradictory`: the primary's fallback is `Contradictory`, or a name this build does not know.
+    /// `fallback-contradictory`: the primary's fallback is `Contradictory`.
     FallbackContradictory,
+    /// `fallback-unknown`: the primary's fallback is a name this build does not know.
+    FallbackUnknown,
 }
 
 impl SnapshotError {
@@ -367,6 +347,7 @@ impl SnapshotError {
             Self::FallbackMissing => "fallback-missing".to_owned(),
             Self::FallbackStale => "fallback-stale".to_owned(),
             Self::FallbackContradictory => "fallback-contradictory".to_owned(),
+            Self::FallbackUnknown => "fallback-unknown".to_owned(),
         }
     }
 }
@@ -495,12 +476,37 @@ fn fallback_fault(fallback: Option<&str>) -> Option<SnapshotError> {
         None | Some("Unresolved") => None,
         Some("Missing") => Some(SnapshotError::FallbackMissing),
         Some("Stale") => Some(SnapshotError::FallbackStale),
-        // a fallback this build does not know cannot be shown harmless, so it reads as doubt
-        Some(_) => Some(SnapshotError::FallbackContradictory),
+        Some("Contradictory") => Some(SnapshotError::FallbackContradictory),
+        // a fallback this build does not know cannot be shown harmless, so it reads as doubt, under its own token
+        Some(_) => Some(SnapshotError::FallbackUnknown),
     }
 }
 
-/// Reads one swarm whose name and size were checked; fails only on a bad key.
+/// A parsed key, whether its hex was upper case, and the raw entry it came from.
+type ParsedEntry<'a> = ((BlsKey, bool), &'a RawEntry);
+
+/// Parses every listed key, skipping an entry whose key is not one and counting it in [`Warnings::bad_keys`].
+///
+/// A node change to one entry must not freeze the table, so a bad key drops its entry alone.
+/// A key encoding this build does not read breaks every key at once, so a swarm that lists entries and keeps none is refused; skipping would empty the sets instead.
+fn parse_keys<'a>(
+    raw_entries: &'a [RawEntry],
+    warnings: &mut Warnings,
+) -> Result<Vec<ParsedEntry<'a>>, SnapshotError> {
+    let parsed: Vec<ParsedEntry<'a>> = raw_entries
+        .iter()
+        .filter_map(|raw_entry| {
+            BlsKey::parse_reporting_case(&raw_entry.bls_pubkey)
+                .map(|key| (key, raw_entry))
+                .inspect_err(|_| bump(&mut warnings.bad_keys))
+                .ok()
+        })
+        .collect();
+    let kept = !parsed.is_empty() || raw_entries.is_empty();
+    kept.then_some(parsed).ok_or(SnapshotError::Bls)
+}
+
+/// Reads one swarm whose name and size were checked; fails only when it lists entries and no key parses.
 fn read_swarm(raw: RawSwarm, warnings: &mut Warnings) -> Result<(String, Swarm), SnapshotError> {
     // a pool behind its window still lists the previous epoch's keys, which must not strike the keys it failed to publish
     let authoritative = raw.available
@@ -510,10 +516,9 @@ fn read_swarm(raw: RawSwarm, warnings: &mut Warnings) -> Result<(String, Swarm),
                     && fallback_fault(admission.fallback.as_deref()).is_none()
             },
         );
+    let parsed = parse_keys(&raw.entries, warnings)?;
     let mut entries = BTreeMap::new();
-    for raw_entry in &raw.entries {
-        let (key, uppercase) =
-            BlsKey::parse_reporting_case(&raw_entry.bls_pubkey).map_err(|_| SnapshotError::Bls)?;
+    for ((key, uppercase), raw_entry) in parsed {
         if uppercase {
             bump(&mut warnings.uppercase_keys);
         }
@@ -605,6 +610,11 @@ mod tests {
     /// `bls_key(9)` of the node test: the compressed BLS public key of the scalar `[9; 32]`.
     const NODE_KEY_9: &str = "0xb77ba5d4bf7524aa429f1700dac5ac0a6de363e66ab0ef0aa13f2872c43a6923122ac96b24db2503f7c6ae4f33ae9ab400174206049b6caaba895383af5609ff2cde4d65ce83ba31f9ada80ba83bb47afb60bbc49dd40b9c7b57410bf8bbc525";
 
+    /// A primary whose first entry has a short key and whose second is good.
+    const BLS_SHORT: &str = include_str!("../tests/fixtures/snapshot/bls-short.json");
+    /// A primary whose first entry has a non-hex key and whose second is good.
+    const BLS_NONHEX: &str = include_str!("../tests/fixtures/snapshot/bls-nonhex.json");
+
     /// Every required field of the v1 model by object and name, with values of another type.
     ///
     /// A missing key and each of these values are `snapshot-malformed`.
@@ -617,26 +627,8 @@ mod tests {
         ("/swarms/0", "tracked_epoch", &[r#""0x2a""#]),
         ("/swarms/0", "admission", &[r#""Closed""#, "[]"]),
         ("/swarms/0", "entries", &["null", "{}", r#"["0x8f3a"]"#]),
-        ("/swarms/0/admission", "configured", &["null", "3"]),
-        ("/swarms/0/admission", "effective", &["null", "3"]),
         ("/swarms/0/admission", "epoch", &[r#""0x2a""#]),
         ("/swarms/0/admission", "fallback", &["false"]),
-        (
-            "/swarms/0/admission",
-            "resolved_current",
-            &["null", r#""4""#],
-        ),
-        (
-            "/swarms/0/admission",
-            "required_current",
-            &["null", r#""3""#],
-        ),
-        (
-            "/swarms/0/admission",
-            "connected_current",
-            &["null", r#""3""#],
-        ),
-        ("/swarms/0/admission", "contradicted", &["null", r#""0""#]),
         ("/swarms/0/entries/0", "bls_pubkey", &["null", "0"]),
         (
             "/swarms/0/entries/0",
@@ -648,29 +640,34 @@ mod tests {
             "multiaddrs",
             &["null", r#""/ip4/203.0.113.10/udp/49590/quic-v1""#, "[1]"],
         ),
-        ("/swarms/0/entries/0", "source", &["null", "1"]),
-        ("/swarms/0/entries/0", "admitted", &["null", r#""true""#]),
     ];
 
-    /// Every optional field of the v1 model by object and name, with values of another type.
+    /// The one optional field of the v1 model by object and name, with values of another type.
     ///
     /// The field may be null or absent; each of these values is `snapshot-malformed`.
-    /// `network_pubkey` is read as any JSON value, so no value mistypes it.
-    const OPTIONAL: &[(&str, &str, &[&str])] = &[
-        ("", "epoch", &[r#""0x2a""#]),
-        ("/swarms/0", "worker_id", &[r#""0""#]),
-        ("/swarms/0/entries/0", "peer_id", &["1"]),
-        ("/swarms/0/entries/0", "network_pubkey", &[]),
-        (
-            "/swarms/0/entries/0",
-            "record_multiaddrs",
-            &[r#""/ip4/203.0.113.10/udp/49590/quic-v1""#],
-        ),
-        (
-            "/swarms/0/entries/0",
-            "record_timestamp",
-            &[r#""1793750400""#],
-        ),
+    const OPTIONAL: &[(&str, &str, &[&str])] = &[(
+        "/swarms/0/entries/0",
+        "record_multiaddrs",
+        &[r#""/ip4/203.0.113.10/udp/49590/quic-v1""#],
+    )];
+
+    /// Fields the node serialises that the decision does not read, by object and name.
+    ///
+    /// Each may be absent, null or of any other shape without changing the parse.
+    const UNREAD: &[(&str, &str)] = &[
+        ("", "epoch"),
+        ("/swarms/0", "worker_id"),
+        ("/swarms/0/admission", "configured"),
+        ("/swarms/0/admission", "effective"),
+        ("/swarms/0/admission", "resolved_current"),
+        ("/swarms/0/admission", "required_current"),
+        ("/swarms/0/admission", "connected_current"),
+        ("/swarms/0/admission", "contradicted"),
+        ("/swarms/0/entries/0", "peer_id"),
+        ("/swarms/0/entries/0", "network_pubkey"),
+        ("/swarms/0/entries/0", "record_timestamp"),
+        ("/swarms/0/entries/0", "source"),
+        ("/swarms/0/entries/0", "admitted"),
     ];
 
     /// Every stored fixture that fails, with the token it must give.
@@ -701,13 +698,8 @@ mod tests {
             "snapshot-swarms",
         ),
         (
-            "bls-short",
-            include_str!("../tests/fixtures/snapshot/bls-short.json"),
-            "snapshot-bls",
-        ),
-        (
-            "bls-nonhex",
-            include_str!("../tests/fixtures/snapshot/bls-nonhex.json"),
+            "bls-all-bad",
+            include_str!("../tests/fixtures/snapshot/bls-all-bad.json"),
             "snapshot-bls",
         ),
         (
@@ -930,6 +922,7 @@ mod tests {
                 unparsed: 1,
                 truncated_lists: 1,
                 pool_ahead: 0,
+                bad_keys: 0,
             }
         );
         let primary = swarm(&snapshot, PRIMARY_SWARM)?;
@@ -994,6 +987,23 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_fallback_this_build_does_not_know_is_additions_only() -> TestResult {
+        let mut result = value(GOOD)?;
+        let mut worker = at(&mut result, "/swarms/0")?.clone();
+        set(&mut worker, "", "network", "worker-3".into())?;
+        set(&mut worker, "/admission", "fallback", value(r#""Lost""#)?)?;
+        push_swarm(&mut result, &worker.to_string())?;
+        let snapshot = parse(result)?;
+        assert!(swarm(&snapshot, PRIMARY_SWARM)?.authoritative);
+        assert!(!swarm(&snapshot, "worker-3")?.authoritative);
+        assert_eq!(
+            swarm(&snapshot, "worker-3")?.entries.len(),
+            swarm(&snapshot, PRIMARY_SWARM)?.entries.len()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn worker_doubts_are_not_fatal() -> TestResult {
         // `None` is an available swarm without a status, whose fallback cannot be read
         for (tracked_epoch, fallback, authoritative) in [
@@ -1029,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_fallback_unresolved_is_authoritative_and_unknown_is_contradictory() -> TestResult {
+    fn primary_fallback_unresolved_is_authoritative_and_unknown_is_unknown() -> TestResult {
         let mut unresolved = value(GOOD)?;
         *at(&mut unresolved, "/swarms/0/admission/fallback")? = "Unresolved".into();
         assert!(swarm(&parse(unresolved)?, PRIMARY_SWARM)?.authoritative);
@@ -1039,10 +1049,18 @@ mod tests {
             *at(&mut result, "/swarms/0/admission/fallback")? = fallback.into();
             assert_eq!(
                 token_of(result).as_deref(),
-                Some("fallback-contradictory"),
+                Some("fallback-unknown"),
                 "{fallback:?}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn primary_fallback_contradictory_keeps_its_own_token() -> TestResult {
+        let mut result = value(GOOD)?;
+        *at(&mut result, "/swarms/0/admission/fallback")? = "Contradictory".into();
+        assert_eq!(token_of(result).as_deref(), Some("fallback-contradictory"));
         Ok(())
     }
 
@@ -1187,9 +1205,8 @@ mod tests {
         for (object, field, replacement) in [
             ("", "swarms", "{}"),
             ("/swarms/0", "available", r#""yes""#),
-            ("/swarms/0", "worker_id", "70000"),
             ("/swarms/0", "tracked_epoch", "-1"),
-            ("/swarms/0/admission", "resolved_current", "-4"),
+            ("/swarms/0/admission", "epoch", "-4"),
             ("/swarms/0/entries/0", "bls_pubkey", "null"),
             ("/swarms/0/entries/0", "slots", r#""current""#),
             ("/swarms/0/entries/0", "multiaddrs", "null"),
@@ -1232,7 +1249,7 @@ mod tests {
             }
         }
 
-        // an unused optional field changes nothing, whether null or absent
+        // the optional field changes nothing, whether null or absent
         let good = parse(value(GOOD)?)?;
         for (object, field, mistypes) in OPTIONAL {
             let mut result = value(GOOD)?;
@@ -1269,6 +1286,57 @@ mod tests {
             set(&mut result, pointer, field, Value::Bool(true))?;
         }
         assert_eq!(parse(result)?, parse(value(GOOD)?)?);
+        Ok(())
+    }
+
+    #[test]
+    fn unread_fields_parse_whatever_their_shape() -> TestResult {
+        let good = parse(value(GOOD)?)?;
+        UNREAD.iter().try_for_each(|(object, field)| -> TestResult {
+            let mut absent = value(GOOD)?;
+            remove(&mut absent, object, field)?;
+            assert_eq!(parse(absent), Ok(good.clone()), "{object}/{field} absent");
+            ["null", "-1", r#""x""#, "[1]", "{}", "true"]
+                .iter()
+                .try_for_each(|shape| -> TestResult {
+                    let mut result = value(GOOD)?;
+                    set(&mut result, object, field, value(shape)?)?;
+                    assert_eq!(parse(result), Ok(good.clone()), "{object}/{field}: {shape}");
+                    Ok(())
+                })
+        })
+    }
+
+    #[test]
+    fn a_bad_key_among_good_ones_skips_its_entry_alone() -> TestResult {
+        [("bls-short", BLS_SHORT), ("bls-nonhex", BLS_NONHEX)]
+            .iter()
+            .try_for_each(|(name, text)| -> TestResult {
+                let snapshot = parse(value(text)?)?;
+                let primary = swarm(&snapshot, PRIMARY_SWARM)?;
+                assert_eq!(snapshot.warnings.bad_keys, 1, "{name}");
+                assert_eq!(primary.entries.len(), 1, "{name}");
+                assert!(primary.authoritative, "{name}");
+                Ok(())
+            })
+    }
+
+    #[test]
+    fn a_swarm_that_lists_entries_and_keeps_no_key_is_refused() -> TestResult {
+        let mut result = value(GOOD)?;
+        *at(&mut result, "/swarms/0/entries")? =
+            value(r#"[{"bls_pubkey": "0x8f3a", "slots": ["current"], "multiaddrs": []}]"#)?;
+        assert_eq!(token_of(result).as_deref(), Some("snapshot-bls"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_swarm_without_entries_has_no_bad_keys() -> TestResult {
+        let mut result = value(GOOD)?;
+        *at(&mut result, "/swarms/0/entries")? = Value::Array(Vec::new());
+        let snapshot = parse(result)?;
+        assert_eq!(snapshot.warnings.bad_keys, 0);
+        assert!(swarm(&snapshot, PRIMARY_SWARM)?.entries.is_empty());
         Ok(())
     }
 
@@ -1443,6 +1511,7 @@ mod tests {
                 unparsed: 1,
                 truncated_lists: 1,
                 pool_ahead: 0,
+                bad_keys: 0,
             }
         );
         // the skipped dns address leaves the primary as good.json reads it
@@ -1514,6 +1583,7 @@ mod tests {
             SnapshotError::FallbackMissing,
             SnapshotError::FallbackStale,
             SnapshotError::FallbackContradictory,
+            SnapshotError::FallbackUnknown,
         ]
         .map(|e| (e.token(), e.to_string()));
         for (token, displayed) in &tokens {
@@ -1532,6 +1602,7 @@ mod tests {
                 "fallback-missing",
                 "fallback-stale",
                 "fallback-contradictory",
+                "fallback-unknown",
             ]
         );
     }

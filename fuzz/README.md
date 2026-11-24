@@ -9,7 +9,7 @@ This directory is a [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) crate 
 | `config` | `config::load_config` and `load_floor` on any bytes | Loading twice gives the same result. An accepted config is well formed, and the config written back from it loads to the same settings. A floor renders back to its own bytes. |
 | `snapshot` | `snapshot::parse` on any JSON, then `memory::apply`, `serialize`, `load_state` | An accepted snapshot folds into empty memory, which then holds exactly its IPs. `serialize(load_state(serialize(state)))` is byte-equal. A second fold changes nothing. |
 | `nft_listing` | `nft::parse_listing` on any bytes | Every refusal is `NftError::Parse`. Only the program's four sets are read, sorted and well formed. |
-| `http_response` | `rpc::read_response` over a cursor of any bytes (64 KiB at most) | The body stays within 8 MiB and the head within 16 KiB. A chunked body equals the target's own de-chunking, and any other body is the bytes after the head. |
+| `http_response` | `rpc::read_response` over a cursor of any bytes (64 KiB at most) | The body stays within the default 8 MiB and the head within 16 KiB. A chunked body equals the target's own de-chunking, and any other body is the bytes after the head. |
 
 Each file in `fuzz_targets/` starts with its full list of oracles. A panic in an oracle is a finding just like a panic in the code it checks. `config`, `snapshot` and `http_response` also read each input in a second, structured form, so they reach their accepting paths without a corpus.
 

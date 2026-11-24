@@ -45,12 +45,21 @@ const KEY_VERSION: &str = "CONFIG_VERSION";
 const KEY_RPC_PORT: &str = "RPC_PORT";
 const KEY_P2P_PORTS: &str = "P2P_PORTS";
 const KEY_ALLOW_FROM: &str = "P2P_ALLOW_FROM";
+const KEY_RPC_DEADLINE: &str = "RPC_DEADLINE_SECS";
+const KEY_RPC_MAX_BODY: &str = "RPC_MAX_BODY_MIB";
+
+/// One MiB, the unit of `RPC_MAX_BODY_MIB`.
+const MIB: usize = 1024 * 1024;
 
 /// The settings of one run, read from the config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Port of the node's JSON-RPC server on 127.0.0.1, 1 to 65535.
     pub rpc_port: u16,
+    /// Time allowed for one RPC call and for each of its reads: `RPC_DEADLINE_SECS`, 1 to 60 s, 30 s when the key is absent.
+    pub rpc_deadline: std::time::Duration,
+    /// Largest decoded RPC body accepted, and the most `render --snapshot` reads, in bytes: `RPC_MAX_BODY_MIB`, 1 to 32 MiB, 8 MiB when the key is absent.
+    pub rpc_max_body: usize,
     /// The P2P ports the table guards, at least one, each 1 to 65535.
     pub p2p_ports: BTreeSet<u16>,
     /// IPv4 entries of `P2P_ALLOW_FROM`: hosts as /32 and networks masked to their network address.
@@ -67,6 +76,13 @@ pub struct Config {
     /// nft refuses overlapping intervals in one set, and dropping a covered network never shrinks what the list admits.
     /// Hosts are never dropped: they go to the allow sets, not the interval sets.
     pub covered_dropped: usize,
+}
+
+impl Config {
+    /// The client for the node's RPC port with the config's deadline and body cap.
+    pub const fn rpc_client(&self) -> crate::rpc::RpcClient {
+        crate::rpc::RpcClient::with_limits(self.rpc_port, self.rpc_deadline, self.rpc_max_body)
+    }
 }
 
 /// Why the config or the floor cannot be used; the whole run is refused.
@@ -210,6 +226,8 @@ fn parse_config(bytes: &[u8]) -> Result<Config, (Option<usize>, String)> {
 
     let mut seen: Vec<(&str, usize)> = Vec::new();
     let mut rpc_port = None;
+    let mut rpc_deadline = None;
+    let mut rpc_max_body = None;
     let mut p2p_ports = None;
     let mut allow_from = None;
     for entry in &entries {
@@ -230,6 +248,22 @@ fn parse_config(bytes: &[u8]) -> Result<Config, (Option<usize>, String)> {
                     ))
                 })?);
             }
+            KEY_RPC_DEADLINE => {
+                rpc_deadline = Some(parse_bounded(entry.value, 1, 60).ok_or_else(|| {
+                    at(format!(
+                        "{KEY_RPC_DEADLINE}={:?} is not a whole number of seconds 1 to 60",
+                        entry.value
+                    ))
+                })?);
+            }
+            KEY_RPC_MAX_BODY => {
+                rpc_max_body = Some(parse_bounded(entry.value, 1, 32).ok_or_else(|| {
+                    at(format!(
+                        "{KEY_RPC_MAX_BODY}={:?} is not a whole number of MiB 1 to 32",
+                        entry.value
+                    ))
+                })?);
+            }
             KEY_P2P_PORTS => p2p_ports = Some(parse_ports(entry.value).map_err(at)?),
             KEY_ALLOW_FROM => allow_from = Some(parse_allow_from(entry.value).map_err(at)?),
             other => return Err(at(format!("{other:?} is not a known key"))),
@@ -239,6 +273,14 @@ fn parse_config(bytes: &[u8]) -> Result<Config, (Option<usize>, String)> {
 
     let missing = |key: &str| (None, format!("{key} is missing"));
     let rpc_port = rpc_port.ok_or_else(|| missing(KEY_RPC_PORT))?;
+    // the two limits are optional: an older config written by firewall-setup.sh has neither
+    let rpc_deadline =
+        rpc_deadline.map_or(crate::rpc::DEFAULT_DEADLINE, std::time::Duration::from_secs);
+    let rpc_max_body = rpc_max_body
+        .and_then(|mib| usize::try_from(mib).ok())
+        .map_or(crate::rpc::DEFAULT_MAX_BODY_BYTES, |mib| {
+            mib.saturating_mul(MIB)
+        });
     let p2p_ports = p2p_ports.ok_or_else(|| missing(KEY_P2P_PORTS))?;
     let (mut static_v4, mut static_v6) = allow_from.ok_or_else(|| missing(KEY_ALLOW_FROM))?;
     let catch_all = static_v4
@@ -248,6 +290,8 @@ fn parse_config(bytes: &[u8]) -> Result<Config, (Option<usize>, String)> {
     let covered_dropped = drop_covered(&mut static_v4).saturating_add(drop_covered(&mut static_v6));
     Ok(Config {
         rpc_port,
+        rpc_deadline,
+        rpc_max_body,
         p2p_ports,
         static_v4,
         static_v6,
@@ -293,6 +337,15 @@ fn parse_port(text: &str) -> Option<u16> {
     // refusing a leading zero refuses 0 as well, and an empty text fails the parse
     let plain = text.bytes().all(|b| b.is_ascii_digit()) && !text.starts_with('0');
     plain.then(|| text.parse::<u16>().ok()).flatten()
+}
+
+/// A whole number: decimal digits without a sign or a leading zero, `low` to `high`.
+fn parse_bounded(text: &str, low: u64, high: u64) -> Option<u64> {
+    let plain = text.bytes().all(|b| b.is_ascii_digit()) && !text.starts_with('0');
+    plain
+        .then(|| text.parse::<u64>().ok())
+        .flatten()
+        .filter(|n| (low..=high).contains(n))
 }
 
 /// The value of `P2P_PORTS`: one or more ports separated by commas, each once.
@@ -525,6 +578,117 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
             .map_err(|(line, message)| format!("{line:?}: {message}").into())
     }
 
+    /// The example with `extra` lines appended after its four keys.
+    fn with_limits(extra: &str) -> Result<Config, Box<dyn Error>> {
+        parse_config(format!("{EXAMPLE}{extra}").as_bytes())
+            .map_err(|(line, message)| format!("{line:?}: {message}").into())
+    }
+
+    #[test]
+    fn the_rpc_limits_default_when_absent() -> TestResult {
+        let config = with_limits("")?;
+        assert_eq!(config.rpc_deadline, std::time::Duration::from_secs(30));
+        assert_eq!(config.rpc_max_body, 8_388_608);
+        assert_eq!(config.rpc_client(), crate::rpc::RpcClient::new(8545));
+        Ok(())
+    }
+
+    #[test]
+    fn the_rpc_limits_are_read_within_their_bounds() -> TestResult {
+        [
+            (1_u64, 1_usize, 1_048_576),
+            (60, 32, 33_554_432),
+            (45, 16, 16_777_216),
+        ]
+        .iter()
+        .try_for_each(|(secs, mib, bytes)| -> TestResult {
+            let config = with_limits(&format!(
+                "RPC_DEADLINE_SECS={secs}\nRPC_MAX_BODY_MIB={mib}\n"
+            ))?;
+            assert_eq!(config.rpc_deadline, std::time::Duration::from_secs(*secs));
+            assert_eq!(config.rpc_max_body, *bytes);
+            assert_eq!(
+                config.rpc_client(),
+                crate::rpc::RpcClient::with_limits(8545, config.rpc_deadline, *bytes)
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn the_rpc_limits_refuse_values_outside_their_grammar() {
+        let seconds = "is not a whole number of seconds 1 to 60";
+        let mib = "is not a whole number of MiB 1 to 32";
+        [
+            (
+                "RPC_DEADLINE_SECS=0",
+                format!("RPC_DEADLINE_SECS=\"0\" {seconds}"),
+            ),
+            (
+                "RPC_DEADLINE_SECS=61",
+                format!("RPC_DEADLINE_SECS=\"61\" {seconds}"),
+            ),
+            (
+                "RPC_DEADLINE_SECS=ten",
+                format!("RPC_DEADLINE_SECS=\"ten\" {seconds}"),
+            ),
+            (
+                "RPC_DEADLINE_SECS=030",
+                format!("RPC_DEADLINE_SECS=\"030\" {seconds}"),
+            ),
+            (
+                "RPC_DEADLINE_SECS=",
+                format!("RPC_DEADLINE_SECS=\"\" {seconds}"),
+            ),
+            (
+                "RPC_MAX_BODY_MIB=0",
+                format!("RPC_MAX_BODY_MIB=\"0\" {mib}"),
+            ),
+            (
+                "RPC_MAX_BODY_MIB=33",
+                format!("RPC_MAX_BODY_MIB=\"33\" {mib}"),
+            ),
+            (
+                "RPC_MAX_BODY_MIB=8.5",
+                format!("RPC_MAX_BODY_MIB=\"8.5\" {mib}"),
+            ),
+            (
+                "RPC_MAX_BODY_MIB=-8",
+                format!("RPC_MAX_BODY_MIB=\"-8\" {mib}"),
+            ),
+        ]
+        .iter()
+        .for_each(|(extra, message)| {
+            assert_eq!(
+                refusal(&format!("{EXAMPLE}{extra}\n")),
+                (Some(6), message.clone()),
+                "{extra}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_repeated_rpc_limit_is_refused() {
+        assert_eq!(
+            refusal(&format!(
+                "{EXAMPLE}RPC_MAX_BODY_MIB=8\nRPC_MAX_BODY_MIB=8\n"
+            )),
+            (
+                Some(7),
+                "RPC_MAX_BODY_MIB is set again (first on line 6)".to_owned()
+            )
+        );
+        assert_eq!(
+            refusal(&format!(
+                "{EXAMPLE}RPC_DEADLINE_SECS=30\nRPC_DEADLINE_SECS=30\n"
+            )),
+            (
+                Some(7),
+                "RPC_DEADLINE_SECS is set again (first on line 6)".to_owned()
+            )
+        );
+    }
+
     fn refusal(text: &str) -> (Option<usize>, String) {
         parse_config(text.as_bytes())
             .map_or_else(|e| e, |config| (None, format!("accepted: {config:?}")))
@@ -578,6 +742,8 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
             config,
             Config {
                 rpc_port: 8545,
+                rpc_deadline: crate::rpc::DEFAULT_DEADLINE,
+                rpc_max_body: crate::rpc::DEFAULT_MAX_BODY_BYTES,
                 p2p_ports: BTreeSet::from([49590, 49594]),
                 static_v4: cidrs(&["198.51.100.9/32", "203.0.113.0/24"])?,
                 static_v6: BTreeSet::new(),

@@ -33,7 +33,7 @@ const GOLDEN: &str = include_str!("golden/program-6.6.nft");
 /// `epochDuration` before the node has reported one.
 const DEFAULT_DURATION: &str = "21600";
 
-/// The most bytes `render --snapshot` reads, the RPC body cap of 8 MiB.
+/// The most bytes `render --snapshot` reads, the default RPC body cap of 8 MiB (`RPC_MAX_BODY_MIB=8`).
 const SNAPSHOT_CAP: usize = 8_388_608;
 
 /// Where the stdout of a run goes.

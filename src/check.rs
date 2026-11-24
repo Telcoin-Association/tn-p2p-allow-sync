@@ -256,7 +256,7 @@ pub fn check<O: Write, E: Write>(
         Ok(None) => return print(&Report::bare(Verdict::Absent), out, log, None),
         Err(e) => return error(log, "nft-unavailable", &e),
     };
-    let snapshot = match fetch_snapshot(&RpcClient::new(config.rpc_port)) {
+    let snapshot = match fetch_snapshot(&config.rpc_client()) {
         Ok(snapshot) => snapshot,
         // the table enforces nothing whether or not the node answers; like `absent`, no line
         // closes the run
