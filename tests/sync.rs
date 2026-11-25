@@ -1823,7 +1823,10 @@ fn nft_refusing_the_caller_exits_2_with_run_as_root_and_writes_the_error_status(
     bed.nft.knob("eperm")?;
     let ran = bed.sync_snapshot(&two_keys())?;
     assert_eq!(ran.code, Some(2), "{ran:?}");
-    assert_eq!(ran.stdout, "");
+    assert_eq!(
+        ran.stdout,
+        "result=error reason=nft-unavailable epoch= v4=0 v6=0 static=0 floor=0 keys=0 dns_skipped=0 unparsed=0\n"
+    );
     assert!(
         ran.logged(
             "error reason=nft-unavailable action=none detail=\"nft: operation not permitted, run as root\""
