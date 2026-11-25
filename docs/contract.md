@@ -521,7 +521,8 @@ result=applied reason= epoch=42 v4=3 v6=1 static=1 floor=2 keys=2 dns_skipped=0 
 The counts come from the status the run wrote, or tried to write.
 A stale or error run keeps every count of the previous status, so its line shows the previous counts: a first run that goes stale prints `floor=0` even with a floor file, and a refusal prints the counts of the last status on disk.
 A run whose write of `status` failed prints `result=error reason=state-io-failed` although no new status reached the disk, with the counts of the status it failed to write.
-No line is printed on a usage error, an unsafe state dir, busy, `lock-stuck`, a lock failure or `nft-unavailable`.
+`nft-unavailable` in `sync` writes `status` like every local error, so it prints `result=error reason=nft-unavailable` with the previous counts.
+No line is printed on a usage error, an unsafe state dir, busy, `lock-stuck` or a lock failure.
 
 ### `check`
 

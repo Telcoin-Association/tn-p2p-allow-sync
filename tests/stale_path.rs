@@ -744,8 +744,12 @@ fn a_failing_table_listing_with_the_table_present_is_nft_unavailable_and_writes_
     let before = bed.calls()?;
     let ran = bed.sync(answers(&two_keys()))?;
     assert_eq!(ran.code, Some(2), "{ran:?}");
-    // docs/contract.md, The sync line: no line is printed on nft-unavailable
-    assert_eq!(ran.stdout, "");
+    // docs/contract.md, The sync line: the run wrote status, so it prints the error line with the
+    // counts of the previous status
+    assert_eq!(
+        ran.stdout,
+        format!("result=error reason=nft-unavailable {COUNTS}\n")
+    );
     assert_eq!(
         ran.events(),
         [
