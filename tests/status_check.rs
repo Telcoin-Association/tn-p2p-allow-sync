@@ -54,10 +54,12 @@ const FILE_KEYS: [&str; 18] = [
 ];
 
 /// The live keys `status` adds after the file's, in order.
-const LIVE_KEYS: [&str; 7] = [
+const LIVE_KEYS: [&str; 9] = [
     "LOADED",
     "AGE_SECS",
     "STALE",
+    "BUSY_SINCE",
+    "BUSY_RUNS",
     "COUNTER_ACCEPT_PACKETS",
     "COUNTER_ACCEPT_BYTES",
     "COUNTER_DROP_PACKETS",
@@ -429,6 +431,8 @@ fn status_json_is_one_line_with_every_key_and_none_of_the_script_keys() -> TestR
             "stale",
             "stale_since",
             "stale_reason",
+            "busy_since",
+            "busy_runs",
             "counters",
         ]
     );
@@ -447,6 +451,8 @@ fn status_json_is_one_line_with_every_key_and_none_of_the_script_keys() -> TestR
         ("stale", json!(false)),
         ("stale_since", Value::Null),
         ("stale_reason", Value::Null),
+        ("busy_since", Value::Null),
+        ("busy_runs", Value::Null),
         ("counters", json!({"accepted": 12, "dropped": 7})),
     ] {
         assert_eq!(object.get(key), Some(&value), "{key}");

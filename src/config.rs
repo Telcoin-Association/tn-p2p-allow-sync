@@ -11,7 +11,7 @@
 //! ```
 //!
 //! A line whose first byte is `#` is a comment and an empty line is skipped.
-//! Every other line is printable ASCII without spaces or quotes, so nothing is ever unquoted.
+//! Every other line is printable ASCII without quotes, so nothing is ever unquoted; spaces and tabs around its tokens and a CR before its newline are ignored.
 //! Each of the four keys appears exactly once; an unknown, duplicate or missing key refuses the whole file.
 //! The RPC host is fixed at 127.0.0.1 and has no key.
 //!
@@ -189,12 +189,10 @@ fn parse_config(bytes: &[u8]) -> Result<Config, (Option<usize>, String)> {
         if text.is_empty() || text.starts_with(b"#") {
             continue;
         }
-        if let Some(bad) = text.iter().find(|b| !b.is_ascii_graphic()) {
+        if let Some(bad) = text.iter().find(|b| !is_plain(**b)) {
             return Err((
                 Some(line),
-                format!(
-                    "byte {bad:#04x} is not allowed: no spaces, tabs, control or non-ASCII characters"
-                ),
+                format!("byte {bad:#04x} is not allowed: no control or non-ASCII characters"),
             ));
         }
         // every byte is printable ASCII now, so the text is valid UTF-8
@@ -205,7 +203,12 @@ fn parse_config(bytes: &[u8]) -> Result<Config, (Option<usize>, String)> {
         let Some((key, value)) = text.split_once('=') else {
             return Err((Some(line), format!("{text:?} is not KEY=VALUE")));
         };
-        entries.push(Entry { line, key, value });
+        // spaces and tabs around `=` are padding, not part of the key or the value
+        entries.push(Entry {
+            line,
+            key: key.trim_ascii(),
+            value: value.trim_ascii(),
+        });
     }
 
     // the version goes first: a newer file may hold keys this build does not know
@@ -324,12 +327,19 @@ fn covers(wide: Cidr, narrow: Cidr) -> bool {
     wide.prefix <= narrow.prefix && Cidr::new(narrow.net, wide.prefix) == Some(wide)
 }
 
+/// Whether a byte may appear inside a config or floor line: printable ASCII, a space or a tab.
+fn is_plain(byte: u8) -> bool {
+    byte.is_ascii_graphic() || byte == b' ' || byte == b'\t'
+}
+
 /// Lines of `bytes` split at `\n`, numbered from 1; a final newline does not start another line.
+///
+/// Each line loses the ASCII whitespace at both ends, so a file with CRLF line ends or padded by hand still parses.
 fn numbered_lines(bytes: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
     let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     // an empty file has no lines, not one empty line
     let lines = (!bytes.is_empty()).then(|| body.split(|b| *b == b'\n'));
-    (1..).zip(lines.into_iter().flatten())
+    (1..).zip(lines.into_iter().flatten().map(<[u8]>::trim_ascii))
 }
 
 /// A port: decimal digits without a sign or a leading zero, 1 to 65535.
@@ -357,7 +367,7 @@ fn parse_ports(value: &str) -> Result<BTreeSet<u16>, String> {
         ));
     }
     let mut ports = BTreeSet::new();
-    for text in value.split(',') {
+    for text in value.split(',').map(str::trim_ascii) {
         let port = parse_port(text)
             .ok_or_else(|| format!("{KEY_P2P_PORTS} entry {text:?} is not a port 1 to 65535"))?;
         if !ports.insert(port) {
@@ -374,7 +384,7 @@ fn parse_allow_from(value: &str) -> Result<(BTreeSet<Cidr>, BTreeSet<Cidr>), Str
     if value.is_empty() {
         return Ok((v4, v6));
     }
-    for text in value.split(',') {
+    for text in value.split(',').map(str::trim_ascii) {
         let entry =
             addr::parse_cidr_or_host(text).map_err(|e| format!("{KEY_ALLOW_FROM} entry {e}"))?;
         let entry = if entry.is_host() {
@@ -766,6 +776,23 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
     }
 
     #[test]
+    fn padding_and_crlf_are_ignored() -> TestResult {
+        let text = b"CONFIG_VERSION=1\r\n  # indented comment\r\nRPC_PORT = 8545 \r\nP2P_PORTS = 49590,\t49594\r\nP2P_ALLOW_FROM = 198.51.100.9/32 , 203.0.113.0/24\r\n   \r\n";
+        let config = parse_config(text).map_err(|(_, m)| m)?;
+        assert_eq!(config.rpc_port, 8545);
+        assert_eq!(config.p2p_ports, BTreeSet::from([49590, 49594]));
+        assert_eq!(
+            config.static_v4,
+            cidrs(&["198.51.100.9/32", "203.0.113.0/24"])?
+        );
+        assert_eq!(
+            parse_floor(b"# floor 1\r\n 192.0.2.10 \r\n").map_err(|(_, m)| m)?,
+            BTreeSet::from([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn every_refusal_names_its_line() {
         let base = "CONFIG_VERSION=1\nRPC_PORT=8545\nP2P_PORTS=49590\nP2P_ALLOW_FROM=\n";
         for (text, line, message) in [
@@ -806,28 +833,22 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
                 "quotes are not allowed",
             ),
             (
-                format!("{base}RPC_PORT = 8545\n"),
+                format!("{base}RPC_PORT=8545\0\n"),
                 5,
-                "byte 0x20 is not allowed",
+                "byte 0x00 is not allowed",
             ),
             (
-                format!("{base}RPC_PORT=8545 \n"),
+                format!("{base}RPC_PORT=\x0b8545\n"),
                 5,
-                "byte 0x20 is not allowed",
+                "byte 0x0b is not allowed",
             ),
             (
-                format!("{base}RPC_PORT=\t8545\n"),
-                5,
-                "byte 0x09 is not allowed",
+                "CONFIG_VERSION=1\x01\nRPC_PORT=8545\n".to_owned(),
+                1,
+                "byte 0x01 is not allowed",
             ),
             (
-                format!("{base} # indented comment\n"),
-                5,
-                "byte 0x20 is not allowed",
-            ),
-            (format!("{base} \n"), 5, "byte 0x20 is not allowed"),
-            (
-                "CONFIG_VERSION=1\r\nRPC_PORT=8545\r\n".to_owned(),
+                "CONFIG_VERSION=1\rRPC_PORT=8545\n".to_owned(),
                 1,
                 "byte 0x0d is not allowed",
             ),
@@ -1270,7 +1291,7 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
                 "the first line is not \"# floor 1\"",
             ),
             (
-                b"# floor 1\r\n",
+                b"# floor 1 x\n",
                 Some(1),
                 "the first line is not \"# floor 1\"",
             ),
@@ -1325,14 +1346,14 @@ P2P_ALLOW_FROM=203.0.113.0/24,198.51.100.9
                 "\"node.example\" is not a canonical IP address",
             ),
             (
-                b"# floor 1\n192.0.2.10 \n",
+                b"# floor 1\n192.0.2.10/32\n",
                 Some(2),
-                "\"192.0.2.10 \" is not a canonical IP address",
+                "\"192.0.2.10/32\" is not a canonical IP address",
             ),
             (
-                b"# floor 1\n192.0.2.10\r\n",
+                b"# floor 1\n192.0.2.10x\n",
                 Some(2),
-                "\"192.0.2.10\\r\" is not a canonical IP address",
+                "\"192.0.2.10x\" is not a canonical IP address",
             ),
             (
                 b"# floor 1\n\n192.0.2.10\n",

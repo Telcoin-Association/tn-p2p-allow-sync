@@ -10,7 +10,7 @@
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -37,6 +37,18 @@ pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// What a value outside the value grammar is written as; such a value is a bug in the writer.
 pub const INVALID: &str = "invalid";
+
+/// The busy mark: how many `sync` runs in a row found the lock held, and since when; see [`Busy`].
+pub const BUSY_FILE: &str = "busy";
+
+/// The temporary file a busy run writes the mark through before the rename into place.
+pub const BUSY_STAGED: &str = ".busy.new";
+
+/// How many `sync` runs in a row may find the lock held and exit 4: the run that makes this many exits 2 as `lock-stuck`, which fails the unit.
+pub const MAX_BUSY_RUNS: u32 = 3;
+
+/// A `.busy.new` older than this was left by a busy run that died, since a busy run writes its mark within a second of starting: the next busy run removes it and writes its own.
+pub const BUSY_STAGED_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// How the last run ended, the value of `RESULT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,16 +327,107 @@ pub fn is_stale(status: &Status, now: u64) -> Option<bool> {
     age_secs(status, now).map(|age| age > status.epoch_duration.saturating_mul(2))
 }
 
-/// The output of `status`: the file's keys as [`Status::render`] writes them, then the live keys `LOADED`, `AGE_SECS`, `STALE` and `COUNTER_{ACCEPT,DROP}_{PACKETS,BYTES}`.
+/// The busy mark `busy`: how many `sync` runs in a row found the lock held, and when the first of them ran.
 ///
-/// A live value that is not known is empty: `LOADED` and the counters when nft could not list the table, the counters when the table or a counter is absent, `AGE_SECS` and `STALE` before the first good run.
+/// A run that finds the lock held writes it without the lock, through [`BUSY_STAGED`]; a run that takes the lock removes both files.
+/// `status` shows it as `BUSY_SINCE` and `BUSY_RUNS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Busy {
+    since: u64,
+    runs: u32,
+}
+
+impl Busy {
+    /// The mark as the file holds it: the lines `BUSY_SINCE=<unix seconds>` and `BUSY_RUNS=<count>`, in either order and nothing else.
+    ///
+    /// Anything else, or no file, is `None`, and the next busy run counts from one.
+    pub fn parse(bytes: Option<&[u8]>) -> Option<Self> {
+        let text = std::str::from_utf8(bytes?).ok()?;
+        let (since, runs) =
+            text.lines()
+                .try_fold((None::<u64>, None::<u32>), |(since, runs), line| {
+                    let (key, value) = line.split_once('=')?;
+                    match () {
+                        () if key == "BUSY_SINCE" => Some((Some(value.parse().ok()?), runs)),
+                        () if key == "BUSY_RUNS" => Some((since, Some(value.parse().ok()?))),
+                        () => None,
+                    }
+                })?;
+        Some(Self {
+            since: since?,
+            runs: runs?,
+        })
+    }
+
+    /// The mark after one more run found the lock held: the first such run starts the count at one and `since` at `now`; every later one adds one and keeps `since`.
+    pub fn next(previous: Option<Self>, now: u64) -> Self {
+        previous.map_or(
+            Self {
+                since: now,
+                runs: 1,
+            },
+            |mark| Self {
+                runs: mark.runs.saturating_add(1),
+                ..mark
+            },
+        )
+    }
+
+    /// The file's text, as [`Busy::parse`] reads it.
+    pub fn render(&self) -> Vec<u8> {
+        format!("BUSY_SINCE={}\nBUSY_RUNS={}\n", self.since, self.runs).into_bytes()
+    }
+
+    /// When the first run of the current series found the lock held, unix seconds.
+    pub fn since(&self) -> u64 {
+        self.since
+    }
+
+    /// How many runs in a row found the lock held, the latest included.
+    pub fn runs(&self) -> u32 {
+        self.runs
+    }
+}
+
+/// The busy mark in `dir`, or `None` when there is none, with a `busy-mark-unreadable` warning when it cannot be read.
+///
+/// Both `sync` and `status` read it without the lock: a mark that a busy run is replacing at that moment reads as the old one or the new, since the rename is atomic.
+pub fn read_busy<E: Write>(dir: &StateDir, log: &mut Log<E>) -> Option<Busy> {
+    let bytes = dir
+        .read(BUSY_FILE)
+        .map_err(|e| {
+            log.line(
+                Priority::Warning,
+                "busy-mark-unreadable",
+                &[("detail", &e.to_string())],
+            );
+        })
+        .ok()
+        .flatten();
+    Busy::parse(bytes.as_deref())
+}
+
+/// Removes the busy mark and its temporary file: the lock is free, so the series of busy runs is over.
+///
+/// Only a lock holder calls this, since removing a file another run may be writing is what the lock guards; nothing under either name is not an error.
+pub fn clear_busy(dir: &StateDir) -> Result<(), FsError> {
+    [BUSY_FILE, BUSY_STAGED]
+        .into_iter()
+        .try_for_each(|name| dir.remove(name))
+}
+
+/// The output of `status`: the file's keys as [`Status::render`] writes them, then the live keys `LOADED`, `AGE_SECS`, `STALE`, `BUSY_SINCE`, `BUSY_RUNS` and `COUNTER_{ACCEPT,DROP}_{PACKETS,BYTES}`.
+///
+/// A live value that is not known is empty: `LOADED` and the counters when nft could not list the table, the counters when the table or a counter is absent, `AGE_SECS` and `STALE` before the first good run, `BUSY_SINCE` and `BUSY_RUNS` while there is no busy mark.
 /// `AGE_SECS` and `STALE` come from the file and the clock, so a failing nft never empties them.
-pub fn text(status: &Status, live: &Live, now: u64) -> String {
+pub fn text(status: &Status, live: &Live, busy: Option<&Busy>, now: u64) -> String {
     let (mut text, _) = status.render();
     for (key, value) in [
         ("LOADED", known(live.loaded)),
         ("AGE_SECS", known(age_secs(status, now))),
         ("STALE", known(is_stale(status, now))),
+        ("BUSY_SINCE", known(busy.map(Busy::since))),
+        ("BUSY_RUNS", known(busy.map(Busy::runs))),
         (
             "COUNTER_ACCEPT_PACKETS",
             known(live.accept.map(|c| c.packets)),
@@ -363,6 +466,8 @@ struct JsonStatus<'a> {
     stale: Option<bool>,
     stale_since: Option<u64>,
     stale_reason: Option<&'a str>,
+    busy_since: Option<u64>,
+    busy_runs: Option<u32>,
     counters: JsonCounters,
 }
 
@@ -378,7 +483,12 @@ struct JsonCounters {
 /// The keys are `loaded`, `epoch`, `allowed_v4`, `allowed_v6`, `static` (both static sets), `floor`, `keys`, `dns_skipped`, `last_good`, `age_secs`, `stale`, `stale_since`, `stale_reason` and `counters`, an object of `accepted` and `dropped` packet counts.
 /// A value that is not known is `null`, as is an empty `stale_reason`.
 /// The keys `enabled`, `persistent`, `timer` and `reason` are never present: the scripts own those facts and add them in front.
-pub fn json(status: &Status, live: &Live, now: u64) -> Result<String, serde_json::Error> {
+pub fn json(
+    status: &Status,
+    live: &Live,
+    busy: Option<&Busy>,
+    now: u64,
+) -> Result<String, serde_json::Error> {
     let object = JsonStatus {
         loaded: live.loaded,
         epoch: status.epoch,
@@ -393,6 +503,8 @@ pub fn json(status: &Status, live: &Live, now: u64) -> Result<String, serde_json
         stale: is_stale(status, now),
         stale_since: status.stale_since,
         stale_reason: Some(status.stale_reason.as_str()).filter(|reason| !reason.is_empty()),
+        busy_since: busy.map(Busy::since),
+        busy_runs: busy.map(Busy::runs),
         counters: JsonCounters {
             accepted: live.accept.map(|counter| counter.packets),
             dropped: live.drop.map(|counter| counter.packets),
@@ -427,6 +539,7 @@ pub fn show<O: Write, E: Write>(
         }
     };
     let status = read_status(&dir, log);
+    let busy = read_busy(&dir, log);
     let listing = live_table(nft);
     if let Err(e) = &listing {
         log.line(
@@ -438,7 +551,7 @@ pub fn show<O: Write, E: Write>(
     let live = Live::from_listing(listing.as_ref().map(Option::as_ref));
     let now = unix_now();
     let output = if as_json {
-        match json(&status, &live, now) {
+        match json(&status, &live, busy.as_ref(), now) {
             Ok(line) => line,
             Err(e) => {
                 log.line(
@@ -450,7 +563,7 @@ pub fn show<O: Write, E: Write>(
             }
         }
     } else {
-        text(&status, &live, now)
+        text(&status, &live, busy.as_ref(), now)
     };
     match out.write_all(output.as_bytes()).and_then(|()| out.flush()) {
         Ok(()) => Exit::Fresh,
@@ -721,10 +834,51 @@ mod tests {
 
     const SCRIPT_KEYS: [&str; 4] = ["enabled", "persistent", "timer", "reason"];
 
+    /// A busy mark two runs old.
+    const BUSY: Busy = Busy {
+        since: 1_762_299_500,
+        runs: 2,
+    };
+
+    #[test]
+    fn the_busy_mark_round_trips_and_counts_runs() {
+        let first = Busy::next(None, NOW);
+        assert_eq!((first.since(), first.runs()), (NOW, 1));
+        let second = Busy::next(Some(first), NOW.saturating_add(300));
+        assert_eq!((second.since(), second.runs()), (NOW, 2));
+        assert_eq!(second.render(), b"BUSY_SINCE=1762299800\nBUSY_RUNS=2\n");
+        assert_eq!(Busy::parse(Some(second.render().as_slice())), Some(second));
+        assert_eq!(
+            Busy::parse(Some(b"BUSY_RUNS=2\nBUSY_SINCE=1762299800")),
+            Some(second)
+        );
+        let saturated = Busy::next(
+            Some(Busy {
+                since: NOW,
+                runs: u32::MAX,
+            }),
+            NOW,
+        );
+        assert_eq!((saturated.since(), saturated.runs()), (NOW, u32::MAX));
+        assert_eq!(Busy::parse(None), None);
+        [
+            &b""[..],
+            b"BUSY_SINCE=1\n",
+            b"BUSY_RUNS=1\n",
+            b"BUSY_SINCE=x\nBUSY_RUNS=1\n",
+            b"BUSY_SINCE=1\nBUSY_RUNS=-1\n",
+            b"BUSY_SINCE=1\nBUSY_RUNS=1\nEXTRA=2\n",
+            b"BUSY_SINCE=1\nBUSY_RUNS=1\nno equals\n",
+            b"\xff",
+        ]
+        .into_iter()
+        .for_each(|bad| assert_eq!(Busy::parse(Some(bad)), None, "{bad:?}"));
+    }
+
     #[test]
     fn the_json_line_holds_every_key_in_order_and_none_of_the_script_keys()
     -> Result<(), Box<dyn std::error::Error>> {
-        let line = json(&full(), &loaded(), NOW)?;
+        let line = json(&full(), &loaded(), Some(&BUSY), NOW)?;
         assert_eq!(line.matches('\n').count(), 1);
         assert!(line.ends_with("}\n"), "{line}");
         assert_eq!(
@@ -732,7 +886,7 @@ mod tests {
             concat!(
                 r#"{"loaded":true,"epoch":42,"allowed_v4":120,"allowed_v6":7,"static":3,"floor":9,"keys":64,"#,
                 r#""dns_skipped":3,"last_good":1762299700,"age_secs":100,"stale":false,"stale_since":1762299800,"#,
-                r#""stale_reason":"rpc-error--32001","counters":{"accepted":12,"dropped":7}}"#,
+                r#""stale_reason":"rpc-error--32001","busy_since":1762299500,"busy_runs":2,"counters":{"accepted":12,"dropped":7}}"#,
                 "\n"
             )
         );
@@ -753,6 +907,8 @@ mod tests {
             "stale",
             "stale_since",
             "stale_reason",
+            "busy_since",
+            "busy_runs",
             "counters",
         ];
         expected.sort_unstable();
@@ -771,11 +927,11 @@ mod tests {
     #[test]
     fn unknown_json_values_are_null() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
-            json(&Status::default(), &Live::default(), NOW)?,
+            json(&Status::default(), &Live::default(), None, NOW)?,
             concat!(
                 r#"{"loaded":null,"epoch":null,"allowed_v4":0,"allowed_v6":0,"static":0,"floor":0,"keys":0,"#,
                 r#""dns_skipped":0,"last_good":null,"age_secs":null,"stale":null,"stale_since":null,"#,
-                r#""stale_reason":null,"counters":{"accepted":null,"dropped":null}}"#,
+                r#""stale_reason":null,"busy_since":null,"busy_runs":null,"counters":{"accepted":null,"dropped":null}}"#,
                 "\n"
             )
         );
@@ -784,7 +940,7 @@ mod tests {
             loaded: Some(false),
             ..Live::default()
         };
-        assert!(json(&Status::default(), &live, NOW)?.starts_with(r#"{"loaded":false,"#));
+        assert!(json(&Status::default(), &live, None, NOW)?.starts_with(r#"{"loaded":false,"#));
         Ok(())
     }
 
@@ -813,9 +969,9 @@ mod tests {
     fn the_text_is_the_file_then_the_live_keys() {
         let (file, _) = full().render();
         assert_eq!(
-            text(&full(), &loaded(), NOW),
+            text(&full(), &loaded(), Some(&BUSY), NOW),
             format!(
-                "{file}LOADED=true\nAGE_SECS=100\nSTALE=false\nCOUNTER_ACCEPT_PACKETS=12\nCOUNTER_ACCEPT_BYTES=3456\nCOUNTER_DROP_PACKETS=7\nCOUNTER_DROP_BYTES=420\n"
+                "{file}LOADED=true\nAGE_SECS=100\nSTALE=false\nBUSY_SINCE=1762299500\nBUSY_RUNS=2\nCOUNTER_ACCEPT_PACKETS=12\nCOUNTER_ACCEPT_BYTES=3456\nCOUNTER_DROP_PACKETS=7\nCOUNTER_DROP_BYTES=420\n"
             )
         );
         let absent = Live {
@@ -823,17 +979,17 @@ mod tests {
             ..Live::default()
         };
         assert_eq!(
-            text(&full(), &absent, NOW),
+            text(&full(), &absent, None, NOW),
             format!(
-                "{file}LOADED=false\nAGE_SECS=100\nSTALE=false\nCOUNTER_ACCEPT_PACKETS=\nCOUNTER_ACCEPT_BYTES=\nCOUNTER_DROP_PACKETS=\nCOUNTER_DROP_BYTES=\n"
+                "{file}LOADED=false\nAGE_SECS=100\nSTALE=false\nBUSY_SINCE=\nBUSY_RUNS=\nCOUNTER_ACCEPT_PACKETS=\nCOUNTER_ACCEPT_BYTES=\nCOUNTER_DROP_PACKETS=\nCOUNTER_DROP_BYTES=\n"
             )
         );
         let (file, _) = Status::default().render();
-        let unknown = text(&Status::default(), &Live::default(), NOW);
+        let unknown = text(&Status::default(), &Live::default(), None, NOW);
         assert_eq!(
             unknown,
             format!(
-                "{file}LOADED=\nAGE_SECS=\nSTALE=\nCOUNTER_ACCEPT_PACKETS=\nCOUNTER_ACCEPT_BYTES=\nCOUNTER_DROP_PACKETS=\nCOUNTER_DROP_BYTES=\n"
+                "{file}LOADED=\nAGE_SECS=\nSTALE=\nBUSY_SINCE=\nBUSY_RUNS=\nCOUNTER_ACCEPT_PACKETS=\nCOUNTER_ACCEPT_BYTES=\nCOUNTER_DROP_PACKETS=\nCOUNTER_DROP_BYTES=\n"
             )
         );
         for line in unknown.lines() {

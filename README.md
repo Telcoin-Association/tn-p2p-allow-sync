@@ -37,9 +37,9 @@ usage: tn-p2p-allow-sync [--state-dir DIR] [--nft PATH] COMMAND
 |---|---|
 | 0 | Fresh. `sync`: applied or already loaded. `check`: consistent. `status`, `render`, `capture-floor`: done. |
 | 1 | Refused, nothing written, not even `status`. `sync --require-authoritative`: the snapshot is not authoritative or the dynamic set is empty. `check`: an address is missing or the table is absent. `render`: not authoritative. |
-| 2 | Error: usage, config, floor or state invalid, unsafe state dir, nft missing or EPERM, apply failed. The stale-path protections still run where possible. |
+| 2 | Error: usage, config, floor or state invalid, unsafe state dir, nft missing, EPERM or killed after 10 s, apply failed, lock stuck. The stale-path protections still run where possible. |
 | 3 | Stale. `sync`: last-good kept. `check`: cannot judge (RPC down, the snapshot not authoritative, or the last sync behind the snapshot: a newer epoch or an address it never held). |
-| 4 | Busy: the lock is held. |
+| 4 | Busy: the lock is held. The third busy `sync` in a row exits 2 as `lock-stuck` instead, so a stuck lock fails the unit. |
 | 101 | Panic, a bug. |
 
 `--state-dir` defaults to `/var/lib/telcoin-p2p-allow`, which must be owned by the effective uid with mode 0700; `--nft` defaults to `/usr/sbin/nft`.

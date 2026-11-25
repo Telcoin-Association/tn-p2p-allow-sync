@@ -1257,7 +1257,7 @@ fn a_rule_or_the_policy_changed_by_hand_is_healed_by_the_next_authoritative_run(
 }
 
 #[test]
-fn a_held_lock_exits_busy_and_writes_nothing() -> TestResult {
+fn a_held_lock_exits_busy_and_writes_only_the_busy_mark() -> TestResult {
     let mut bed = Bed::new("busy")?;
     let lock = OpenOptions::new()
         .read(true)
@@ -1269,8 +1269,20 @@ fn a_held_lock_exits_busy_and_writes_nothing() -> TestResult {
     let ran = bed.sync_snapshot(&two_keys())?;
     assert_eq!(ran.code, Some(4), "{ran:?}");
     assert_eq!(ran.stdout, "");
-    assert!(ran.logged("busy "), "{ran:?}");
-    assert_eq!(bed.names()?, ["config", "lock"]);
+    assert!(ran.logged("busy detail="), "{ran:?}");
+    assert!(ran.stderr.contains(" runs=1 since="), "{ran:?}");
+    assert_eq!(bed.names()?, ["busy", "config", "lock"]);
+    let mark = fs::read_to_string(bed.file("busy"))?;
+    let since = mark
+        .strip_prefix("BUSY_SINCE=")
+        .and_then(|rest| rest.split_once('\n'))
+        .map(|(since, _)| since.to_owned())
+        .ok_or("no BUSY_SINCE line")?;
+    assert_eq!(mark, format!("BUSY_SINCE={since}\nBUSY_RUNS=1\n"));
+    assert_eq!(
+        fs::metadata(bed.file("busy"))?.permissions().mode() & 0o7777,
+        0o600
+    );
     assert_eq!(bed.nft.argv()?, Vec::<String>::new());
     assert_eq!(bed.rpc.requests(), Vec::<String>::new());
     drop(lock);
@@ -1280,6 +1292,131 @@ fn a_held_lock_exits_busy_and_writes_nothing() -> TestResult {
         bed.sync_with(answers(&two_keys()), &["--wait", "5"])?.code,
         Some(0)
     );
+    // the locked run ends the series of busy runs: the mark is gone
+    assert!(!bed.file("busy").exists(), "{:?}", bed.names()?);
+    Ok(())
+}
+
+#[test]
+fn the_third_busy_run_in_a_row_is_lock_stuck_and_status_shows_the_series() -> TestResult {
+    let mut bed = Bed::new("lock-stuck")?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(bed.file("lock"))?;
+    lock.try_lock()?;
+    let first = bed.sync_snapshot(&two_keys())?;
+    assert_eq!(first.code, Some(4), "{first:?}");
+    let since = fs::read_to_string(bed.file("busy"))?
+        .strip_prefix("BUSY_SINCE=")
+        .and_then(|rest| rest.split_once('\n'))
+        .map(|(since, _)| since.to_owned())
+        .ok_or("no BUSY_SINCE line")?;
+    let second = bed.sync_snapshot(&two_keys())?;
+    assert_eq!(second.code, Some(4), "{second:?}");
+    assert!(second.logged("busy detail="), "{second:?}");
+    assert!(
+        second.stderr.contains(&format!(" runs=2 since={since}")),
+        "{second:?}"
+    );
+    // docs/contract.md, The lock: the third busy run in a row fails the unit
+    let third = bed.sync_snapshot(&two_keys())?;
+    assert_eq!(third.code, Some(2), "{third:?}");
+    assert_eq!(third.stdout, "");
+    assert!(third.logged("error reason=lock-stuck detail="), "{third:?}");
+    assert!(
+        third.stderr.contains(&format!(" runs=3 since={since}")),
+        "{third:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(bed.file("busy"))?,
+        format!("BUSY_SINCE={since}\nBUSY_RUNS=3\n")
+    );
+    assert_eq!(bed.names()?, ["busy", "config", "lock"]);
+    assert_eq!(bed.nft.argv()?, Vec::<String>::new());
+    assert_eq!(bed.rpc.requests(), Vec::<String>::new());
+    // status reads the mark without the lock
+    let shown = bed.run(&["status"])?;
+    assert_eq!(shown.code, Some(0), "{shown:?}");
+    assert!(
+        shown
+            .stdout
+            .contains(&format!("\nBUSY_SINCE={since}\nBUSY_RUNS=3\n")),
+        "{shown:?}"
+    );
+    let shown = bed.run(&["status", "--json"])?;
+    assert_eq!(shown.code, Some(0), "{shown:?}");
+    let object: Value = serde_json::from_str(&shown.stdout)?;
+    assert_eq!(
+        object
+            .get("busy_since")
+            .and_then(Value::as_u64)
+            .map(|n| n.to_string()),
+        Some(since.clone())
+    );
+    assert_eq!(object.get("busy_runs"), Some(&json!(3)));
+    drop(lock);
+    // the next locked run ends the series, and status shows no mark
+    assert_eq!(
+        bed.sync_with(answers(&two_keys()), &["--wait", "5"])?.code,
+        Some(0)
+    );
+    assert!(!bed.file("busy").exists(), "{:?}", bed.names()?);
+    let shown = bed.run(&["status"])?;
+    assert!(
+        shown.stdout.contains("\nBUSY_SINCE=\nBUSY_RUNS=\n"),
+        "{shown:?}"
+    );
+    let shown = bed.run(&["status", "--json"])?;
+    let object: Value = serde_json::from_str(&shown.stdout)?;
+    assert_eq!(
+        (object.get("busy_since"), object.get("busy_runs")),
+        (Some(&Value::Null), Some(&Value::Null))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_leftover_busy_temporary_skips_the_mark_until_it_is_old() -> TestResult {
+    let mut bed = Bed::new("busy-leftover")?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(bed.file("lock"))?;
+    lock.try_lock()?;
+    // a fresh `.busy.new` may belong to a busy run still writing: it is never removed
+    fs::write(bed.file(".busy.new"), "")?;
+    let ran = bed.sync_snapshot(&two_keys())?;
+    assert_eq!(ran.code, Some(4), "{ran:?}");
+    assert!(ran.logged("busy-mark-skipped detail="), "{ran:?}");
+    assert!(ran.stderr.contains(" runs=1 since="), "{ran:?}");
+    assert!(!bed.file("busy").exists(), "{:?}", bed.names()?);
+    assert_eq!(fs::read(bed.file(".busy.new"))?, b"");
+    // one older than a minute was left by a run that died: it is replaced by the mark
+    let old = SystemTime::now()
+        .checked_sub(Duration::from_secs(120))
+        .ok_or("clock")?;
+    fs::File::options()
+        .write(true)
+        .open(bed.file(".busy.new"))?
+        .set_modified(old)?;
+    let ran = bed.sync_snapshot(&two_keys())?;
+    assert_eq!(ran.code, Some(4), "{ran:?}");
+    assert!(!ran.stderr.contains("busy-mark-skipped"), "{ran:?}");
+    assert!(fs::read_to_string(bed.file("busy"))?.ends_with("BUSY_RUNS=1\n"));
+    assert!(!bed.file(".busy.new").exists());
+    // a locked run removes a planted temporary file along with the mark
+    fs::write(bed.file(".busy.new"), "")?;
+    drop(lock);
+    assert_eq!(
+        bed.sync_with(answers(&two_keys()), &["--wait", "5"])?.code,
+        Some(0)
+    );
+    assert!(!bed.file("busy").exists() && !bed.file(".busy.new").exists());
     Ok(())
 }
 
@@ -1688,19 +1825,26 @@ fn stderr_never_exceeds_eight_lines() -> TestResult {
 }
 
 #[test]
-fn nft_refusing_the_caller_exits_2_with_run_as_root_and_writes_nothing() -> TestResult {
+fn nft_refusing_the_caller_exits_2_with_run_as_root_and_writes_the_error_status() -> TestResult {
     let mut bed = Bed::new("eperm")?;
     bed.nft.knob("eperm")?;
     let ran = bed.sync_snapshot(&two_keys())?;
     assert_eq!(ran.code, Some(2), "{ran:?}");
-    assert_eq!(ran.stdout, "");
+    assert_eq!(
+        ran.stdout,
+        "result=error reason=nft-unavailable epoch= v4=0 v6=0 static=0 floor=0 keys=0 dns_skipped=0 unparsed=0\n"
+    );
     assert!(
         ran.logged(
-            "error reason=nft-unavailable detail=\"nft: operation not permitted, run as root\""
+            "error reason=nft-unavailable action=none detail=\"nft: operation not permitted, run as root\""
         ),
         "{ran:?}"
     );
-    assert_eq!(bed.names()?, ["config", "lock"]);
+    // the run holds the lock, so the failure is recorded like every local error
+    assert_eq!(bed.names()?, ["config", "lock", "status"]);
+    assert_eq!(bed.status_value("RESULT")?, "error");
+    assert_eq!(bed.status_value("STALE_REASON")?, "nft-unavailable");
+    assert_ne!(bed.status_value("STALE_SINCE")?, "");
     assert_eq!(bed.rpc.requests(), Vec::<String>::new());
     let ran = bed.run(&["render", "--check"])?;
     assert_eq!(ran.code, Some(2), "{ran:?}");

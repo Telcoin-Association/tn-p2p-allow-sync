@@ -6,10 +6,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -20,6 +22,15 @@ pub const DEFAULT_PATH: &str = "/usr/sbin/nft";
 
 // the whole environment nft gets; LC_ALL=C also fixes the strerror text the runner looks for
 const CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// How long one nft child may run before it is killed and reported as [`NftError::TimedOut`].
+///
+/// nft answers in milliseconds; a child that runs this long is wedged, typically on the netlink socket.
+/// A sync run starts at most six nft children and two RPC calls bounded at 10 s each, so a run ends inside the unit's `TimeoutStartSec=90`, and a wedged nft can no longer hold the lock for good.
+pub const NFT_TIMEOUT: Duration = Duration::from_secs(10);
+
+// how often the runner looks whether the child has exited
+const WAIT_POLL: Duration = Duration::from_millis(50);
 
 const FAMILY: &str = "inet";
 const TABLE: &str = "tn_p2p_allow";
@@ -48,6 +59,39 @@ pub enum NftError {
     },
     /// nft succeeded but printed JSON the parser does not understand.
     Parse(String),
+    /// nft ran past the deadline ([`NFT_TIMEOUT`] outside tests) and was killed.
+    TimedOut(Duration),
+}
+
+/// Reads `pipe` to its end on a thread of its own; nothing when the child has no such pipe.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.map_or(Ok(()), |mut pipe| pipe.read_to_end(&mut bytes).map(drop))
+            .map(|()| bytes)
+    })
+}
+
+/// What a reader thread collected from `stream`, or why it could not.
+fn collected(reader: JoinHandle<io::Result<Vec<u8>>>, stream: &str) -> Result<Vec<u8>, NftError> {
+    reader
+        .join()
+        .map_err(|_panic| NftError::Failed {
+            code: None,
+            stderr: format!("reading the {stream} of nft: the reader thread ended early"),
+        })?
+        .map_err(|err| NftError::Failed {
+            code: None,
+            stderr: format!("reading the {stream} of nft: {err}"),
+        })
+}
+
+/// Why a poll for the exit of nft failed.
+fn wait_failure(err: io::Error) -> NftError {
+    NftError::Failed {
+        code: None,
+        stderr: format!("waiting for nft: {err}"),
+    }
 }
 
 impl fmt::Display for NftError {
@@ -67,6 +111,9 @@ impl fmt::Display for NftError {
                 }
             }
             Self::Parse(why) => write!(f, "nft output not understood: {why}"),
+            Self::TimedOut(deadline) => {
+                write!(f, "nft did not finish within {deadline:?} and was killed")
+            }
         }
     }
 }
@@ -163,15 +210,26 @@ pub struct Listing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nft {
     path: PathBuf,
+    deadline: Duration,
 }
 
 impl Nft {
-    /// A runner for `path`, or for [`DEFAULT_PATH`] when `path` is `None`.
+    /// A runner for `path`, or for [`DEFAULT_PATH`] when `path` is `None`; its children are killed after [`NFT_TIMEOUT`].
     ///
     /// The caller passes an absolute path and warns when it is not the default.
     pub fn new(path: Option<&Path>) -> Self {
         Self {
             path: path.map_or_else(|| PathBuf::from(DEFAULT_PATH), Path::to_path_buf),
+            deadline: NFT_TIMEOUT,
+        }
+    }
+
+    /// A runner like [`Nft::new`] whose children are killed after `deadline` instead of [`NFT_TIMEOUT`].
+    #[cfg(test)]
+    fn with_deadline(path: Option<&Path>, deadline: Duration) -> Self {
+        Self {
+            deadline,
+            ..Self::new(path)
         }
     }
 
@@ -247,12 +305,48 @@ impl Nft {
             (Some(bytes), Some(mut pipe)) => pipe.write_all(bytes),
             _ => Ok(()),
         };
-        // polls stdout and stderr together, the way Command::output does
-        let output = child.wait_with_output().map_err(|err| NftError::Failed {
-            code: None,
-            stderr: format!("reading the output of nft: {err}"),
-        })?;
+        // stdout and stderr are drained on threads of their own, so nft can never block on a
+        // full pipe while this thread waits for it to exit or for the deadline to pass
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        let status = self.wait(&mut child)?;
+        let output = Output {
+            status,
+            stdout: collected(stdout, "stdout")?,
+            stderr: collected(stderr, "stderr")?,
+        };
         outcome(output, written)
+    }
+
+    /// Waits for `child` to exit; when the deadline passes first, kills it and reports [`NftError::TimedOut`].
+    fn wait(&self, child: &mut Child) -> Result<ExitStatus, NftError> {
+        let started = Instant::now();
+        // polls until nft exits, a poll fails or the deadline passes, sleeping one tick between polls
+        let waited = std::iter::repeat_with(|| child.try_wait().map_err(wait_failure).transpose())
+            .find_map(|polled| polled.or_else(|| self.tick(started)))
+            .unwrap_or(Err(NftError::TimedOut(self.deadline)));
+        waited.map_err(|err| {
+            if matches!(err, NftError::TimedOut(_)) {
+                // kill fails only when nft exited in the meantime; wait reaps it either way
+                child
+                    .kill()
+                    .and_then(|()| child.wait())
+                    .map(drop)
+                    .unwrap_or(());
+            }
+            err
+        })
+    }
+
+    /// Sleeps one poll tick, or reports the timeout once the deadline has passed since `started`.
+    fn tick(&self, started: Instant) -> Option<Result<ExitStatus, NftError>> {
+        let elapsed = started.elapsed();
+        if elapsed >= self.deadline {
+            Some(Err(NftError::TimedOut(self.deadline)))
+        } else {
+            std::thread::sleep(WAIT_POLL.min(self.deadline.saturating_sub(elapsed)));
+            None
+        }
     }
 
     fn spawn_error(&self, err: &io::Error) -> NftError {
@@ -1510,6 +1604,24 @@ mod tests {
     }
 
     #[test]
+    fn a_child_that_outlives_the_deadline_is_killed_and_timed_out() {
+        let deadline = Duration::from_millis(300);
+        let started = Instant::now();
+        let waited =
+            Nft::with_deadline(Some(Path::new("/bin/sleep")), deadline).run(&os(&["5"]), None);
+        assert_eq!(waited, Err(NftError::TimedOut(deadline)));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_child_inside_the_deadline_is_not_touched() -> TestResult {
+        let nft = Nft::with_deadline(Some(Path::new("/bin/sleep")), Duration::from_secs(5));
+        let output = nft.run(&os(&["0"]), None)?;
+        assert!(output.status.success());
+        Ok(())
+    }
+
+    #[test]
     fn display_gives_one_line() {
         let failed = NftError::Failed {
             code: Some(1),
@@ -1524,6 +1636,10 @@ mod tests {
             stderr: String::new(),
         };
         assert_eq!(killed.to_string(), "nft was killed by a signal");
+        assert_eq!(
+            NftError::TimedOut(Duration::from_secs(10)).to_string(),
+            "nft did not finish within 10s and was killed"
+        );
         assert_eq!(
             NftError::Permission.to_string(),
             "nft: operation not permitted, run as root"

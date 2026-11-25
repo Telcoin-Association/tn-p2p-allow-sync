@@ -344,6 +344,24 @@ fn fill(mut file: File, path: &Path, bytes: &[u8], mode: u32) -> Result<(), FsEr
     file.sync_all().map_err(|e| FsError::io(path, "sync", e))
 }
 
+/// Creates the file at `path` holding `bytes`, with exactly `mode` whatever the umask, and syncs it.
+///
+/// The open uses `O_CREAT|O_EXCL|O_NOFOLLOW`, so nothing is ever written through a symlink planted at `path`, and anything already there is an error.
+/// On failure the new file is removed.
+fn create_exclusive(path: &Path, bytes: &[u8], mode: u32) -> Result<(), FsError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| FsError::io(path, "create", e))?;
+    fill(file, path, bytes, mode).inspect_err(|_| {
+        // best effort: the error that matters is the one above
+        let _ = fs::remove_file(path);
+    })
+}
+
 /// A state dir that passed the safety checks of [`StateDir::open`].
 ///
 /// File names passed to its methods are single path components such as `status`; a name with a `/`, an empty name, `.` and `..` are refused.
@@ -449,19 +467,25 @@ impl StateDir {
     pub fn create(&self, name: &str, bytes: &[u8], mode: u32) -> Result<PathBuf, FsError> {
         let path = self.file(name)?;
         remove_leftover(&path)?;
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .custom_flags(O_NOFOLLOW)
-            .open(&path)
-            .map_err(|e| FsError::io(&path, "create", e))?;
-        if let Err(e) = fill(file, &path, bytes, mode) {
-            // best effort: the error that matters is the one above
-            let _ = fs::remove_file(&path);
-            return Err(e);
-        }
+        create_exclusive(&path, bytes, mode)?;
         Ok(path)
+    }
+
+    /// Replaces the file `name` with `bytes` and `mode` without holding the [`Lock`]: the busy mark of a run that found the lock held.
+    ///
+    /// The bytes go to `.<name>.new` and are renamed into place as in [`StateDir::write_atomic`], but nothing is removed first: a leftover temporary file is the create error, since only a lock holder may remove what another run may still be writing.
+    /// The caller decides what a failure means; `sync` logs it and goes on without the mark.
+    pub fn write_unlocked(&self, name: &str, bytes: &[u8], mode: u32) -> Result<(), FsError> {
+        let target = self.file(name)?;
+        let temp = self.file(&format!(".{name}.new"))?;
+        create_exclusive(&temp, bytes, mode)?;
+        fs::rename(&temp, &target)
+            .map_err(|e| {
+                // best effort: the error that matters is the rename's
+                let _ = fs::remove_file(&temp);
+                FsError::io(&target, "rename into place", e)
+            })
+            .and_then(|()| self.sync())
     }
 
     /// Renames the file `from` to `to`, then syncs the directory so the rename survives a crash.
@@ -1114,6 +1138,34 @@ mod tests {
             ),
             "{result:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unlocked_write_replaces_the_file_and_never_removes_a_leftover() -> TestResult {
+        let (_temp, dir) = state_dir("unlocked")?;
+        dir.write_unlocked("busy", b"one\n", 0o600)?;
+        assert_eq!(dir.read("busy")?, Some(b"one\n".to_vec()));
+        assert_eq!(
+            fs::metadata(dir.path().join("busy"))?.mode() & 0o7777,
+            0o600
+        );
+        dir.write_unlocked("busy", b"two\n", 0o600)?;
+        assert_eq!(dir.read("busy")?, Some(b"two\n".to_vec()));
+        // a leftover temporary file is refused, never removed, and the file keeps its content
+        fs::write(dir.path().join(".busy.new"), "stale")?;
+        let refused = dir.write_unlocked("busy", b"three\n", 0o600);
+        assert!(matches!(refused, Err(FsError::Io { .. })), "{refused:?}");
+        assert_eq!(dir.read("busy")?, Some(b"two\n".to_vec()));
+        assert_eq!(fs::read(dir.path().join(".busy.new"))?, b"stale");
+        // a symlink planted at the temporary name is never followed
+        fs::remove_file(dir.path().join(".busy.new"))?;
+        let elsewhere = dir.path().join("elsewhere");
+        fs::write(&elsewhere, "")?;
+        symlink(&elsewhere, dir.path().join(".busy.new"))?;
+        assert!(dir.write_unlocked("busy", b"four\n", 0o600).is_err());
+        assert_eq!(fs::read(&elsewhere)?, b"");
+        assert_eq!(dir.read("busy")?, Some(b"two\n".to_vec()));
         Ok(())
     }
 
