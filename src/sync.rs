@@ -33,7 +33,7 @@ use crate::log::{Line, Log, Priority};
 use crate::memory::{self, State};
 use crate::nft::{Chain, Element, Expr, Listing, Nft, NftError};
 use crate::render::{self, Program};
-use crate::rpc::{self, RpcClient, RpcError};
+use crate::rpc::{RpcClient, RpcError};
 use crate::snapshot::{self, Snapshot, SnapshotError, Warnings};
 use crate::status::{self, RunResult, Status};
 
@@ -71,9 +71,6 @@ const ACCEPT_RULES: [(&str, &str); 4] = [
 
 /// The token of an empty dynamic set: memory holds no address, so the program would admit only the floor and the static list.
 pub const EMPTY_SET: &str = "empty-set";
-
-/// The largest file `render --snapshot` reads, the same cap as an RPC body.
-const MAX_SNAPSHOT_FILE: usize = rpc::MAX_BODY_BYTES;
 
 /// The four sets of one program.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -407,6 +404,7 @@ fn log_absorbed<E: Write>(log: &mut Log<E>, warnings: &Warnings) {
         ("unparsed", warnings.unparsed),
         ("truncated-lists", warnings.truncated_lists),
         ("pool-ahead", warnings.pool_ahead),
+        ("bad-keys", warnings.bad_keys),
     ] {
         if n > 0 {
             log.line(
@@ -568,7 +566,7 @@ impl<O: Write, E: Write> Run<'_, O, E> {
             state_bytes,
             ..
         } = inputs;
-        let rpc = RpcClient::new(config.rpc_port);
+        let rpc = config.rpc_client();
         let snap = match fetch_snapshot(&rpc) {
             Ok(snap) => snap,
             Err(reason) => return self.stale(&reason),
@@ -859,13 +857,13 @@ pub fn render<O: Write, E: Write>(
         return nft_unavailable(log, &e);
     }
     let snap = match options.snapshot {
-        Some(path) => match fsutil::read_bounded(path, count(MAX_SNAPSHOT_FILE)) {
-            Ok(bytes) => snapshot_from_bytes(&bytes),
+        Some(path) => match fsutil::read_bounded(path, count(config.rpc_max_body)) {
+            Ok(bytes) => snapshot_from_bytes(&bytes, config.rpc_max_body),
             Err(e) => {
                 return untouched(log, "snapshot-unreadable", &format_args!("{path:?}: {e}"));
             }
         },
-        None => fetch_snapshot(&RpcClient::new(config.rpc_port)),
+        None => fetch_snapshot(&config.rpc_client()),
     };
     let refused = |reason: &str, state: &State, warnings: &Warnings| {
         let sets = Sets::build(&memory::allow_ips(state), &floor, &config);
@@ -913,9 +911,9 @@ pub fn render<O: Write, E: Write>(
 
 /// The snapshot in `bytes`, either a `result` object or a whole JSON-RPC response that holds one, or the stale reason.
 ///
-/// A body past the RPC cap is `rpc-body-too-large` and bytes that are not JSON are `snapshot-malformed`, as from the node.
-fn snapshot_from_bytes(bytes: &[u8]) -> Result<Snapshot, String> {
-    if bytes.len() > MAX_SNAPSHOT_FILE {
+/// A body past `max_body`, the config's RPC cap, is `rpc-body-too-large` and bytes that are not JSON are `snapshot-malformed`, as from the node.
+fn snapshot_from_bytes(bytes: &[u8], max_body: usize) -> Result<Snapshot, String> {
+    if bytes.len() > max_body {
         return Err(RpcError::BodyTooLarge.token());
     }
     let value =
@@ -960,6 +958,8 @@ mod tests {
             .partition(|cidr| cidr.net.is_ipv4());
         Config {
             rpc_port: 8545,
+            rpc_deadline: crate::rpc::DEFAULT_DEADLINE,
+            rpc_max_body: crate::rpc::DEFAULT_MAX_BODY_BYTES,
             p2p_ports: BTreeSet::from([49590, 49594]),
             static_v4: v4.into_iter().collect(),
             static_v6: v6.into_iter().collect(),
@@ -1440,9 +1440,9 @@ mod tests {
 
     #[test]
     fn a_snapshot_file_holds_a_result_or_a_whole_response() {
-        let bare = snapshot_from_bytes(GOOD.as_bytes());
+        let bare = snapshot_from_bytes(GOOD.as_bytes(), crate::rpc::DEFAULT_MAX_BODY_BYTES);
         let wrapped = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{GOOD}}}");
-        let wrapped = snapshot_from_bytes(wrapped.as_bytes());
+        let wrapped = snapshot_from_bytes(wrapped.as_bytes(), crate::rpc::DEFAULT_MAX_BODY_BYTES);
         assert!(bare.is_ok(), "{bare:?}");
         assert_eq!(bare, wrapped);
 
@@ -1457,15 +1457,15 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                snapshot_from_bytes(bytes).map(|_| ()),
+                snapshot_from_bytes(bytes, crate::rpc::DEFAULT_MAX_BODY_BYTES).map(|_| ()),
                 Err(reason.to_owned()),
                 "{}",
                 String::from_utf8_lossy(bytes)
             );
         }
-        let huge = vec![b' '; MAX_SNAPSHOT_FILE.saturating_add(1)];
+        let huge = vec![b' '; crate::rpc::DEFAULT_MAX_BODY_BYTES.saturating_add(1)];
         assert_eq!(
-            snapshot_from_bytes(&huge).map(|_| ()),
+            snapshot_from_bytes(&huge, crate::rpc::DEFAULT_MAX_BODY_BYTES).map(|_| ()),
             Err("rpc-body-too-large".to_owned())
         );
     }

@@ -120,9 +120,12 @@ Grammar, version 1:
 - Every other line is printable ASCII (0x21 to 0x7e): no spaces, tabs, control bytes, non-ASCII bytes, `"` or `'`.
 - Such a line is `KEY=VALUE`, split at the first `=`.
 - Every line is checked against the grammar above first; then `CONFIG_VERSION` is checked before any other key and must be `1`, so a newer file reports its version rather than an unknown key.
-- Each of the four keys appears exactly once; an unknown, duplicate or missing key refuses the whole file.
+- Each of the four keys above appears exactly once, and each of the two optional keys below at most once; an unknown, duplicate or missing key refuses the whole file.
 - `RPC_PORT` is a port: decimal digits, no sign, no leading zero, 1 to 65535.
   The RPC host is always `127.0.0.1` and has no key.
+- `RPC_DEADLINE_SECS` is optional: the seconds allowed for one RPC call and for each of its reads, decimal digits, no sign, no leading zero, 1 to 60; absent, it is 30.
+- `RPC_MAX_BODY_MIB` is optional: the cap on a decoded RPC body and on the file `render --snapshot` reads, in MiB, decimal digits, no sign, no leading zero, 1 to 32; absent, it is 8.
+  The scripts write neither key, and an older binary refuses a file that holds one as an unknown key, so add them only once the binary is upgraded.
 - `P2P_PORTS` is one or more ports separated by commas, each listed once.
   An empty value is refused, since the program would carry `udp dport {  }`, which nft rejects.
   The program lists the ports sorted.
@@ -179,8 +182,10 @@ The tool calls `tn_admissionSnapshot` with params `[]` over HTTP/1.1 on `127.0.0
 
 - `POST /` with `Host`, `Content-Type: application/json`, `Content-Length` and `Connection: close`.
 - The response may end by `Content-Length`, by `chunked` encoding or at the end of the stream.
-- Connecting has 2 s, each read 5 s, and the whole call 10 s, checked before every read.
-- The response head is capped at 16 KiB and the decoded body at 8 MiB.
+- The whole call and each read have `RPC_DEADLINE_SECS`, 30 s by default, checked before every read; connecting has 2 s, or the deadline when that is shorter.
+  The default fits a run's two calls under the unit's `TimeoutStartSec=90`; a deadline above 45 s no longer does.
+- The response head is capped at 16 KiB and the decoded body at `RPC_MAX_BODY_MIB`, 8 MiB by default.
+  The default stays at 8 MiB because the unit's `MemoryMax=128M` bounds the parsed tree, which takes several times the body.
 - The address is a literal, so no name is ever resolved.
 
 The node serves the method on that port only when:
@@ -195,27 +200,27 @@ The result is validated whole; the first fault in this order makes the whole sna
 1. `result` is an object whose `version` is an unsigned integer.
    `version` is read before the shape, so a later version reports `snapshot-version-<n>` even when its shape changed.
 2. `version` is 1.
-3. The fields fit the v1 model; unknown fields are ignored at every level, so v1 can gain fields.
+3. The fields the decision reads fit the v1 model; every other field is ignored at every level, whatever its shape, so v1 can gain, drop or retype a field the decision does not read.
    `tracked_epoch`, `admission`, `admission.epoch` and `admission.fallback` are present in every swarm, possibly null; a missing one is `snapshot-malformed`, in a worker swarm too.
 4. 1 to 16 swarms, each named `primary` or `worker-N` (`N` a decimal worker id from 0 to 65535 without a leading zero), each name once.
 5. At most 10000 entries per swarm.
-6. Every `bls_pubkey` is `0x` and 192 hex digits.
+6. In a swarm that lists entries, at least one `bls_pubkey` is `0x` and 192 hex digits; an entry whose key is not is skipped and counted as `bad-keys`.
 7. The primary swarm exists and is `available: true`.
 8. The primary's `tracked_epoch` is not null.
 9. The available primary has a non-null `admission` (a null one there is `snapshot-malformed`).
 10. The primary's `tracked_epoch` is not below its `admission.epoch`, when that is not null.
-11. The primary's `admission.fallback` is null or `Unresolved`; `Missing`, `Stale`, `Contradictory` and any other value are stale.
+11. The primary's `admission.fallback` is null or `Unresolved`; `Missing`, `Stale` and `Contradictory` are stale under their own tokens, and any other value is stale as `fallback-unknown`.
 
 The snapshot's epoch is the primary's `tracked_epoch`, the epoch whose pool it lists; the top-level `epoch` is not used.
 A snapshot whose epoch is below the last applied epoch is `epoch-regressed`; an equal epoch is the normal case of the runs within one epoch.
 A primary `tracked_epoch` above its `admission.epoch` is accepted, and counted as one `pool-ahead` warning.
 
 A worker swarm is authoritative when it is available, its `tracked_epoch` is not null and not below its `admission.epoch`, and its `admission` is not null and has a fallback of null or `Unresolved`.
-A worker swarm that is absent from the snapshot or not authoritative is additions-only (see [Memory](#memory)); it never makes the snapshot stale, `admission: null` included.
+A worker swarm that is absent from the snapshot or not authoritative is additions-only (see [Memory](#memory)); it never makes the snapshot stale, `admission: null` and a fallback this build does not know included.
 A worker swarm that lacks one of the four keys of rule 3 is a shape fault, so the whole snapshot is `snapshot-malformed`; only a present `null` keeps a worker additions-only.
 
 The 16-swarm cap allows the primary and 15 workers, so a node with more than 15 workers is `snapshot-swarms` on every run; more workers are a deployment constraint, and the deployments run one.
-The 8 MiB body cap binds before any count does: at roughly 600 B per entry it holds about 13000 entries over all swarms, so `rpc-body-too-large` fires before `snapshot-entries` can.
+The default 8 MiB body cap binds before any count does: at roughly 600 B per entry it holds about 13000 entries over all swarms, so `rpc-body-too-large` fires before `snapshot-entries` can; the 32 MiB maximum holds about 55000, still under 16 swarms of 10000.
 A node lists at most about 1100 entries per swarm: its 1024 tracked keys, the committees of its window, and its trusted and bootstrap peers.
 
 Some stale reasons are expected and pass by themselves, and each keeps the loaded program:
@@ -238,6 +243,7 @@ Faults inside a valid snapshot are absorbed, counted as occurrences over every s
 | a `dns`, `dns4`, `dns6` or `dnsaddr` multiaddr | skipped, never resolved | `dns-skipped` | `DNS_SKIPPED` |
 | any other multiaddr without a leading address | skipped | `unparsed` | `UNPARSED` |
 | the primary's pool ahead of its window | accepted | `pool-ahead` | none |
+| a `bls_pubkey` that is not `0x` and 192 hex digits | the entry is skipped | `bad-keys` | none |
 
 Addresses: the first 32 of `multiaddrs` and the first 32 of `record_multiaddrs` both count.
 The leading `/ip4/A` or `/ip6/A` segment is parsed into an address.
@@ -246,10 +252,10 @@ Unspecified, multicast and link-local addresses (169.254.0.0/16, fe80::/10) are 
 When `record_multiaddrs` is present and its addresses differ from those of `multiaddrs`, the entry is a mismatch: both sets are allowed and `check` reports the key.
 
 Fields the decision reads: `version`, `swarms[].network`, `available`, `tracked_epoch`, `admission.epoch`, `admission.fallback`, `entries[].bls_pubkey`, `slots`, `multiaddrs` and `record_multiaddrs`.
-The others (`worker_id`, `peer_id`, `network_pubkey`, `record_timestamp`, `source`, `admitted`, `admission.configured`, `admission.effective` and the admission counts) are parsed and not used; the admission mode never matters, because the firewall is a cost filter independent of the node's gate.
-Unused is not optional: `source` (a string) and `admitted` (a bool) on every entry, and `configured`, `effective` (strings) and `resolved_current`, `required_current`, `connected_current`, `contradicted` (unsigned integers) in every `admission` object, are required, and a snapshot that lacks one or gives it another type is `snapshot-malformed`.
+No other field is read: `worker_id`, `peer_id`, `network_pubkey`, `record_timestamp`, `source`, `admitted`, `admission.configured`, `admission.effective`, the admission counts and the top-level `epoch` may be absent, null or of any type; the admission mode never matters, because the firewall is a cost filter independent of the node's gate.
+A field the decision does not read cannot freeze the table: a node release that drops or retypes one changes nothing here.
 `tracked_epoch`, `admission`, `admission.epoch` and `admission.fallback` are present, possibly null.
-`worker_id`, `peer_id`, `network_pubkey`, `record_timestamp`, `record_multiaddrs` and the top-level `epoch` may be null or absent; the node sends `record_multiaddrs` only for a `stub` entry whose signed record lists other addresses.
+`record_multiaddrs` may be null or absent; the node sends it only for a `stub` entry whose signed record lists other addresses.
 
 After a snapshot that validated and folded into memory, the tool calls `tn_getCurrentEpochInfo` best effort and stores its `epochDuration` as `EPOCH_DURATION`.
 A failure there logs `epoch-info-failed reason=<token>`, with the token of the RPC failure (`snapshot-malformed` when the body is not JSON, holds no `result` or its `result` is not an object, as for the snapshot) or `no-epoch-duration` when the answer holds no positive integer `epochDuration`, and never makes the run stale; the default is 21600 until a value is learned.
@@ -420,7 +426,7 @@ Only the elements of the four sets are read, so a set or a map added by hand, wh
 The tool never deletes the table; `off` does.
 
 Nothing caps the program itself.
-The 8 MiB body cap bounds one snapshot at roughly 440k addresses (about 6800 entries of 64 addresses each), a program of 9 to 20 MB, and memory adds only what the snapshots of the last 3 epochs listed.
+The default 8 MiB body cap bounds one snapshot at roughly 440k addresses (about 6800 entries of 64 addresses each), a program of 9 to 20 MB, and memory adds only what the snapshots of the last 3 epochs listed; the 32 MiB maximum of `RPC_MAX_BODY_MIB` allows four times that.
 The node's own limits, about 1024 tracked keys per swarm and at most 4 addresses in a signed record, put a realistic maximum near 65k addresses; the real-kernel job loads such a program in well under a second (0.2 to 0.6 s measured on nft 1.0.2, 1.0.9 and 1.1.3), far below the unit's 90 s.
 
 ## A sync run
@@ -461,19 +467,20 @@ Every token below appears as `STALE_REASON` in `status`, as `reason=` on the std
 | `rpc-unreachable` | connection refused, broken or closed before any response byte, or a connect, read or overall timeout | 3 | `stale` |
 | `rpc-http-<code>` | an HTTP status other than 200, such as `rpc-http-503`; the first status line is the answer, so an interim 1xx, which the request never asks for, reads as its code | 3 | `stale` |
 | `rpc-bad-http` | a response that breaks HTTP/1.1 framing | 3 | `stale` |
-| `rpc-body-too-large` | a head over 16 KiB or a decoded body over 8 MiB | 3 | `stale` |
+| `rpc-body-too-large` | a head over 16 KiB or a decoded body over `RPC_MAX_BODY_MIB` (8 MiB by default) | 3 | `stale` |
 | `snapshot-malformed` | a body that is not JSON, no `result`, a `result` that is not an object, no valid `version`, a shape outside the v1 model, or an available primary with `admission: null` | 3 | `stale` |
 | `rpc-method-missing` | JSON-RPC error -32601: the node lacks `tn_admissionSnapshot`, because its release predates the method or `tn` is not in its `--http.api` | 3 | `stale` |
 | `rpc-error-<code>` | any other JSON-RPC error, its code written literally, so -32001 reads `rpc-error--32001`; an `error` member without an integer `code` is `snapshot-malformed` | 3 | `stale` |
 | `snapshot-version-<n>` | `version` other than 1, such as `snapshot-version-2` | 3 | `stale` |
 | `snapshot-swarms` | no swarm, more than 16, a bad name or a name listed twice | 3 | `stale` |
 | `snapshot-entries` | more than 10000 entries in a swarm | 3 | `stale` |
-| `snapshot-bls` | a `bls_pubkey` that is not `0x` and 192 hex digits | 3 | `stale` |
+| `snapshot-bls` | a swarm that lists entries and none has a `bls_pubkey` of `0x` and 192 hex digits | 3 | `stale` |
 | `primary-unavailable` | no primary swarm, or `available: false` | 3 | `stale` |
 | `pool-unpublished` | the primary's `tracked_epoch` is null, or below its `admission.epoch` | 3 | `stale` |
 | `fallback-missing` | the primary's fallback is `Missing` | 3 | `stale` |
 | `fallback-stale` | the primary's fallback is `Stale` | 3 | `stale` |
-| `fallback-contradictory` | the primary's fallback is `Contradictory`, or a value this build does not know | 3 | `stale` |
+| `fallback-contradictory` | the primary's fallback is `Contradictory` | 3 | `stale` |
+| `fallback-unknown` | the primary's fallback is a value this build does not know | 3 | `stale` |
 | `epoch-regressed` | the snapshot's epoch is below the applied epoch; it clears by itself once the node's tracked epoch is back at or above the applied one, as after a node whose startup record sync failed replays old epochs; after a far-future `tracked_epoch` was accepted once, every honest snapshot regresses, it never clears, and the recovery is `off`, then `on` | 3 | `stale` |
 | `empty-set` | memory holds no address after the snapshot | 3 | `stale` |
 | `config-invalid` | `config` is missing, unreadable or breaks the grammar | 2 | `error` |
@@ -489,9 +496,9 @@ Every token below appears as `STALE_REASON` in `status`, as `reason=` on the std
 Log-only tokens, never written to `status`: `usage` (a relative `--nft`), `snapshot-unreadable` (`render --snapshot` cannot read its file), `nft-check-failed` (`render --check` and nft rejected the program), `output-failed` (stdout could not be written, or `status --json` could not be serialised) and `no-epoch-duration` (the `epoch-info-failed` reason of an answer without a positive integer `epochDuration`).
 
 The deployment's `on` maps exit 1 with `reason=rpc-method-missing` on the stdout line to "this node release lacks tn_admissionSnapshot, or tn is not in its --http.api; update the node or add tn to --http.api", and `check-node.sh` prints the same text for that reason.
-`check-node.sh` reports at once: `rpc-method-missing`, `snapshot-version-*`, `epoch-regressed` and `state-invalid`, which can need the operator; any `RESULT=error`; and a sync unit whose last run failed, by its `Result` and `ExecMainStatus` (exit 0, 3 and 4 are not failures).
+`check-node.sh` reports at once: `rpc-method-missing`, `snapshot-version-*`, `epoch-regressed`, `state-invalid`, `snapshot-malformed`, `rpc-body-too-large`, `snapshot-swarms`, `snapshot-entries`, `snapshot-bls` and `fallback-unknown`, which can need the operator, since a healthy node keeps giving the same answer and none of them passes by itself; any `RESULT=error`; and a sync unit whose last run failed, by its `Result` and `ExecMainStatus` (exit 0, 3 and 4 are not failures).
 It reports every other reason once `STALE_SINCE` is older than 2 epochs.
-`firewall-setup.sh --p2p-committee status` warns at once on the same four reasons, on any `RESULT=error`, and on a failed sync-unit result, with the same wording as check-node.
+`firewall-setup.sh --p2p-committee status` warns at once on the same reasons, on any `RESULT=error`, and on a failed sync-unit result, with the same wording as check-node.
 
 ## Outputs
 
@@ -630,7 +637,7 @@ The scripts own those facts and splice them in front with `printf` (`"${json#\{}
 The summary is the run's closing line, so the log's cap never drops it.
 
 - Memory comes from `state.json` and is updated in memory only; no lock is taken.
-- `--snapshot FILE` reads a regular file of at most 8 MiB holding either the `result` object or a whole JSON-RPC response; without it the node is asked.
+- `--snapshot FILE` reads a regular file of at most `RPC_MAX_BODY_MIB` (8 MiB by default) holding either the `result` object or a whole JSON-RPC response; without it the node is asked.
   A larger file is `rpc-body-too-large` and bytes that are not JSON are `snapshot-malformed`, both refused with exit 1 as from the node.
 - A printed program has the summary `result=rendered reason= epoch=… v4=… …` and exit 0.
 - A stale reason prints no program, the summary `result=stale reason=<token> …` and exit 1; its `epoch` and counts are those of memory as `state.json` holds it, epoch 0 and no keys when there is none.

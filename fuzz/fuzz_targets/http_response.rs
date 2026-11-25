@@ -2,10 +2,10 @@
 //!
 //! Each input is read twice: as a whole response, and as the body of a response whose head says `Transfer-Encoding: chunked`,
 //! so the chunked decoder is reached without a corpus of valid heads.
-//! Inputs above 64 KiB are skipped to keep one run fast; the 8 MiB body cap is asserted, not reached.
+//! Inputs above 64 KiB are skipped to keep one run fast; the default 8 MiB body cap is asserted, not reached.
 //!
 //! Oracles, for an accepted response:
-//! - the body is at most `MAX_BODY_BYTES` and the head, up to and with its empty line, at most `MAX_HEADER_BYTES`;
+//! - the body is at most `DEFAULT_MAX_BODY_BYTES` and the head, up to and with its empty line, at most `MAX_HEADER_BYTES`;
 //! - the status line is `HTTP/1.1 200` or `HTTP/1.0 200`, alone or followed by a space;
 //! - a chunked body equals the de-chunking of the bytes after the head, written here from RFC 9112 section 7.1;
 //! - any other body is a prefix of the bytes after the head, and all of them when the head has no `Content-Length`.
@@ -15,7 +15,7 @@
 use std::io::Cursor;
 
 use libfuzzer_sys::fuzz_target;
-use tn_p2p_allow_sync::rpc::{MAX_BODY_BYTES, MAX_HEADER_BYTES, read_response};
+use tn_p2p_allow_sync::rpc::{DEFAULT_MAX_BODY_BYTES, MAX_HEADER_BYTES, read_response};
 
 /// The largest input read; larger ones are skipped.
 const MAX_INPUT: usize = 64 * 1024;
@@ -34,11 +34,11 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn check(input: &[u8]) {
-    let Ok(body) = read_response(&mut Cursor::new(input)) else {
+    let Ok(body) = read_response(&mut Cursor::new(input), DEFAULT_MAX_BODY_BYTES) else {
         return;
     };
     assert!(
-        body.len() <= MAX_BODY_BYTES,
+        body.len() <= DEFAULT_MAX_BODY_BYTES,
         "a body of {} bytes",
         body.len()
     );

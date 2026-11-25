@@ -7,7 +7,7 @@
 //! Every way a call can fail is one [`RpcError`], and [`RpcError::token`] gives its `STALE_REASON` token.
 //! Connecting is bounded by a connect timeout, each read by a read timeout, and the whole call by an overall deadline that is checked before every read, so a server that drips one byte at a time cannot hold a run past the deadline.
 //! A timeout of any of the three is [`RpcError::Unreachable`], the same as a refused connection.
-//! The response head is capped at [`MAX_HEADER_BYTES`] and the decoded body at [`MAX_BODY_BYTES`]; a response that passes either cap is refused without buffering any more of it.
+//! The response head is capped at [`MAX_HEADER_BYTES`] and the decoded body at the client's cap, [`DEFAULT_MAX_BODY_BYTES`] unless the config sets `RPC_MAX_BODY_MIB`; a response that passes either cap is refused without buffering any more of it.
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -16,8 +16,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-/// Largest decoded response body accepted, in bytes: 8 MiB.
-pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Largest decoded response body accepted by default, in bytes: 8 MiB, the `RPC_MAX_BODY_MIB=8` of the config.
+///
+/// The default stays at 8 MiB because the unit's `MemoryMax=128M` bounds the parsed tree, which takes several times the body.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Largest response head accepted, in bytes: the status line, the header lines and the blank line that ends them, 16 KiB in all.
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -27,14 +29,13 @@ pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Size lines are framing, not body, so they are capped one at a time rather than counted against either cap.
 const MAX_CHUNK_LINE_BYTES: usize = 1024;
 
-/// Default time allowed to connect.
+/// Time allowed to connect, or the deadline when that is shorter.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Default time allowed for each read.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Default time allowed for the whole call, connect included.
-const DEADLINE: Duration = Duration::from_secs(10);
+/// Default time allowed for the whole call and for each read, connect included: 30 s, the `RPC_DEADLINE_SECS=30` of the config.
+///
+/// Two calls fit under the unit's `TimeoutStartSec=90` with room for the rest of the run, and a node that answers at once never waits on it.
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The JSON-RPC request id; each call is the only request on its connection.
 const REQUEST_ID: u64 = 1;
@@ -48,16 +49,29 @@ pub struct RpcClient {
     connect_timeout: Duration,
     read_timeout: Duration,
     deadline: Duration,
+    max_body: usize,
 }
 
 impl RpcClient {
-    /// A client for `127.0.0.1:port` with the default timeouts: 2 s to connect, 5 s for each read and 10 s for the whole call.
+    /// A client for `127.0.0.1:port` with the default limits: [`DEFAULT_DEADLINE`] for the whole call and [`DEFAULT_MAX_BODY_BYTES`] for the body.
     pub const fn new(port: u16) -> Self {
+        Self::with_limits(port, DEFAULT_DEADLINE, DEFAULT_MAX_BODY_BYTES)
+    }
+
+    /// A client for `127.0.0.1:port` with `deadline` for the whole call and for each read, `max_body` bytes for the decoded body, and the shorter of 2 s and `deadline` to connect.
+    pub const fn with_limits(port: u16, deadline: Duration, max_body: usize) -> Self {
+        // `Ord::min` is not const; the comparison is
+        let connect_timeout = if deadline.as_nanos() < CONNECT_TIMEOUT.as_nanos() {
+            deadline
+        } else {
+            CONNECT_TIMEOUT
+        };
         Self {
             port,
-            connect_timeout: CONNECT_TIMEOUT,
-            read_timeout: READ_TIMEOUT,
-            deadline: DEADLINE,
+            connect_timeout,
+            read_timeout: deadline,
+            deadline,
+            max_body,
         }
     }
 
@@ -74,6 +88,7 @@ impl RpcClient {
             connect_timeout,
             read_timeout,
             deadline,
+            max_body: DEFAULT_MAX_BODY_BYTES,
         }
     }
 
@@ -83,7 +98,7 @@ impl RpcClient {
     ///
     /// - [`RpcError::Unreachable`] when the connection is refused, a write or read fails, the server closes before any response byte, or a timeout or the deadline passes.
     /// - [`RpcError::Http`] when the status is not 200, and [`RpcError::BadHttp`] when the response breaks HTTP/1.1 framing.
-    /// - [`RpcError::BodyTooLarge`] when the head passes [`MAX_HEADER_BYTES`] or the body passes [`MAX_BODY_BYTES`].
+    /// - [`RpcError::BodyTooLarge`] when the head passes [`MAX_HEADER_BYTES`] or the body passes the client's cap.
     /// - [`RpcError::MethodMissing`] or [`RpcError::JsonRpc`] when the response is a JSON-RPC error.
     /// - [`RpcError::Malformed`] when the body is not JSON, has no `result`, or its `result` is not an object.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
@@ -103,7 +118,7 @@ impl RpcClient {
             deadline: self.deadline,
             started,
         });
-        let body = read_response(&mut reader)?;
+        let body = read_response(&mut reader, self.max_body)?;
         drop(reader);
         let response = serde_json::from_slice::<Value>(&body);
         // the raw body is not kept alive next to the value parsed from it
@@ -123,7 +138,7 @@ pub enum RpcError {
     Http(u16),
     /// The response broke HTTP/1.1 framing: `rpc-bad-http`.
     BadHttp,
-    /// The response head passed [`MAX_HEADER_BYTES`] or the decoded body passed [`MAX_BODY_BYTES`]: `rpc-body-too-large`.
+    /// The response head passed [`MAX_HEADER_BYTES`] or the decoded body passed the client's cap: `rpc-body-too-large`.
     BodyTooLarge,
     /// The body was not JSON, had no `result`, or its `result` was not an object: `snapshot-malformed`.
     Malformed,
@@ -212,9 +227,9 @@ fn request(port: u16, method: &str, params: Value) -> Vec<u8> {
 
 /// Reads one response and returns its decoded body.
 ///
-/// The head is capped at [`MAX_HEADER_BYTES`] and the decoded body at [`MAX_BODY_BYTES`], and every failure is the [`RpcError`] that [`RpcClient::call`] returns for it.
+/// The head is capped at [`MAX_HEADER_BYTES`] and the decoded body at `max_body` bytes, and every failure is the [`RpcError`] that [`RpcClient::call`] returns for it.
 /// Public for the fuzz targets in `fuzz/`; the program reads a response only through [`RpcClient::call`].
-pub fn read_response<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
+pub fn read_response<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Vec<u8>, RpcError> {
     // a server that closes before its first byte never answered: the connection broke, not the framing
     if reader.fill_buf().map_err(io_error)?.is_empty() {
         return Err(RpcError::Unreachable);
@@ -225,10 +240,10 @@ pub fn read_response<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
         200 => {}
         code => return Err(RpcError::Http(code)),
     }
-    match read_headers(reader, &mut budget)? {
+    match read_headers(reader, &mut budget, max_body)? {
         Framing::Length(length) => read_length(reader, length),
-        Framing::Chunked => read_chunked(reader),
-        Framing::Eof => read_to_eof(reader),
+        Framing::Chunked => read_chunked(reader, max_body),
+        Framing::Eof => read_to_eof(reader, max_body),
     }
 }
 
@@ -273,7 +288,11 @@ fn status_code(line: &[u8]) -> Result<u16, RpcError> {
 /// Reads the header lines up to the blank line and returns how the body is framed.
 ///
 /// Only `Content-Length` and `Transfer-Encoding` matter; every other field is checked for shape and ignored.
-fn read_headers<R: BufRead>(reader: &mut R, budget: &mut usize) -> Result<Framing, RpcError> {
+fn read_headers<R: BufRead>(
+    reader: &mut R,
+    budget: &mut usize,
+    max_body: usize,
+) -> Result<Framing, RpcError> {
     let mut length = None;
     let mut chunked = false;
     loop {
@@ -284,7 +303,7 @@ fn read_headers<R: BufRead>(reader: &mut R, budget: &mut usize) -> Result<Framin
         let (name, value) = split_field(&line)?;
         if name.eq_ignore_ascii_case(b"content-length") {
             let n = parse_digits(value, 10)?;
-            if n > MAX_BODY_BYTES {
+            if n > max_body {
                 return Err(RpcError::BodyTooLarge);
             }
             // repeated lengths are framing only when they agree
@@ -357,7 +376,7 @@ fn parse_digits(digits: &[u8], radix: u8) -> Result<usize, RpcError> {
     })
 }
 
-/// Reads a body of exactly `length` bytes, already checked against [`MAX_BODY_BYTES`].
+/// Reads a body of exactly `length` bytes, already checked against the body cap.
 fn read_length<R: Read>(reader: &mut R, length: usize) -> Result<Vec<u8>, RpcError> {
     let mut body = Vec::with_capacity(length);
     reader
@@ -375,10 +394,10 @@ fn read_length<R: Read>(reader: &mut R, length: usize) -> Result<Vec<u8>, RpcErr
 /// Reads and decodes a chunked body.
 ///
 /// The body is complete at the last chunk, so the trailer section is never read: the connection closes behind it.
-fn read_chunked<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
+fn read_chunked<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Vec<u8>, RpcError> {
     // the whole cap is reserved up front so the buffer never reallocates past it; pages that
     // are never written cost nothing
-    let mut body = Vec::with_capacity(MAX_BODY_BYTES);
+    let mut body = Vec::with_capacity(max_body);
     loop {
         let mut budget = MAX_CHUNK_LINE_BYTES;
         let line = read_line(reader, &mut budget, RpcError::BadHttp)?;
@@ -388,7 +407,7 @@ fn read_chunked<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
         if size == 0 {
             return Ok(body);
         }
-        if size > MAX_BODY_BYTES.saturating_sub(body.len()) {
+        if size > max_body.saturating_sub(body.len()) {
             return Err(RpcError::BodyTooLarge);
         }
         let before = body.len();
@@ -409,15 +428,15 @@ fn read_chunked<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
 }
 
 /// Reads a body that ends when the server closes the connection.
-fn read_to_eof<R: Read>(reader: &mut R) -> Result<Vec<u8>, RpcError> {
+fn read_to_eof<R: Read>(reader: &mut R, max_body: usize) -> Result<Vec<u8>, RpcError> {
     // reserved up front for the same reason as in `read_chunked`
-    let mut body = Vec::with_capacity(MAX_BODY_BYTES);
+    let mut body = Vec::with_capacity(max_body);
     reader
         .by_ref()
-        .take(to_u64(MAX_BODY_BYTES))
+        .take(to_u64(max_body))
         .read_to_end(&mut body)
         .map_err(io_error)?;
-    if body.len() < MAX_BODY_BYTES {
+    if body.len() < max_body {
         return Ok(body);
     }
     // one byte past the cap tells a body at the cap from one over it, and lands in its own
@@ -820,9 +839,9 @@ mod tests {
 
     #[test]
     fn body_at_the_cap_is_read() -> TestResult {
-        // 8 MiB written out, so the test pins the cap rather than restating it
+        // 8 MiB written out, so the test pins the default cap rather than restating it
         let (json, expected) = padded_json(8_388_608);
-        assert_eq!(json.len(), MAX_BODY_BYTES);
+        assert_eq!(json.len(), DEFAULT_MAX_BODY_BYTES);
         assert_eq!(call_against(with_length(&json))?, Ok(expected.clone()));
         let mut eof = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
         eof.extend_from_slice(json.as_bytes());
@@ -837,7 +856,7 @@ mod tests {
 
     #[test]
     fn body_over_the_cap_is_too_large() -> TestResult {
-        let over = MAX_BODY_BYTES.saturating_add(1);
+        let over = DEFAULT_MAX_BODY_BYTES.saturating_add(1);
         let (json, _) = padded_json(over);
         assert_eq!(json.len(), over);
 
@@ -892,7 +911,10 @@ mod tests {
     fn a_body_under_the_cap_ends_at_the_first_end_of_stream() {
         // only a body that fills the cap is probed for one byte more; a shorter one is never read past its end
         let mut stream = EndsAfterEachPart(VecDeque::from([b"abc".as_slice(), b"x".as_slice()]));
-        assert_eq!(read_to_eof(&mut stream), Ok(b"abc".to_vec()));
+        assert_eq!(
+            read_to_eof(&mut stream, DEFAULT_MAX_BODY_BYTES),
+            Ok(b"abc".to_vec())
+        );
     }
 
     #[test]
@@ -1056,15 +1078,69 @@ mod tests {
     }
 
     #[test]
-    fn new_uses_the_default_timeouts() {
+    fn new_uses_the_default_limits() {
+        assert_eq!(
+            RpcClient::new(8545),
+            RpcClient::with_limits(8545, Duration::from_secs(30), 8 * 1024 * 1024)
+        );
         assert_eq!(
             RpcClient::new(8545),
             RpcClient::with_timeouts(
                 8545,
                 Duration::from_secs(2),
-                Duration::from_secs(5),
-                Duration::from_secs(10),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
             )
         );
+    }
+
+    #[test]
+    fn with_limits_bounds_the_connect_by_the_deadline() {
+        let long = Duration::from_secs(45);
+        assert_eq!(
+            RpcClient::with_limits(8545, long, 1024),
+            RpcClient {
+                port: 8545,
+                connect_timeout: Duration::from_secs(2),
+                read_timeout: long,
+                deadline: long,
+                max_body: 1024,
+            }
+        );
+        let short = Duration::from_secs(1);
+        assert_eq!(
+            RpcClient::with_limits(8545, short, 1024),
+            RpcClient {
+                port: 8545,
+                connect_timeout: short,
+                read_timeout: short,
+                deadline: short,
+                max_body: 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn the_body_cap_is_the_callers() -> TestResult {
+        let (json, _) = padded_json(4096);
+        let length = |cap: usize| {
+            read_response(&mut std::io::Cursor::new(with_length(&json)), cap).map(|body| body.len())
+        };
+        assert_eq!(length(4096), Ok(4096));
+        assert_eq!(length(4095), Err(RpcError::BodyTooLarge));
+        let mut eof = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        eof.extend_from_slice(json.as_bytes());
+        assert_eq!(
+            read_response(&mut std::io::Cursor::new(eof), 4095),
+            Err(RpcError::BodyTooLarge)
+        );
+        assert_eq!(
+            read_response(
+                &mut std::io::Cursor::new(chunked_in_two(json.as_bytes())?),
+                4095
+            ),
+            Err(RpcError::BodyTooLarge)
+        );
+        Ok(())
     }
 }
