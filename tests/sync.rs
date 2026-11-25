@@ -647,6 +647,13 @@ fn stale_snapshots_keep_the_last_good_program_and_success_clears_the_staleness()
 #[test]
 fn a_node_that_never_answers_is_unreachable() -> TestResult {
     let mut bed = Bed::new("hang")?;
+    // the default deadline is 30 s; a 3 s deadline keeps the run well inside the bound below
+    // and proves that `RPC_DEADLINE_SECS` reaches the call
+    let config = bed.read("config")?.unwrap_or_default();
+    write_private(
+        &bed.file("config"),
+        &format!("{config}RPC_DEADLINE_SECS=3\n"),
+    )?;
     let start = Instant::now();
     let ran = bed.sync(vec![Response::Hang])?;
     assert_eq!(ran.code, Some(3), "{ran:?}");
@@ -654,7 +661,7 @@ fn a_node_that_never_answers_is_unreachable() -> TestResult {
         ran.stdout,
         "result=stale reason=rpc-unreachable epoch= v4=0 v6=0 static=0 floor=0 keys=0 dns_skipped=0 unparsed=0\n"
     );
-    // the read timeout, well inside the overall deadline
+    // the configured deadline bounds the whole call, connect included
     assert!(start.elapsed() < Duration::from_secs(12));
     assert_eq!(bed.rpc.methods(), ["tn_admissionSnapshot"]);
     Ok(())
